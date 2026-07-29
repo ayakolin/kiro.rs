@@ -619,6 +619,8 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
 
+Claude Sonnet 5 系特例：上游移除了手动 extended thinking（仅保留 adaptive），既不回传原生 reasoning 文本，也不响应 `<thinking_mode>` 伪标签。对 `claude-sonnet-5*` 模型，请求启用 thinking（enabled / adaptive）时服务端改为注入显式自然语言指令，让模型把推理包进 `<thinking>` 标签，再走同一套标签提取路径转换为 thinking block（流式与非流式均生效）。
+
 ### Tool Use
 
 服务端会把 Anthropic tools 转成 Kiro 工具定义，并处理以下兼容逻辑：

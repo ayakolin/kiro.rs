@@ -1549,9 +1549,28 @@ fn convert_tools(
     Ok(out)
 }
 
+/// 上游已确认不响应 `<thinking_mode>` 伪标签、也不回传原生 reasoning 文本的模型。
+///
+/// 实测（2026-07，ide / runtime 两端点、enabled / adaptive / 各 effort 档位）：
+/// claude-sonnet-5 开启 thinking 后响应只有纯文本（偶发仅含 signature 的空
+/// reasoningContentEvent），与 Anthropic 官方「Sonnet 5 移除手动 extended
+/// thinking、仅保留 adaptive」的行为一致。对这类模型改用显式自然语言指令，
+/// 让模型把推理包进 `<thinking>` 标签，再由本服务的标签提取路径转换为
+/// thinking block。其余 Claude 模型（含 opus-4.7 / 4.8、opus-5）伪标签路径正常。
+fn model_uses_explicit_thinking_instruction(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    m == "claude-sonnet-5" || m.starts_with("claude-sonnet-5.")
+}
+
+/// 对 [`model_uses_explicit_thinking_instruction`] 模型注入的显式思考指令。
+const EXPLICIT_THINKING_INSTRUCTION: &str = "Important: before giving your final answer, always think step by step and wrap your complete reasoning process inside <thinking> and </thinking> tags. Only put your internal reasoning inside the tags; write the final answer itself after the closing </thinking> tag.";
+
 /// 生成thinking标签前缀
 fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
     if let Some(t) = &req.thinking {
+        if model_uses_explicit_thinking_instruction(model_id) && t.is_enabled() {
+            return Some(EXPLICIT_THINKING_INSTRUCTION.to_string());
+        }
         if t.thinking_type == "enabled" {
             return Some(format!(
                 "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
@@ -2091,6 +2110,32 @@ mod tests {
             budget_tokens: 20000,
         });
         req
+    }
+
+    #[test]
+    fn sonnet_5_uses_explicit_thinking_instruction() {
+        for thinking_type in ["enabled", "adaptive"] {
+            let req = minimal_thinking_request("claude-sonnet-5", thinking_type);
+            let prefix = generate_thinking_prefix(&req, "claude-sonnet-5").unwrap();
+            assert_eq!(prefix, EXPLICIT_THINKING_INSTRUCTION);
+        }
+        // 点号变体同样命中
+        let req = minimal_thinking_request("claude-sonnet-5.1", "enabled");
+        let prefix = generate_thinking_prefix(&req, "claude-sonnet-5.1").unwrap();
+        assert_eq!(prefix, EXPLICIT_THINKING_INSTRUCTION);
+        // 其它 Claude 模型保持伪标签路径
+        for model in ["claude-opus-5", "claude-opus-4.7", "claude-sonnet-4.6"] {
+            let req = minimal_thinking_request(model, "enabled");
+            let prefix = generate_thinking_prefix(&req, model).unwrap();
+            assert!(
+                prefix.contains("<thinking_mode>enabled</thinking_mode>"),
+                "{model} 应保持伪标签注入"
+            );
+        }
+        // 未请求 thinking 时不注入
+        let mut req = minimal_thinking_request("claude-sonnet-5", "enabled");
+        req.thinking = None;
+        assert!(generate_thinking_prefix(&req, "claude-sonnet-5").is_none());
     }
 
     #[test]
