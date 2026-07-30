@@ -777,26 +777,101 @@ fn seed_hash(seed: &str) -> u64 {
     line_hash(seed)
 }
 
-/// 直接从 content block 的 JSON 值算签名，只取 type/text/thinking 三个字段。
+/// 直接从 content block 的 JSON 值算签名。
 ///
-/// 不反序列化整个 ContentBlock、不 clone：image 的 base64、tool_use 的 input、
-/// tool_result 的 content 等大字段或易变字段都不参与签名，保证前缀指纹稳定且廉价。
+/// 不反序列化整个 ContentBlock、不 clone：省开销，且避免「某 block 反序列化失败被
+/// 跳过」造成的前缀漂移。
+///
+/// 取 type/text/thinking，**并纳入工具块的正文**（`tool_use.input`、
+/// `tool_result.content`）。工具正文必须进签名：它是历史前缀的实际内容，漏掉会让
+/// 「同一位置、内容完全不同的 tool_result」算出相同指纹 → 判为命中（虚假命中），
+/// 从而高报 cache_read、低报真实 input。
+///
+/// 对 id 漂移仍然免疫：只取正文，不取每轮新生成的 `id` / `tool_use_id`。
 fn block_signature_value(v: &serde_json::Value) -> String {
     let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
-    format!("block:{}|{}|{}", s("type"), s("text"), s("thinking"))
+    let mut sig = format!("block:{}|{}|{}", s("type"), s("text"), s("thinking"));
+    // 工具块正文：input（tool_use 参数）/ content（tool_result 输出）。
+    // 二者可能是任意 JSON（字符串、数组、对象），统一按序列化文本取指纹；
+    // 序列化对 map 走 BTreeMap 有序输出，故对 key 插入顺序稳定。
+    if let Some(payload) = tool_payload_value(v) {
+        sig.push('|');
+        sig.push_str(&payload);
+    }
+    sig
 }
 
-/// content block 的 token 估算原文：仅 text + thinking 的纯文本，不含签名结构标记。
+/// 取工具块的正文 JSON 文本（`tool_use.input` / `tool_result.content`），无则 None。
+///
+/// 只认这两个字段：其余字段（id / tool_use_id / name / is_error）不进正文——
+/// id 每轮漂移，纳入会让历史前缀永不命中。
+fn tool_payload_value(v: &serde_json::Value) -> Option<String> {
+    for key in ["input", "content"] {
+        if let Some(x) = v.get(key) {
+            // 字符串直接取原文，避免多一层 JSON 转义；其余按序列化取。
+            return Some(match x.as_str() {
+                Some(s) => s.to_string(),
+                None => x.to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// content block 的 token 估算原文：text + thinking + 工具正文，不含签名结构标记。
+///
+/// 工具正文（`tool_use.input` / `tool_result.content`）必须计入：对 Claude Code 这类
+/// 负载，工具输出往往占上下文大头，漏计会让 est 口径的 `covered / prompt_total` 比例
+/// 系统性偏离真实构成，`split_against_total` 分摊出的 cache_read 随之被压低。
 fn block_token_text(v: &serde_json::Value) -> String {
     let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
-    let text = s("text");
-    let thinking = s("thinking");
-    if thinking.is_empty() {
-        text.to_string()
-    } else if text.is_empty() {
-        thinking.to_string()
-    } else {
-        format!("{text} {thinking}")
+    let mut parts: Vec<String> = Vec::new();
+    for key in ["text", "thinking"] {
+        let t = s(key);
+        if !t.is_empty() {
+            parts.push(t.to_string());
+        }
+    }
+    // 工具正文：只累计其中的**自然语言文本**，不含 JSON 结构标记（括号、引号、
+    // key 名），与「token 计数贴近原文」的既有口径保持一致。
+    if let Some(payload) = v.get("input").or_else(|| v.get("content")) {
+        let mut buf = String::new();
+        collect_json_text(payload, &mut buf);
+        if !buf.is_empty() {
+            parts.push(buf);
+        }
+    }
+    parts.join(" ")
+}
+
+/// 递归收集 JSON 值里的所有字符串叶子，用空格拼接到 `out`。
+///
+/// `tool_result.content` 既可能是裸字符串，也可能是 `[{type:"text",text:"..."}]`
+/// 这类结构；`tool_use.input` 是任意参数对象。这里只取字符串叶子（含对象的 key，
+/// key 也是模型看到的 token），忽略数字 / 布尔 / null 的字面量长度差异。
+fn collect_json_text(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::String(s) => {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(s);
+        }
+        serde_json::Value::Array(arr) => {
+            for x in arr {
+                collect_json_text(x, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, x) in map {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(k);
+                collect_json_text(x, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1655,6 +1730,190 @@ mod tests {
         // 会话 B 首轮：独立画像，无历史可命中（不因 A 的判定而串缓存）。
         let b1 = compute_cache_usage(&cache, &make("B", 1), 0);
         assert_eq!(b1.cache_read, 0, "会话 B 应有独立画像，不命中 A 的前缀");
+    }
+
+    /// 因素4 回归：工具正文变化必须打断命中。
+    ///
+    /// 修复前 `block_signature_value` 只取 type/text/thinking，`tool_result.content`
+    /// 完全不进签名 → 同一位置内容截然不同的 tool_result 算出相同指纹 → 判为命中，
+    /// 高报 cache_read、低报真实 input。命中深度必须止于变化点之前。
+    #[test]
+    fn changed_tool_result_content_breaks_hit_depth() {
+        use super::super::types::Message;
+        let opening = "please read the config file ".repeat(10);
+        let big = "config line value\n".repeat(200);
+
+        let conv = |result: &str| {
+            vec![
+                msg_with_cc("user", &opening, false),
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([
+                        {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a"}}
+                    ]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([
+                        {"type":"tool_result","tool_use_id":"t1","content": result}
+                    ]),
+                },
+                msg_with_cc("user", "explain", false),
+            ]
+        };
+
+        // 内容完全相同 → 命中到最深段。
+        let cache = CacheMeter::new(None);
+        let a = compute_cache_usage(&cache, &req_with_messages(conv(&big)), 1);
+        let b = compute_cache_usage(&cache, &req_with_messages(conv(&big)), 1);
+        assert_eq!(b.cache_read, a.cache_covered_est, "内容不变应完整命中");
+
+        // tool_result 内容变化 → 命中必须止于其之前，不得覆盖最深段。
+        let cache = CacheMeter::new(None);
+        let c = compute_cache_usage(&cache, &req_with_messages(conv(&big)), 1);
+        let d = compute_cache_usage(
+            &cache,
+            &req_with_messages(conv(&format!("{big}CHANGED"))),
+            1,
+        );
+        assert!(
+            d.cache_read < c.cache_covered_est,
+            "tool_result 内容变化后不得虚假命中最深段: read={} covered={}",
+            d.cache_read,
+            c.cache_covered_est
+        );
+    }
+
+    /// tool_use.input 变化同样必须打断命中（参数变了，历史前缀就不同）。
+    #[test]
+    fn changed_tool_use_input_breaks_hit_depth() {
+        use super::super::types::Message;
+        let opening = "run a command ".repeat(10);
+        let pad = "argument payload ".repeat(200);
+        let conv = |path: &str| {
+            vec![
+                msg_with_cc("user", &opening, false),
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([
+                        {"type":"tool_use","id":"t1","name":"Read",
+                         "input":{"file_path":path,"pad":pad}}
+                    ]),
+                },
+                msg_with_cc("user", "explain", false),
+            ]
+        };
+        let cache = CacheMeter::new(None);
+        let a = compute_cache_usage(&cache, &req_with_messages(conv("/etc/passwd")), 1);
+        let b = compute_cache_usage(&cache, &req_with_messages(conv("/other/path")), 1);
+        assert!(
+            b.cache_read < a.cache_covered_est,
+            "tool_use.input 变化后不得虚假命中: read={} covered={}",
+            b.cache_read,
+            a.cache_covered_est
+        );
+    }
+
+    /// 纳入工具正文后，对 id 漂移仍须免疫：正文一致、仅 id 变化应完整命中。
+    /// （这是 tool_call_history_still_hits_despite_id_drift 的加强版：正文更大，
+    ///  且断言命中到最深段而非仅 >0。）
+    #[test]
+    fn tool_payload_in_signature_still_immune_to_id_drift() {
+        use super::super::types::Message;
+        let opening = "start the task ".repeat(10);
+        let big = "tool output line\n".repeat(200);
+        let conv = |id: &str| {
+            vec![
+                msg_with_cc("user", &opening, false),
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([
+                        {"type":"tool_use","id":id,"name":"Read","input":{"file_path":"/a"}}
+                    ]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([
+                        {"type":"tool_result","tool_use_id":id,"content": big}
+                    ]),
+                },
+                msg_with_cc("user", "explain", false),
+            ]
+        };
+        let cache = CacheMeter::new(None);
+        let a = compute_cache_usage(&cache, &req_with_messages(conv("toolu_aaa")), 1);
+        let b = compute_cache_usage(&cache, &req_with_messages(conv("toolu_bbb")), 1);
+        assert_eq!(
+            b.cache_read, a.cache_covered_est,
+            "仅 id 漂移应完整命中（id 不进签名）"
+        );
+    }
+
+    /// 工具正文必须计入 est token 口径：漏计会压低 covered/total 比例，
+    /// 使 split_against_total 分摊出的 cache_read 系统性偏小。
+    #[test]
+    fn tool_payload_counts_toward_token_estimate() {
+        use super::super::types::Message;
+        let file = "source code line in the file\n".repeat(400);
+        let msgs = vec![
+            msg_with_cc("user", "read it", false),
+            Message {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a.rs"}}
+                ]),
+            },
+            Message {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type":"tool_result","tool_use_id":"t1","content": file}
+                ]),
+            },
+            msg_with_cc("user", "explain", false),
+        ];
+        let u = compute_cache_usage(&CacheMeter::new(None), &req_with_messages(msgs), 1);
+        let payload_est = estimate_tokens(&file);
+        assert!(
+            u.cache_covered_est >= payload_est,
+            "tool_result 正文({payload_est})必须计入 covered，实测 {}",
+            u.cache_covered_est
+        );
+    }
+
+    /// `tool_result.content` 也可能是结构化数组（`[{type:"text",text:"..."}]`）。
+    /// 结构化与裸字符串两种形态都必须计入 token，且内容变化都能打断命中。
+    #[test]
+    fn structured_tool_result_content_is_counted_and_compared() {
+        use super::super::types::Message;
+        let body = "structured tool output line ".repeat(200);
+        let conv = |t: &str| {
+            vec![
+                msg_with_cc("user", "go", false),
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([
+                        {"type":"tool_result","tool_use_id":"t1",
+                         "content":[{"type":"text","text": t}]}
+                    ]),
+                },
+                msg_with_cc("user", "explain", false),
+            ]
+        };
+        let cache = CacheMeter::new(None);
+        let a = compute_cache_usage(&cache, &req_with_messages(conv(&body)), 1);
+        // 结构化 content 的文本必须计入 token 口径。
+        assert!(
+            a.cache_covered_est >= estimate_tokens(&body),
+            "结构化 content 的文本应计入 covered，实测 {}",
+            a.cache_covered_est
+        );
+        // 内容变化 → 打断命中。
+        let b = compute_cache_usage(&cache, &req_with_messages(conv("completely other")), 1);
+        assert!(
+            b.cache_read < a.cache_covered_est,
+            "结构化 content 变化也应打断命中: read={}",
+            b.cache_read
+        );
     }
 
     #[test]
