@@ -13,7 +13,8 @@
 //!
 //! 跨轮命中的关键：历史消息逐字节不变，故 Turn N+1 的历史前缀段 hash 必然等于
 //! Turn N 写入的同一段。会话隔离：哈希链以一个隔离种子起头（优先 metadata
-//! session，否则客户端 Key id），使不同会话 / Key 的相同前缀互不命中。
+//! session，其次客户端 Key id，主 Key 无 session 时用首条 message 的会话指纹），
+//! 使不同会话 / Key 的相同前缀互不命中。
 //!
 //! 内存 + JSON 落盘：每分钟一次写到 `cache_dir/cache_metering.json`，启动时读
 //! 回过期记录会被丢掉。**不依赖 Redis 或任何外部 KV**。
@@ -114,8 +115,29 @@ pub struct CacheMeter {
 #[derive(Default)]
 struct Inner {
     entries: HashMap<u64, CacheEntry>,
+    /// 按隔离种子记录的 system 逐行易变性画像（不落盘，进程内学习）
+    profiles: HashMap<u64, SystemProfile>,
     /// 自上次落盘后是否有变化
     dirty: bool,
+}
+
+/// 一个会话的 system 逐行易变性画像。
+///
+/// `skip_until` 只能识别「动态头独立成一个不带 cache_control 的 block」这一种形态。
+/// 实测 Claude Code 也会把每轮变化的内容（时间戳 / cwd / env）与稳定指令**放在同一个
+/// 带 cache_control 的 block 里**，此时动态内容进入哈希链，而链是累积的
+/// （`commit` 用 `hasher.clone()`），最前面一个字节的变动会让**其后所有段**连锁 miss
+/// —— 命中率恒为 0。
+///
+/// 这里不猜测「什么样子算时间戳」，而是按会话观察：记住上一轮每个 block 的逐行指纹，
+/// 跨轮对比出真正变过的行下标，把它们永久标记为易变并排除出哈希链。标记只增不减，
+/// 因此哈希链会在若干轮内收敛到稳定子集。
+struct SystemProfile {
+    /// 上一轮每个 block 的逐行 hash（按 block 下标、行下标定位）
+    lines: Vec<Vec<u64>>,
+    /// 每个 block 中已判定为易变的行下标（只增不减，保证哈希链收敛）
+    volatile: Vec<std::collections::HashSet<usize>>,
+    expires_at: i64,
 }
 
 impl CacheMeter {
@@ -200,6 +222,65 @@ impl CacheMeter {
         }
     }
 
+    /// 观察本轮 system 的逐行指纹，返回「应排除出哈希链的易变行」下标集合。
+    ///
+    /// `observed[b][l]` 是第 b 个 system block 第 l 行的 hash。与上一轮同位置对比，
+    /// 变化过的行判定为易变并记入画像；判定只增不减，故哈希链会在若干轮后收敛。
+    /// 首次观察返回空集合（还无从判断哪行会变）。
+    ///
+    /// block 行数变化时只比对公共前缀长度：行数变了说明有插入 / 删除，按下标对齐已
+    /// 失真，此时宁可少标（保守：少标只是让链更短，不会造成错误命中）。
+    fn learn_volatile_lines(
+        &self,
+        seed_hash: u64,
+        observed: &[Vec<u64>],
+        ttl_secs: i64,
+    ) -> Vec<std::collections::HashSet<usize>> {
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        let expires_at = now + ttl_secs.clamp(60, MAX_TTL_SECS);
+
+        let profile = match inner.profiles.get_mut(&seed_hash) {
+            // 画像过期（会话早已结束）→ 丢弃重新学习，避免拿陈旧判定套新会话。
+            Some(p) if p.expires_at <= now => {
+                *p = SystemProfile {
+                    lines: observed.to_vec(),
+                    volatile: vec![Default::default(); observed.len()],
+                    expires_at,
+                };
+                return p.volatile.clone();
+            }
+            Some(p) => p,
+            None => {
+                inner.profiles.insert(
+                    seed_hash,
+                    SystemProfile {
+                        lines: observed.to_vec(),
+                        volatile: vec![Default::default(); observed.len()],
+                        expires_at,
+                    },
+                );
+                return vec![Default::default(); observed.len()];
+            }
+        };
+
+        // block 数量变化：按下标对齐仅在公共范围内有效，超出部分视为新 block。
+        profile.volatile.resize_with(observed.len(), Default::default);
+        for (b, cur) in observed.iter().enumerate() {
+            if let Some(prev) = profile.lines.get(b) {
+                let common = cur.len().min(prev.len());
+                for l in 0..common {
+                    if cur[l] != prev[l] {
+                        profile.volatile[b].insert(l);
+                    }
+                }
+            }
+        }
+        profile.lines = observed.to_vec();
+        profile.expires_at = expires_at;
+        profile.volatile.clone()
+    }
+
     /// 把当前快照写到 persist_path（仅在 dirty 时实际落盘）
     pub fn flush_to_disk(&self) {
         let path = match self.persist_path.clone() {
@@ -253,6 +334,8 @@ impl CacheMeter {
         if inner.entries.len() != before {
             inner.dirty = true;
         }
+        // 易变性画像同样过期清理（不落盘，仅防内存膨胀）。
+        inner.profiles.retain(|_, p| p.expires_at > now);
     }
 
     #[cfg(test)]
@@ -317,10 +400,10 @@ struct Segment {
 /// 会把 total 全部计入 input）且不写入。
 ///
 /// `key_id` 是客户端 Key id，用于会话隔离：前缀哈希会混入一个隔离种子（优先取
-/// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
-/// 缓存互不命中——同一前缀只在同一会话内复用。
+/// 请求 metadata 里的 session，其次 key_id，主 Key 无 session 时用会话指纹），
+/// 使不同会话 / 不同客户端 Key 的缓存互不命中——同一前缀只在同一会话内复用。
 pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
-    let (segments, prompt_total_est) = extract_segments(req, key_id);
+    let (segments, prompt_total_est) = extract_segments(cache, req, key_id);
     if segments.is_empty() {
         // 无断点：仍带出 prompt_total_est 以便调用方将来扩展，但 covered=0 → 全入 input。
         return CacheUsage {
@@ -382,7 +465,7 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 ///
 /// `key_id` 用于会话隔离：哈希以一个隔离种子起头（优先用 metadata session，否则
 /// key_id），种子不计入 token，只让不同会话的同前缀产生不同 hash → 互不命中。
-fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
+fn extract_segments(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut cum_tokens: u32 = 0;
@@ -392,8 +475,7 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
 
     // 会话隔离种子：作为哈希链最前置的输入，不进 token 估算。同一会话内前缀稳定
     // 复用；跨会话 / 跨客户端 Key 的相同前缀因种子不同而 hash 不同，互不命中。
-    // 为 None（主 Key 无 session，被多用户共享）时不模拟缓存，直接返回空段：
-    // compute_cache_usage 对空段走「全 input、零缓存、不回写」的分支。
+    // 主 Key 无 session 时按会话指纹隔离（见 isolation_seed），仍可跨轮命中。
     let Some(seed) = isolation_seed(req, key_id) else {
         return (Vec::new(), 0);
     };
@@ -470,8 +552,38 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
             dynamic_prefix_tokens =
                 dynamic_prefix_tokens.saturating_add(estimate_tokens(&sys.text).max(0) as u32);
         }
-        for sys in systems.iter().skip(skip_until) {
-            feed(&mut hasher, &system_signature(sys), &sys.text, &mut cum_tokens);
+
+        // 保留下来的 block 里仍可能混有每轮变化的行（动态内容与稳定指令同块、且该块
+        // 带 cache_control——block 级 skip_until 对此无能为力）。按会话学习逐行易变性，
+        // 把变过的行排除出哈希链：链是累积的，放任一行抖动会让其后所有段连锁 miss。
+        let kept: Vec<&SystemMessage> = systems.iter().skip(skip_until).collect();
+        let observed: Vec<Vec<u64>> = kept
+            .iter()
+            .map(|s| s.text.lines().map(line_hash).collect())
+            .collect();
+        let volatile = cache.learn_volatile_lines(seed_hash(&seed), &observed, ttl);
+
+        for (b, sys) in kept.iter().enumerate() {
+            let empty = Default::default();
+            let vol = volatile.get(b).unwrap_or(&empty);
+            if vol.is_empty() {
+                feed(&mut hasher, &system_signature(sys), &sys.text, &mut cum_tokens);
+                continue;
+            }
+            // 有易变行：哈希只喂稳定行（行下标一并进哈希，防止「删掉一行」与
+            // 「该行本就不存在」产生相同指纹）；易变行的 token 归入 prompt_total 分母。
+            hasher.update(b"sys:");
+            for (l, line) in sys.text.lines().enumerate() {
+                if vol.contains(&l) {
+                    dynamic_prefix_tokens =
+                        dynamic_prefix_tokens.saturating_add(estimate_tokens(line).max(0) as u32);
+                    continue;
+                }
+                hasher.update(l.to_le_bytes());
+                hasher.update(line.as_bytes());
+                hasher.update(b"\n");
+                cum_tokens = cum_tokens.saturating_add(estimate_tokens(line).max(0) as u32);
+            }
         }
     }
 
@@ -533,12 +645,18 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
 /// 优先级：
 ///   1. metadata.user_id 里的 session 段（Claude Code 格式含 `_session_<uuid>`）
 ///      —— 最精确的会话维度，同一会话多轮共享、跨会话隔离。
-///   2. 主 apiKey（系统 Key，`key_id==0`）且无 session → `None`：该 Key 被多个
-///      用户共享，若按 key 模拟缓存会产生跨用户虚假命中，故不模拟缓存。
-///   3. 其余客户端 Key（`key_id!=0`）→ 按 key 隔离，保留合法的按 Key 缓存复用。
+///   2. 其余客户端 Key（`key_id!=0`）→ 按 key 隔离，保留合法的按 Key 缓存复用。
+///   3. 主 apiKey（系统 Key，`key_id==0`）且无 session → 按**会话指纹**隔离，
+///      见 [`conversation_fingerprint`]。该 Key 可能被多个用户共享，不能按 key
+///      归并成一个命名空间（同项目多用户的 system+tools 前缀完全相同，会互相
+///      顶掉 LRU 并串起用量）；但整体禁用缓存会让这类流量命中率恒为 0。
+///
+/// 关于安全性：种子只是**命名空间**，命中仍要求整条前缀逐字节相同；且缓存条目只
+/// 存 `{tokens, expires_at, last_hit_at}` 三个数字，不存任何 prompt 内容，命中也
+/// 不回传内容。因此内容相同才可能命中的场景下，不存在信息泄露，最坏只是 token
+/// 统计口径的细微偏差——而此时真实上游缓存同样会命中。
 ///
 /// 种子只参与哈希、不计入 token 估算，因此不影响 cache_creation/read 的数值口径。
-/// 返回 `None` 表示本次请求不应模拟缓存（调用方据此产出全 input、零缓存）。
 fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
     if let Some(session) = req
         .metadata
@@ -548,10 +666,38 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
     {
         return Some(format!("sess:{session}"));
     }
-    if key_id == 0 {
-        return None;
+    if key_id != 0 {
+        return Some(format!("key:{key_id}"));
     }
-    Some(format!("key:{key_id}"))
+    Some(format!("conv:{}", conversation_fingerprint(req)))
+}
+
+/// 主 Key 无 session 时的会话身份指纹：取**首条 message** 的 role + 内容摘要。
+///
+/// 为什么用首条 message 而不是 key / system：
+///   - 首条 message 在同一会话的多轮之间**逐字节不变**（新轮只在尾部追加），
+///     所以同会话多轮能落到同一命名空间 → 可以跨轮命中。
+///   - 不同会话的开场内容几乎必然不同 → 天然隔离，不会互相顶掉 LRU。
+///   - 不能用 system：Claude Code 的 system 含每轮变化的动态头（时间 / cwd），
+///     拿它做指纹会让种子每轮漂移、永不命中，正是要避免的失败模式。
+///
+/// 退化行为：上下文压缩重写了首条 message 时指纹改变，缓存视为新会话（一次 miss
+/// 后重新积累），属可接受的优雅降级。无 message 时回退到固定种子。
+fn conversation_fingerprint(req: &MessagesRequest) -> u64 {
+    use sha2::{Digest, Sha256};
+    let Some(first) = req.messages.first() else {
+        return 0;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(first.role.as_bytes());
+    hasher.update(b"|");
+    // 首条 message 的完整内容（含 tool_result 等大字段）：这里只求身份区分度，
+    // 不涉及前缀命中判定，故直接用序列化结果，无需与 block_signature 口径一致。
+    hasher.update(first.content.to_string().as_bytes());
+    let digest = hasher.finalize();
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(buf)
 }
 
 /// 从 Claude Code 的 user_id 中提取 session 标识。
@@ -615,6 +761,20 @@ fn tool_token_text(t: &Tool) -> String {
 
 fn system_signature(s: &SystemMessage) -> String {
     format!("sys:{}", s.text)
+}
+
+/// 单行的 64 位指纹，用于跨轮对比某一行是否变过。
+fn line_hash(line: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(line.as_bytes());
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(buf)
+}
+
+/// 隔离种子的 64 位指纹，用作易变性画像的 key（画像按会话独立）。
+fn seed_hash(seed: &str) -> u64 {
+    line_hash(seed)
 }
 
 /// 直接从 content block 的 JSON 值算签名，只取 type/text/thinking 三个字段。
@@ -1203,10 +1363,13 @@ mod tests {
         assert!(s1b.cache_read > 0, "相同 session 应命中");
     }
 
-    /// 主 apiKey（key_id=0）且无 session：该 Key 被多个用户共享，不应模拟出跨用户
-    /// 缓存命中——即便前缀逐字节相同，也不得命中（返回全 input、零覆盖、不回写）。
+    /// 主 apiKey（key_id=0）且无 session：按会话指纹隔离，同一会话可跨轮命中。
+    ///
+    /// 旧行为是整体禁用缓存（命中率恒 0），代价过大：OpenAI / Responses 端点硬编码
+    /// `metadata: None`，用默认 apiKey 时全部流量永远零命中。改为按首条 message 的
+    /// 指纹分命名空间后，同会话多轮可命中，不同会话仍互相隔离。
     #[test]
-    fn master_key_without_session_does_not_simulate_cross_user_cache_hit() {
+    fn master_key_without_session_hits_within_same_conversation() {
         let cache = CacheMeter::new(None);
         let body = "shared master-key prompt without any session ".repeat(20);
         let msgs = || {
@@ -1216,15 +1379,62 @@ mod tests {
                 msg_with_cc("user", &body, false),
             ]
         };
-        // key_id=0 无 session → 不模拟缓存（对照 different_key_id_does_not_cross_hit 中
-        // key_id=1 会产生 cache_covered_est>0）。
+        // 首轮：建立缓存，无历史可读。
         let a = compute_cache_usage(&cache, &req_with_messages(msgs()), 0);
-        assert_eq!(a.cache_read, 0);
-        assert_eq!(a.cache_covered_est, 0, "主 Key 无 session 不应产生缓存覆盖");
-        // 相同内容再来一次，仍是 key_id=0 无 session → 仍不得命中（否则即跨用户串缓存）。
-        let b = compute_cache_usage(&cache, &req_with_messages(msgs()), 0);
-        assert_eq!(b.cache_read, 0, "共享主 Key 无 session 时不得复用全局模拟缓存");
-        assert_eq!(b.cache_covered_est, 0);
+        assert!(a.cache_covered_est > 0, "主 Key 也应产生缓存覆盖");
+        assert_eq!(a.cache_read, 0, "首轮无历史可命中");
+        // 同一会话（首条 message 不变）续轮：应命中自己上一轮写入的前缀。
+        let mut next = msgs();
+        next.push(msg_with_cc("assistant", &body, false));
+        next.push(msg_with_cc("user", "follow up", false));
+        let b = compute_cache_usage(&cache, &req_with_messages(next), 0);
+        assert!(b.cache_read > 0, "同会话续轮应命中（修复前恒为 0）");
+    }
+
+    /// 主 Key 的会话指纹隔离：开场不同的两个会话（可能来自不同用户）互不命中。
+    #[test]
+    fn master_key_different_conversations_do_not_cross_hit() {
+        let cache = CacheMeter::new(None);
+        let tail = "identical shared project context and instructions ".repeat(20);
+        // 两个会话的公共尾部完全相同，只有开场第一条 message 不同。
+        let conv = |opening: &str| {
+            vec![
+                msg_with_cc("user", opening, false),
+                msg_with_cc("assistant", &tail, false),
+                msg_with_cc("user", &tail, false),
+            ]
+        };
+        let a = compute_cache_usage(&cache, &req_with_messages(conv("alice opening question")), 0);
+        assert!(a.cache_covered_est > 0);
+        // 不同开场 → 不同指纹命名空间 → 不得命中 alice 的前缀。
+        let b = compute_cache_usage(&cache, &req_with_messages(conv("bob opening question")), 0);
+        assert_eq!(b.cache_read, 0, "不同会话（不同开场）不应互相命中");
+        // alice 再来一轮，仍能命中自己的。
+        let a2 = compute_cache_usage(&cache, &req_with_messages(conv("alice opening question")), 0);
+        assert!(a2.cache_read > 0, "同会话应命中自己的前缀");
+    }
+
+    /// 会话指纹必须对「尾部追加」稳定：同会话多轮只在尾部增长，指纹不得漂移，
+    /// 否则每轮落到不同命名空间 → 永不命中（这正是要避免的失败模式）。
+    #[test]
+    fn conversation_fingerprint_stable_across_turns() {
+        let body = "opening message content ".repeat(10);
+        let base = vec![msg_with_cc("user", &body, false)];
+        let f1 = conversation_fingerprint(&req_with_messages(base.clone()));
+
+        let mut grown = base.clone();
+        grown.push(msg_with_cc("assistant", "reply", false));
+        grown.push(msg_with_cc("user", "next question", false));
+        let f2 = conversation_fingerprint(&req_with_messages(grown));
+        assert_eq!(f1, f2, "尾部追加不应改变会话指纹");
+
+        // 换开场 → 指纹必须变（否则不同会话会串到一个命名空间）。
+        let other = vec![msg_with_cc("user", "a totally different opening", false)];
+        assert_ne!(
+            f1,
+            conversation_fingerprint(&req_with_messages(other)),
+            "不同开场应产生不同指纹"
+        );
     }
 
     /// 被跳过的动态 system 头部（无 cache_control）虽不进缓存前缀链，但仍是模型看到
@@ -1274,6 +1484,177 @@ mod tests {
             u.cache_covered_est,
             estimate_tokens(&dynamic)
         );
+    }
+
+    /// 因素1 回归：动态内容与稳定指令**同处一个带 cache_control 的 block**。
+    /// block 级 skip_until 无法分离这种形态，修复前命中率恒为 0（每轮 creation 重复）。
+    /// 逐行学习后，第 3 轮起变动行被排除出哈希链，稳定前缀持续命中。
+    #[test]
+    fn dynamic_line_inside_cached_block_does_not_break_hits() {
+        use super::super::types::{CacheControl, MessagesRequest, SystemMessage};
+        let stable = "You are a coding assistant. ".repeat(200);
+        let body = "conversation content ".repeat(20);
+
+        // 关键：时钟行和稳定指令在同一个 block，且该 block 带 cache_control。
+        let make = |clock: u32| MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: format!("Today is 2026-07-30 {clock}:00\ncwd=/x\n{stable}"),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        // Turn 1：建立画像基线，无历史可命中。
+        let u1 = compute_cache_usage(&cache, &make(10), 1);
+        assert_eq!(u1.cache_read, 0, "turn1 无历史可命中");
+        // Turn 2：时钟变化被观察到 → 该行标记为易变（本轮仍受污染，属学习成本）。
+        compute_cache_usage(&cache, &make(11), 1);
+        // Turn 3+：易变行已排除出哈希链，稳定前缀跨轮命中。
+        let u3 = compute_cache_usage(&cache, &make(12), 1);
+        let u4 = compute_cache_usage(&cache, &make(13), 1);
+        assert!(
+            u3.cache_read > 0,
+            "学习后应命中稳定前缀（修复前恒为 0），read={}",
+            u3.cache_read
+        );
+        assert!(u4.cache_read > 0, "命中应持续保持，read={}", u4.cache_read);
+        // 时钟行始终在变，但命中量稳定 → 说明它已不参与哈希链。
+        assert_eq!(u3.cache_read, u4.cache_read, "命中量应稳定，不随时钟抖动");
+    }
+
+    /// 易变行的 token 必须归入 prompt_total 分母：它是模型真实看到的 input，
+    /// 漏计会缩小分母、高估缓存占比（与被跳过的动态 system 头同一口径）。
+    #[test]
+    fn volatile_lines_still_count_toward_prompt_total() {
+        use super::super::types::{CacheControl, MessagesRequest, SystemMessage};
+        let stable = "Stable instructions. ".repeat(200);
+        let volatile_line = "changing marker ".repeat(30);
+        let body = "conversation ".repeat(20);
+
+        let make = |n: u32| MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: format!("{volatile_line}{n}\n{stable}"),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        compute_cache_usage(&cache, &make(1), 1);
+        compute_cache_usage(&cache, &make(2), 1);
+        let u = compute_cache_usage(&cache, &make(3), 1);
+        // 易变行已不在 covered 里，但仍必须留在 prompt_total 分母中。
+        assert!(
+            u.prompt_total_est >= u.cache_covered_est + estimate_tokens(&volatile_line),
+            "易变行必须计入分母: total={} covered={} volatile={}",
+            u.prompt_total_est,
+            u.cache_covered_est,
+            estimate_tokens(&volatile_line)
+        );
+    }
+
+    /// 全稳定的 system 不应被误判：没有任何行变化时，哈希链保持完整（不丢内容）。
+    #[test]
+    fn fully_stable_system_keeps_all_lines_in_chain() {
+        use super::super::types::{CacheControl, MessagesRequest, SystemMessage};
+        let body = "conversation ".repeat(20);
+        let make = || MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                msg_with_cc("user", &body, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "line one\nline two\nline three".to_string(),
+                cache_control: Some(CacheControl {
+                    cache_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let cache = CacheMeter::new(None);
+        let a = compute_cache_usage(&cache, &make(), 1);
+        let b = compute_cache_usage(&cache, &make(), 1);
+        // 内容全稳定 → 第二轮直接命中，且 covered 口径与第一轮一致（无行被剔除）。
+        assert!(b.cache_read > 0, "全稳定 system 应立即命中");
+        assert_eq!(b.cache_read, a.cache_covered_est);
+    }
+
+    /// 不同会话的画像互不干扰：会话 A 学到的易变行不应影响会话 B 的哈希链。
+    #[test]
+    fn volatile_profiles_are_per_session() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, Metadata, SystemMessage};
+        let stable = "Shared stable instructions. ".repeat(100);
+        let body = "conversation ".repeat(20);
+        let make = |session: &str, clock: u32| MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message { role: "assistant".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+            ],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: format!("clock={clock}\n{stable}"),
+                cache_control: Some(CacheControl { cache_type: "ephemeral".into(), ttl: None }),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("user_x_account__session_{session}")),
+            }),
+        };
+        let cache = CacheMeter::new(None);
+        // 会话 A 走三轮，学到 clock 行易变并开始命中。
+        compute_cache_usage(&cache, &make("A", 1), 0);
+        compute_cache_usage(&cache, &make("A", 2), 0);
+        let a3 = compute_cache_usage(&cache, &make("A", 3), 0);
+        assert!(a3.cache_read > 0, "会话 A 学习后应命中");
+        // 会话 B 首轮：独立画像，无历史可命中（不因 A 的判定而串缓存）。
+        let b1 = compute_cache_usage(&cache, &make("B", 1), 0);
+        assert_eq!(b1.cache_read, 0, "会话 B 应有独立画像，不命中 A 的前缀");
     }
 
     #[test]
