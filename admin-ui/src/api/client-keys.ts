@@ -58,6 +58,15 @@ export async function resetClientKeyStats(id: number): Promise<SuccessResponse> 
   return data
 }
 
+/** 设置或清除积分使用上限。maxCredits 传 null 表示取消限制 */
+export async function setClientKeyMaxCredits(
+  id: number,
+  maxCredits: number | null,
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/client-keys/${id}/max-credits`, { maxCredits })
+  return data
+}
+
 export async function rotateClientKey(id: number): Promise<CreateClientKeyResponse> {
   const { data } = await api.post<CreateClientKeyResponse>(`/client-keys/${id}/rotate`)
   return data

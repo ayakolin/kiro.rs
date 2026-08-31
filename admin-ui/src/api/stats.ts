@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   CredentialDistribution,
+  KeyDistribution,
   ModelDistribution,
   OverviewStats,
   StatsFilter,
@@ -51,6 +52,14 @@ export async function getByModel(time: StatsTimeFilter, filter?: StatsFilter): P
 export async function getByCredential(time: StatsTimeFilter, filter?: StatsFilter): Promise<CredentialDistribution[]> {
   const { data } = await api.get<CredentialDistribution[]>('/stats/by-credential', {
     params: statsParams(time, filter),
+  })
+  return data
+}
+
+export async function getByKey(time: StatsTimeFilter, filter?: StatsFilter): Promise<KeyDistribution[]> {
+  // by-key 是横向对比所有 Key，忽略 keyId 过滤；仅透传时间窗与分组
+  const { data } = await api.get<KeyDistribution[]>('/stats/by-key', {
+    params: { ...time, ...(filter?.group ? { group: filter.group } : {}) },
   })
   return data
 }

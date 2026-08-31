@@ -7,6 +7,7 @@ import {
   setClientKeyDisabled,
   resetClientKeyStats,
   rotateClientKey,
+  setClientKeyMaxCredits,
 } from '@/api/client-keys'
 import type { CreateClientKeyRequest, UpdateClientKeyRequest } from '@/types/api'
 
@@ -64,6 +65,15 @@ export function useRotateClientKey() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => rotateClientKey(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['client-keys'] }),
+  })
+}
+
+export function useSetClientKeyMaxCredits() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, maxCredits }: { id: number; maxCredits: number | null }) =>
+      setClientKeyMaxCredits(id, maxCredits),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['client-keys'] }),
   })
 }

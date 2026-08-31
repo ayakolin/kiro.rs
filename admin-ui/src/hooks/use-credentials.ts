@@ -18,14 +18,32 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getAccountRpmLimitConfig,
+  setAccountRpmLimitConfig,
   getSelfHealConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getGlobalProxy,
+  setGlobalProxy,
+  getCustomModels,
+  setCustomModels,
+  getUpdateConfig,
+  setUpdateConfig,
   resetSuccessCount,
   resetAllSuccessCount,
+  getCredentialMetadataSchema,
+  setCredentialMetadataSchema,
 } from '@/api/credentials'
-import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  CustomModelItem,
+  SetGlobalProxyRequest,
+  SetUpdateConfigRequest,
+  UpdateCredentialRequest,
+  UpdateRefreshTokenRequest,
+  CredentialMetadataSchemaConfig,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -33,6 +51,25 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+export function useCredentialMetadataSchema() {
+  return useQuery({
+    queryKey: ['credential-metadata-schema'],
+    queryFn: getCredentialMetadataSchema,
+  })
+}
+
+export function useSetCredentialMetadataSchema() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: CredentialMetadataSchemaConfig) =>
+      setCredentialMetadataSchema(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credential-metadata-schema'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
   })
 }
 
@@ -52,6 +89,7 @@ export function useCredentialModels(id: number | null) {
     queryKey: ['credential-models', id],
     queryFn: () => getCredentialModels(id!),
     enabled: id !== null,
+    staleTime: 0, // 始终视为过期，每次打开对话框都实时查上游
     retry: false, // 失败不重试，避免对被封禁/异常账号反复请求
   })
 }
@@ -62,6 +100,7 @@ export function useCurrentCredentialModels(enabled: boolean) {
     queryKey: ['current-credential-models'],
     queryFn: getCurrentCredentialModels,
     enabled,
+    staleTime: 0, // 始终视为过期，每次打开对话框都实时查上游
     retry: false,
   })
 }
@@ -238,6 +277,25 @@ export function useSetAccountThrottleConfig() {
   })
 }
 
+// 获取单账号 RPM 限流配置
+export function useAccountRpmLimitConfig() {
+  return useQuery({
+    queryKey: ['accountRpmLimitConfig'],
+    queryFn: getAccountRpmLimitConfig,
+  })
+}
+
+// 更新单账号 RPM 限流配置
+export function useSetAccountRpmLimitConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAccountRpmLimitConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
+    },
+  })
+}
+
 // 获取自愈治理配置（30s 刷新以便观测 consecutiveRounds/totalCount 变化）
 export function useSelfHealConfig() {
   return useQuery({
@@ -273,6 +331,62 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 全局出站代理。此前只在代理池弹窗里内联查询，设置页需要独立入口，
+// 抽成 hook 后两处共用同一份缓存（queryKey 与弹窗保持一致：'global-proxy'）。
+export function useGlobalProxy() {
+  return useQuery({
+    queryKey: ['global-proxy'],
+    queryFn: getGlobalProxy,
+  })
+}
+
+export function useSetGlobalProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetGlobalProxyRequest) => setGlobalProxy(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
+    },
+  })
+}
+
+// 自定义模型配置
+export function useCustomModels() {
+  return useQuery({
+    queryKey: ['custom-models'],
+    queryFn: getCustomModels,
+  })
+}
+
+export function useSetCustomModels() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: { models: CustomModelItem[] }) =>
+      setCustomModels(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-models'] })
+    },
+  })
+}
+
+// 镜像在线更新配置（GitHub Token / 无人值守自动更新）
+export function useUpdateConfig() {
+  return useQuery({
+    queryKey: ['update-config'],
+    queryFn: getUpdateConfig,
+  })
+}
+
+export function useSetUpdateConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetUpdateConfigRequest) => setUpdateConfig(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['update-config'] })
     },
   })
 }

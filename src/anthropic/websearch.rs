@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::admin::trace_db::TraceSink;
+
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
@@ -549,7 +551,19 @@ fn render_websearch_response(
         let summary = generate_search_summary(&query, &search_results);
         let output_tokens = (summary.len() as i32 + 3) / 4;
         // 本地 WebSearch 不走上游，不会收到 meteringEvent，因此也不带 credit_* 字段。
-        super::websearch_loop::render_json(&model, content, "end_turn", input_tokens, output_tokens, "", None)
+        super::websearch_loop::render_json(
+            &model,
+            content,
+            "end_turn",
+            crate::kiro::model::events::TokenUsage {
+                uncached_input_tokens: input_tokens,
+                output_tokens,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+            },
+            "",
+            None,
+        )
     }
 }
 
@@ -581,10 +595,11 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match finish_mcp_call(call_mcp_api(&provider, &mcp_request, group).await) {
-        Ok(results) => results,
-        Err(response) => return response,
-    };
+    let search_results =
+        match finish_mcp_call(call_mcp_api(&provider, &mcp_request, None, group).await) {
+            Ok(results) => results,
+            Err(response) => return response,
+        };
 
     // 4. 按请求模式生成响应
     render_websearch_response(
@@ -601,18 +616,34 @@ pub async fn handle_websearch_request(
 pub(crate) async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
+    sink: Option<&dyn TraceSink>,
     group: Option<&str>,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body, group).await?;
+    if let Some(sink) = sink {
+        return provider
+            .call_mcp_with_trace(
+                &request_body,
+                sink,
+                group,
+                parse_mcp_response,
+                is_no_results_mcp_error,
+            )
+            .await;
+    }
 
+    let response = provider.call_mcp(&request_body, group).await?;
     let body = response.text().await?;
+    parse_mcp_response(&body)
+}
+
+fn parse_mcp_response(body: &str) -> anyhow::Result<McpResponse> {
     tracing::debug!("MCP response: {}", body);
 
-    let mcp_response: McpResponse = serde_json::from_str(&body)?;
+    let mcp_response: McpResponse = serde_json::from_str(body)?;
 
     if let Some(ref error) = mcp_response.error {
         anyhow::bail!(
@@ -623,6 +654,12 @@ pub(crate) async fn call_mcp_api(
     }
 
     Ok(mcp_response)
+}
+
+pub(crate) fn is_no_results_mcp_error(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("MCP error: -32602 - Tool returned no results")
 }
 
 #[cfg(test)]
@@ -636,6 +673,32 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "60");
+    }
+
+    #[test]
+    fn parse_mcp_response_rejects_json_rpc_errors() {
+        let error = parse_mcp_response(
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"search failed"}}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "MCP error: -32603 - search failed");
+    }
+
+    #[test]
+    fn parse_mcp_response_rejects_malformed_bodies() {
+        assert!(parse_mcp_response("not-json").is_err());
+    }
+
+    #[test]
+    fn parse_mcp_response_accepts_successful_results() {
+        let response = parse_mcp_response(
+            r#"{"jsonrpc":"2.0","id":"1","error":null,"result":{"content":[],"isError":false}}"#,
+        )
+        .unwrap();
+
+        assert!(response.error.is_none());
+        assert!(response.result.is_some());
     }
 
     #[tokio::test]

@@ -1,14 +1,16 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { RegionSelect } from '@/components/region-select'
 import {
   Select,
   SelectTrigger,
@@ -20,15 +22,21 @@ import { useAddCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
+import {
+  CredentialMetadataEditor,
+  metadataDefaults,
+} from '@/components/credential-metadata-field'
+import type { CredentialMetadata, CredentialMetadataSchema } from '@/types/api'
 
 interface AddCredentialDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  metadataSchema?: CredentialMetadataSchema
 }
 
 type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 
-export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+export function AddCredentialDialog({ open, onOpenChange, metadataSchema }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -46,10 +54,20 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
+  const [metadata, setMetadata] = useState<CredentialMetadata>({
+    type: 'normal',
+    saleStatus: 'not_for_sale',
+  })
 
   const groupOptions = useGroupOptions()
 
   const { mutate, isPending } = useAddCredential()
+
+  useEffect(() => {
+    if (open) {
+      setMetadata((current) => ({ ...metadataDefaults(metadataSchema), ...current }))
+    }
+  }, [open, metadataSchema])
 
   const resetForm = () => {
     setRefreshToken('')
@@ -69,6 +87,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
+    setMetadata(metadataDefaults(metadataSchema))
   }
 
   const isApiKey = authMethod === 'api_key'
@@ -120,6 +139,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         endpoint: endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
+        metadata,
       },
       {
         onSuccess: (data) => {
@@ -139,6 +159,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>添加凭据</DialogTitle>
+          <DialogDescription>
+            添加 OAuth、企业 SSO 或 API Key 凭据，并配置分组、Metadata 与代理。
+          </DialogDescription>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
@@ -202,28 +225,32 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <Input
-                    id="authRegion"
-                    placeholder="Auth Region"
+              <div className="space-y-2">
+                <div className="space-y-1">
+                  <span className="text-xs text-muted-foreground">
+                    Auth Region（Token 刷新）
+                  </span>
+                  <RegionSelect
                     value={authRegion}
-                    onChange={(e) => setAuthRegion(e.target.value)}
+                    onChange={setAuthRegion}
+                    allowInherit
                     disabled={isPending}
                   />
                 </div>
-                <div>
-                  <Input
-                    id="apiRegion"
-                    placeholder="API Region"
+                <div className="space-y-1">
+                  <span className="text-xs text-muted-foreground">
+                    API Region（API 请求）
+                  </span>
+                  <RegionSelect
                     value={apiRegion}
-                    onChange={(e) => setApiRegion(e.target.value)}
+                    onChange={setApiRegion}
+                    allowInherit
                     disabled={isPending}
                   />
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                选「跟随全局配置」即沿用 config.json 的 region；预设里没有的区域可直接手输
               </p>
             </div>
 
@@ -379,6 +406,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 可选。纯备注，标记账号来源/渠道，便于追踪
               </p>
             </div>
+
+            <CredentialMetadataEditor
+              schema={metadataSchema}
+              value={metadata}
+              onChange={setMetadata}
+              disabled={isPending}
+            />
 
             {/* 代理配置 */}
             <div className="space-y-2">

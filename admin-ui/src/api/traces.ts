@@ -25,6 +25,9 @@ export async function getTraces(query: TraceQuery): Promise<TracePage> {
   if (query.model) params.model = query.model
   if (query.group) params.group = query.group
   if (query.onlyFailed) params.onlyFailed = 'true'
+  if (query.startTime != null) params.startTime = String(query.startTime)
+  if (query.endTime != null) params.endTime = String(query.endTime)
+  if (query.q) params.q = query.q
   if (query.limit != null) params.limit = String(query.limit)
   if (query.offset != null) params.offset = String(query.offset)
   const { data } = await api.get<TracePage>('/traces', { params })

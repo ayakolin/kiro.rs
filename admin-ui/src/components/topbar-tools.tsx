@@ -1,395 +1,306 @@
-import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
+import { useState } from 'react'
 import {
-  Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, Boxes, HeartPulse, HeartCrack,
+  Activity,
+  RefreshCw,
+  UploadCloud,
+  MoreHorizontal,
+  ShieldAlert,
+  ShieldCheck,
+  Boxes,
+  HeartPulse,
+  HeartCrack,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { storage } from '@/lib/storage'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
 import {
-  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
-} from '@/components/ui/dialog'
-import {
-  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
-  DropdownMenuItem, DropdownMenuLabel,
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu'
 import {
-  useLoadBalancingMode, useSetLoadBalancingMode,
-  useAccountThrottleConfig, useSetAccountThrottleConfig,
-  useSelfHealConfig, useSetSelfHealConfig,
+  useLoadBalancingMode,
+  useSetLoadBalancingMode,
+  useAccountThrottleConfig,
+  useSetAccountThrottleConfig,
+  useSelfHealConfig,
+  useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { updateAdminKey, type SelfHealConfigPatch } from '@/api/credentials'
-import { extractErrorMessage, generateApiKey } from '@/lib/utils'
+import { extractErrorMessage } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 
 /**
- * 顶栏右侧通用工具栏：负载均衡切换、可用模型、刷新、在线更新、设置（Key 管理）。
+ * 顶栏工具区：三个调度开关 + 三个动作按钮。
  *
- * 与原 Dashboard 中的工具按钮等价，但全局 Tab 都可访问。刷新按钮会失效
- * 凭据/客户端 Key/统计三类查询，覆盖三个 Tab 的主要数据源。
+ * 这里此前塞了完整的配置面板 —— 冷却时长的 5 个预设按钮、自定义分钟输入、自愈连续
+ * 上限输入、登录密钥表单，还各写了 compact / full 两套。下拉菜单里放数字输入框本来
+ * 就不是它该干的事：菜单是"选一个动作"的容器，不是表单容器。
+ *
+ * 现在的分工：**顶栏只放一次点击就能完成的开关**（这三个是运维高频动作，不该退化成
+ * "进设置页找"），所有参数调整归「设置」Tab。compact 与 full 因此收敛成同一份
+ * 开关定义，窄屏只是把它们折进一个菜单。
  */
 interface TopbarToolsProps {
   compact?: boolean
 }
 
+// 顶栏“刷新数据”只刷新数据查询；配置查询有各自的保存/轮询语义。
+const NON_DATA_QUERY_ROOTS = new Set([
+  'loadBalancingMode',
+  'accountThrottleConfig',
+  'accountRpmLimitConfig',
+  'selfHealConfig',
+  'logGovernanceConfig',
+  'global-proxy',
+  'custom-models',
+  'update-config',
+  'system-update-check',
+])
+
+/** 一个开关的完整描述，compact / full 两种排布共用 */
+interface ToggleSpec {
+  key: string
+  /** 当前是否开启 */
+  on: boolean
+  busy: boolean
+  /** full 模式的按钮文案 */
+  label: string
+  /** compact 模式的菜单项文案（说明这次点击会做什么） */
+  menuLabel: string
+  title: string
+  icon: React.ReactNode
+  onToggle: () => void
+}
+
 export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const queryClient = useQueryClient()
-  const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
-  const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
-  const { data: throttleConfig, isLoading: isLoadingThrottle } = useAccountThrottleConfig()
-  const { mutate: setThrottleConfig, isPending: isSettingThrottle } = useSetAccountThrottleConfig()
+  const { data: lbData, isLoading: lbLoading } = useLoadBalancingMode()
+  const { mutate: setLb, isPending: lbSaving } = useSetLoadBalancingMode()
+  const { data: throttle, isLoading: thLoading } = useAccountThrottleConfig()
+  const { mutate: setThrottle, isPending: thSaving } = useSetAccountThrottleConfig()
+  const { data: selfHeal, isLoading: shLoading } = useSelfHealConfig()
+  const { mutate: setSelfHeal, isPending: shSaving } = useSetSelfHealConfig()
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
-  const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
-  const [keyDialogOpen, setKeyDialogOpen] = useState(false)
-  const [newKey, setNewKey] = useState('')
-  const [showPlain, setShowPlain] = useState(false)
-  const [updating, setUpdating] = useState(false)
+  const [modelsOpen, setModelsOpen] = useState(false)
 
   const handleRefresh = () => {
-    queryClient.invalidateQueries({ queryKey: ['credentials'] })
-    queryClient.invalidateQueries({ queryKey: ['client-keys'] })
-    queryClient.invalidateQueries({ queryKey: ['stats'] })
-    queryClient.invalidateQueries({ queryKey: ['current-credential-models'] })
-    queryClient.invalidateQueries({ queryKey: ['credential-models'] })
+    // 刷新所有数据查询；配置查询不属于“刷新数据”，也不会因此触发上游检查。
+    queryClient.invalidateQueries({
+      predicate: ({ queryKey }) => {
+        const root = queryKey[0]
+        return typeof root === 'string' && !NON_DATA_QUERY_ROOTS.has(root)
+      },
+    })
     toast.success('已刷新')
   }
 
-  const handleToggleLoadBalancing = () => {
-    const cur = loadBalancingData?.mode || 'priority'
-    const next = cur === 'priority' ? 'balanced' : 'priority'
-    setLoadBalancingMode(next, {
-      onSuccess: () => toast.success(`已切换到${next === 'priority' ? '优先级模式' : '均衡负载模式'}`),
-      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
-    })
-  }
+  const onError = (err: unknown) =>
+    toast.error('切换失败：' + extractErrorMessage(err))
 
-  const handleToggleFailover = () => {
-    const cur = throttleConfig?.failover ?? true
-    const next = !cur
-    setThrottleConfig({ failover: next }, {
-      onSuccess: () => toast.success(next ? '已开启账号级风控故障转移' : '已关闭账号级风控故障转移'),
-      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
-    })
-  }
+  const balanced = lbData?.mode === 'balanced'
+  const failover = throttle?.failover ?? true
+  const healing = selfHeal?.enabled ?? true
+  const cooldownMin = Math.round((throttle?.cooldownSecs ?? 1800) / 60)
 
-  const openKeyDialog = () => {
-    setNewKey('')
-    setShowPlain(false)
-    setKeyDialogOpen(true)
-  }
-
-  const handleUpdateKey = async (e: React.FormEvent) => {
-    e.preventDefault()
-    const key = newKey.trim()
-    if (!key) {
-      toast.error('新登录API密钥不能为空')
-      return
-    }
-    setUpdating(true)
-    try {
-      await updateAdminKey({ newKey: key })
-      storage.setApiKey(key)
-      toast.success('登录API密钥已更新，已自动切换到新 Key')
-      setKeyDialogOpen(false)
-      setNewKey('')
-    } catch (err) {
-      toast.error(`更新失败: ${extractErrorMessage(err)}`)
-    } finally {
-      setUpdating(false)
-    }
-  }
-
-  const controls = {
-    handleRefresh,
-    handleToggleFailover,
-    handleToggleLoadBalancing,
-    isLoadingMode,
-    isLoadingThrottle,
-    isSettingMode,
-    isSettingThrottle,
-    loadBalancingMode: loadBalancingData?.mode,
-    openImageUpdate: () => setImageUpdateOpen(true),
-    openModels: () => setModelsDialogOpen(true),
-    openKeyDialog,
-    throttleConfig,
-    updateCheck,
-    updateCooldown: (secs: number) =>
-      setThrottleConfig({ cooldownSecs: secs }, {
-        onSuccess: () =>
-          toast.success(`冷却时长已设为 ${Math.round(secs / 60)} 分钟`),
-        onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
-      }),
-  }
+  const toggles: ToggleSpec[] = [
+    {
+      key: 'lb',
+      on: balanced,
+      busy: lbLoading || lbSaving,
+      label: lbLoading ? '加载中…' : balanced ? '均衡负载' : '按优先级',
+      menuLabel: balanced ? '切换到按优先级' : '切换到均衡负载',
+      title: balanced
+        ? '调度模式：均衡负载 —— 按用量动态摊平到整个池子'
+        : '调度模式：按优先级 —— 数字越小越先用，用完再换下一个',
+      icon: <Activity className="h-3.5 w-3.5" />,
+      onToggle: () =>
+        setLb(balanced ? 'priority' : 'balanced', {
+          onSuccess: () =>
+            toast.success(
+              balanced ? '已切换到按优先级调度' : '已切换到均衡负载',
+            ),
+          onError,
+        }),
+    },
+    {
+      key: 'failover',
+      on: failover,
+      busy: thLoading || thSaving,
+      label: thLoading ? '加载中…' : failover ? `故障转移 · ${cooldownMin}m` : '不切换',
+      menuLabel: failover ? '关闭故障转移' : '开启故障转移',
+      title: failover
+        ? `账号级风控故障转移：开启（冷却 ${cooldownMin} 分钟，可在设置页调整）`
+        : '账号级风控故障转移：关闭',
+      icon: failover ? (
+        <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
+      ) : (
+        <ShieldAlert className="h-3.5 w-3.5 text-amber-500" />
+      ),
+      onToggle: () =>
+        setThrottle(
+          { failover: !failover },
+          {
+            onSuccess: () =>
+              toast.success(failover ? '已关闭故障转移' : '已开启故障转移'),
+            onError,
+          },
+        ),
+    },
+    {
+      key: 'selfheal',
+      on: healing,
+      busy: shLoading || shSaving,
+      label: shLoading ? '加载中…' : healing ? '自愈开' : '自愈关',
+      menuLabel: healing ? '关闭凭据自愈' : '开启凭据自愈',
+      title: healing
+        ? `凭据自愈：已启用（当前连续 ${selfHeal?.consecutiveRounds ?? 0} 轮，参数见设置页）`
+        : '凭据自愈：已关闭',
+      icon: healing ? (
+        <HeartPulse className="h-3.5 w-3.5 text-emerald-600" />
+      ) : (
+        <HeartCrack className="h-3.5 w-3.5 text-amber-500" />
+      ),
+      onToggle: () =>
+        setSelfHeal(
+          { enabled: !healing },
+          {
+            onSuccess: () =>
+              toast.success(healing ? '已关闭凭据自愈' : '已开启凭据自愈'),
+            onError,
+          },
+        ),
+    },
+  ]
 
   return (
     <>
-      {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
+      {compact ? (
+        <CompactTools
+          toggles={toggles}
+          hasUpdate={!!updateCheck?.hasUpdate}
+          onRefresh={handleRefresh}
+          onOpenModels={() => setModelsOpen(true)}
+          onOpenImageUpdate={() => setImageUpdateOpen(true)}
+        />
+      ) : (
+        <FullTools
+          toggles={toggles}
+          updateCheck={updateCheck}
+          onRefresh={handleRefresh}
+          onOpenModels={() => setModelsOpen(true)}
+          onOpenImageUpdate={() => setImageUpdateOpen(true)}
+        />
+      )}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
-      <AvailableModelsDialog
-        open={modelsDialogOpen}
-        onOpenChange={setModelsDialogOpen}
-      />
-
-      <Dialog
-        open={keyDialogOpen}
-        onOpenChange={(open) => { if (!updating) setKeyDialogOpen(open) }}
-      >
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Key className="h-4 w-4" />
-              修改登录API密钥
-            </DialogTitle>
-            <DialogDescription>
-              用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleUpdateKey} className="space-y-4 py-2">
-            <div className="relative">
-              <Input
-                type={showPlain ? 'text' : 'password'}
-                placeholder="输入或生成新的登录API密钥"
-                value={newKey}
-                onChange={(e) => setNewKey(e.target.value)}
-                disabled={updating}
-                autoFocus
-                className="pr-20 font-mono text-[13px]"
-              />
-              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={() => setShowPlain((v) => !v)}
-                  disabled={updating}
-                  title={showPlain ? '隐藏' : '显示'}
-                >
-                  {showPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={async () => {
-                    if (!newKey.trim()) {
-                      toast.error('请先输入或生成 Key 再复制')
-                      return
-                    }
-                    try {
-                      await navigator.clipboard.writeText(newKey)
-                      toast.success('已复制到剪贴板')
-                    } catch {
-                      toast.error('复制失败，请手动选择文本')
-                    }
-                  }}
-                  disabled={updating}
-                  title="复制"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  const key = generateApiKey('sk-admin-')
-                  setNewKey(key)
-                  setShowPlain(true)
-                }}
-                disabled={updating}
-              >
-                <Wand2 className="h-3.5 w-3.5" />生成随机 Key
-              </Button>
-              <p className="text-[11px] text-muted-foreground">
-                建议生成后立即复制保存，确认更新后即生效。
-              </p>
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setKeyDialogOpen(false)} disabled={updating}>
-                取消
-              </Button>
-              <Button type="submit" disabled={updating || !newKey.trim()}>
-                {updating ? '更新中…' : '确认更新'}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      <AvailableModelsDialog open={modelsOpen} onOpenChange={setModelsOpen} />
     </>
   )
 }
 
-interface ToolControls {
-  handleRefresh: () => void
-  handleToggleFailover: () => void
-  handleToggleLoadBalancing: () => void
-  isLoadingMode: boolean
-  isLoadingThrottle: boolean
-  isSettingMode: boolean
-  isSettingThrottle: boolean
-  loadBalancingMode?: 'priority' | 'balanced'
-  openImageUpdate: () => void
-  openKeyDialog: () => void
-  openModels: () => void
-  throttleConfig?: { failover: boolean; cooldownSecs: number }
-  updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
-  updateCooldown: (secs: number) => void
+interface ToolsProps {
+  toggles: ToggleSpec[]
+  onRefresh: () => void
+  onOpenModels: () => void
+  onOpenImageUpdate: () => void
 }
 
-function FullTools({ controls }: { controls: ToolControls }) {
+function FullTools({
+  toggles,
+  updateCheck,
+  onRefresh,
+  onOpenModels,
+  onOpenImageUpdate,
+}: ToolsProps & {
+  updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
+}) {
   return (
     <>
-      <LoadBalancingButton controls={controls} />
-      <ThrottleConfigButton
-        config={controls.throttleConfig}
-        loading={controls.isLoadingThrottle}
-        saving={controls.isSettingThrottle}
-        onToggleFailover={controls.handleToggleFailover}
-        onChangeCooldown={controls.updateCooldown}
-      />
-      <SelfHealConfigButton />
-      <ModelsButton onOpen={controls.openModels} />
-      <RefreshButton onRefresh={controls.handleRefresh} />
-      <ImageUpdateButton controls={controls} />
-      <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
+      {toggles.map((t) => (
+        <Button
+          key={t.key}
+          variant="outline"
+          size="sm"
+          onClick={t.onToggle}
+          disabled={t.busy}
+          title={t.title}
+        >
+          {t.icon}
+          <span className="hidden md:inline">{t.label}</span>
+        </Button>
+      ))}
+      <Button variant="ghost" size="icon" onClick={onOpenModels} title="可用模型">
+        <Boxes className="h-4 w-4" />
+      </Button>
+      <Button variant="ghost" size="icon" onClick={onRefresh} title="刷新数据">
+        <RefreshCw className="h-4 w-4" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={onOpenImageUpdate}
+        title={
+          updateCheck?.hasUpdate
+            ? `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
+            : '镜像在线更新'
+        }
+        className="relative"
+      >
+        <UploadCloud className="h-4 w-4" />
+        {updateCheck?.hasUpdate && <UpdateDot />}
+      </Button>
     </>
   )
 }
 
-function CompactTools({ controls }: { controls: ToolControls }) {
-  const throttleProps = {
-    config: controls.throttleConfig,
-    loading: controls.isLoadingThrottle,
-    saving: controls.isSettingThrottle,
-    onToggleFailover: controls.handleToggleFailover,
-    onChangeCooldown: controls.updateCooldown,
-  }
-
+function CompactTools({
+  toggles,
+  hasUpdate,
+  onRefresh,
+  onOpenModels,
+  onOpenImageUpdate,
+}: ToolsProps & { hasUpdate: boolean }) {
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="icon" title="更多操作">
+        <Button variant="ghost" size="icon" title="更多操作" className="relative">
           <MoreHorizontal className="h-4 w-4" />
+          {hasUpdate && <UpdateDot />}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-64">
-        <DropdownMenuLabel>系统操作</DropdownMenuLabel>
-        <DropdownMenuItem
-          disabled={controls.isLoadingMode || controls.isSettingMode}
-          onSelect={controls.handleToggleLoadBalancing}
-        >
-          <Activity />
-          {controls.isLoadingMode
-            ? '负载均衡加载中'
-            : controls.loadBalancingMode === 'priority'
-              ? '切换到均衡负载'
-              : '切换到优先级'}
+      {/* 窄屏兜底：菜单项随调度开关增加时不撑出视口，超出即在菜单内滚动 */}
+      <DropdownMenuContent
+        align="end"
+        className="max-h-[calc(100dvh-4.5rem)] w-56 max-w-[calc(100dvw-1rem)] overflow-x-hidden overflow-y-auto overscroll-contain"
+      >
+        <DropdownMenuLabel>调度</DropdownMenuLabel>
+        {toggles.map((t) => (
+          <DropdownMenuItem key={t.key} disabled={t.busy} onSelect={t.onToggle}>
+            {t.icon}
+            {t.menuLabel}
+          </DropdownMenuItem>
+        ))}
+        <DropdownMenuLabel>操作</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onRefresh}>
+          <RefreshCw />
+          刷新数据
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={controls.handleRefresh}>
-          <RefreshCw />刷新数据
+        <DropdownMenuItem onSelect={onOpenModels}>
+          <Boxes />
+          可用模型
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={controls.openModels}>
-          <Boxes />可用模型
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={controls.openImageUpdate}>
-          <UploadCloud />镜像在线更新
-        </DropdownMenuItem>
-        <ThrottleCompactItems {...throttleProps} />
-        <SelfHealCompactItems />
-        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={controls.openKeyDialog}>
-          <Key />修改登录API密钥（管理面板登录）
+        <DropdownMenuItem onSelect={onOpenImageUpdate}>
+          <UploadCloud />
+          镜像在线更新
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
-}
-
-function LoadBalancingButton({ controls }: { controls: ToolControls }) {
-  return (
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={controls.handleToggleLoadBalancing}
-      disabled={controls.isLoadingMode || controls.isSettingMode}
-      title="切换负载均衡模式"
-    >
-      <Activity className="h-3.5 w-3.5" />
-      <span className="hidden md:inline">
-        {controls.isLoadingMode
-          ? '加载中…'
-          : controls.loadBalancingMode === 'priority'
-            ? '优先级'
-            : '均衡负载'}
-      </span>
-    </Button>
-  )
-}
-
-function ModelsButton({ onOpen }: { onOpen: () => void }) {
-  return (
-    <Button variant="ghost" size="icon" onClick={onOpen} title="可用模型">
-      <Boxes className="h-4 w-4" />
-    </Button>
-  )
-}
-
-function RefreshButton({ onRefresh }: { onRefresh: () => void }) {
-  return (
-    <Button variant="ghost" size="icon" onClick={onRefresh} title="刷新">
-      <RefreshCw className="h-4 w-4" />
-    </Button>
-  )
-}
-
-function ImageUpdateButton({ controls }: { controls: ToolControls }) {
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      onClick={controls.openImageUpdate}
-      title={imageUpdateTitle(controls.updateCheck)}
-      className="relative"
-    >
-      <UploadCloud className="h-4 w-4" />
-      {controls.updateCheck?.hasUpdate && <UpdateDot />}
-    </Button>
-  )
-}
-
-function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title="设置">
-          <Settings className="h-4 w-4" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={onOpenKeyDialog}>
-          <Key />修改登录API密钥（管理面板登录）
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
-function imageUpdateTitle(updateCheck: ToolControls['updateCheck']) {
-  if (!updateCheck?.hasUpdate) return '镜像在线更新'
-  return `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
 }
 
 function UpdateDot() {
@@ -399,553 +310,4 @@ function UpdateDot() {
       <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
     </span>
   )
-}
-
-interface ThrottleConfigButtonProps {
-  config?: { failover: boolean; cooldownSecs: number }
-  loading: boolean
-  saving: boolean
-  onToggleFailover: () => void
-  onChangeCooldown: (secs: number) => void
-}
-
-interface ThrottleState {
-  cooldownMin: number
-  cooldownSecs: number
-  failover: boolean
-}
-
-interface CustomCooldownFormProps {
-  cooldownMin: number
-  customMin: string
-  disabled: boolean
-  onCustomMinChange: (value: string) => void
-  onSubmit: (e: React.FormEvent) => void
-}
-
-interface ThrottleTriggerProps extends ComponentPropsWithoutRef<typeof Button> {
-  loading: boolean
-  saving: boolean
-  state: ThrottleState
-}
-
-const COOLDOWN_PRESETS = [
-  { label: '5 分钟', secs: 5 * 60 },
-  { label: '15 分钟', secs: 15 * 60 },
-  { label: '30 分钟', secs: 30 * 60 },
-  { label: '1 小时', secs: 60 * 60 },
-  { label: '2 小时', secs: 2 * 60 * 60 },
-]
-
-const DEFAULT_COOLDOWN_SECS = 30 * 60
-const SECONDS_PER_MINUTE = 60
-const MIN_CUSTOM_COOLDOWN_MINUTES = 1
-const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
-
-/**
- * 故障转移开关 + 冷却时长设置（紧凑下拉）
- *
- * 主按钮文案显示当前状态；下拉里:
- * - 顶部一个 Switch 切换 failover
- * - 5 个预设时长 + 一个自定义输入（分钟）
- */
-function ThrottleConfigButton({
-  config, loading, saving, onToggleFailover, onChangeCooldown,
-}: ThrottleConfigButtonProps) {
-  const [open, setOpen] = useState(false)
-  const [customMin, setCustomMin] = useState('')
-  const state = readThrottleState(config)
-
-  useEffect(() => {
-    if (!open) setCustomMin('')
-  }, [open])
-
-  const submitCustom = (e: React.FormEvent) => {
-    e.preventDefault()
-    const min = parseInt(customMin, 10)
-    if (invalidCooldownMinutes(min)) {
-      toast.error('请输入 1-1440 之间的分钟数')
-      return
-    }
-    onChangeCooldown(min * SECONDS_PER_MINUTE)
-    setOpen(false)
-  }
-
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <ThrottleTrigger loading={loading} saving={saving} state={state} />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-64">
-        <ThrottleStatusPanel
-          saving={saving}
-          state={state}
-          onToggleFailover={onToggleFailover}
-        />
-        <ThrottleCooldownPanel
-          customMin={customMin}
-          saving={saving}
-          state={state}
-          onChangeCooldown={onChangeCooldown}
-          onCustomMinChange={setCustomMin}
-          onDone={() => setOpen(false)}
-          onSubmitCustom={submitCustom}
-        />
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
-const ThrottleTrigger = forwardRef<HTMLButtonElement, ThrottleTriggerProps>(
-  function ThrottleTrigger({ loading, saving, state, ...props }, ref) {
-    return (
-      <Button
-        {...props}
-        ref={ref}
-        variant="outline"
-        size="sm"
-        disabled={loading || saving}
-        title={throttleTitle(loading, state)}
-      >
-        {state.failover ? (
-          <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
-        ) : (
-          <ShieldAlert className="h-3.5 w-3.5 text-amber-500" />
-        )}
-        <span className="hidden md:inline">
-          {throttleTriggerText(loading, state)}
-        </span>
-      </Button>
-    )
-  },
-)
-
-function ThrottleStatusPanel({
-  saving, state, onToggleFailover,
-}: {
-  saving: boolean
-  state: ThrottleState
-  onToggleFailover: () => void
-}) {
-  return (
-    <>
-      <DropdownMenuLabel>账号级风控故障转移</DropdownMenuLabel>
-      <div className="px-2 pb-2">
-        <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
-          <ThrottleStatusText failover={state.failover} />
-          <Switch
-            checked={state.failover}
-            disabled={saving}
-            onCheckedChange={() => onToggleFailover()}
-          />
-        </div>
-      </div>
-    </>
-  )
-}
-
-function ThrottleStatusText({ failover }: { failover: boolean }) {
-  return (
-    <div className="text-xs">
-      <div className="font-medium text-foreground">
-        {failover ? '开启' : '关闭'}
-      </div>
-      <div className="text-muted-foreground leading-snug">
-        {failover
-          ? '上游对当前账号触发临时限速时，自动冷却该凭据并切换到下一个可用凭据'
-          : '上游对当前账号触发临时限速时，仅按瞬态错误重试，不切换凭据'}
-      </div>
-    </div>
-  )
-}
-
-function ThrottleCooldownPanel({
-  customMin, saving, state, onChangeCooldown, onCustomMinChange, onDone, onSubmitCustom,
-}: {
-  customMin: string
-  saving: boolean
-  state: ThrottleState
-  onChangeCooldown: (secs: number) => void
-  onCustomMinChange: (value: string) => void
-  onDone?: () => void
-  onSubmitCustom: (e: React.FormEvent) => void
-}) {
-  const disabled = saving || !state.failover
-
-  return (
-    <>
-      <DropdownMenuLabel className="pt-1">冷却时长</DropdownMenuLabel>
-      <div className={cooldownPanelClassName(state.failover)}>
-        <CooldownPresetButtons
-          cooldownSecs={state.cooldownSecs}
-          disabled={disabled}
-          onChangeCooldown={onChangeCooldown}
-          onDone={onDone}
-        />
-        <CustomCooldownForm
-          cooldownMin={state.cooldownMin}
-          customMin={customMin}
-          disabled={disabled}
-          onCustomMinChange={onCustomMinChange}
-          onSubmit={onSubmitCustom}
-        />
-      </div>
-    </>
-  )
-}
-
-function CustomCooldownForm({
-  cooldownMin, customMin, disabled, onCustomMinChange, onSubmit,
-}: CustomCooldownFormProps) {
-  return (
-    <form onSubmit={onSubmit} className="mt-2 flex items-center gap-1.5">
-      <Input
-        type="number"
-        min={MIN_CUSTOM_COOLDOWN_MINUTES}
-        max={MAX_CUSTOM_COOLDOWN_MINUTES}
-        placeholder={`自定义（当前 ${cooldownMin}）`}
-        value={customMin}
-        onChange={(e) => onCustomMinChange(e.target.value)}
-        disabled={disabled}
-        className="h-7 text-xs"
-      />
-      <span className="text-xs text-muted-foreground">分钟</span>
-      <Button
-        type="submit"
-        size="sm"
-        variant="outline"
-        className="h-7 text-xs"
-        disabled={disabled || !customMin.trim()}
-      >
-        保存
-      </Button>
-    </form>
-  )
-}
-
-function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
-  const { loading, saving, onToggleFailover, onChangeCooldown } = props
-  const [customMin, setCustomMin] = useState('')
-  const state = readThrottleState(props.config)
-  const busy = loading || saving
-
-  const submitCustom = (e: React.FormEvent) => {
-    e.preventDefault()
-    const min = parseInt(customMin, 10)
-    if (invalidCooldownMinutes(min)) {
-      toast.error('请输入 1-1440 之间的分钟数')
-      return
-    }
-    onChangeCooldown(min * SECONDS_PER_MINUTE)
-    setCustomMin('')
-  }
-
-  return (
-    <>
-      <DropdownMenuLabel>故障转移</DropdownMenuLabel>
-      <DropdownMenuItem
-        disabled={busy}
-        onSelect={onToggleFailover}
-      >
-        {state.failover ? <ShieldCheck /> : <ShieldAlert />}
-        {compactThrottleText(loading, state)}
-      </DropdownMenuItem>
-      <ThrottleCooldownPanel
-        customMin={customMin}
-        saving={busy}
-        state={state}
-        onChangeCooldown={onChangeCooldown}
-        onCustomMinChange={setCustomMin}
-        onSubmitCustom={submitCustom}
-      />
-    </>
-  )
-}
-
-// ============ 自愈治理 ============
-
-const SELF_HEAL_INTERVAL_PRESETS = [
-  { label: '不冷却', secs: 0 },
-  { label: '1 分钟', secs: 60 },
-  { label: '5 分钟', secs: 5 * 60 },
-  { label: '15 分钟', secs: 15 * 60 },
-  { label: '30 分钟', secs: 30 * 60 },
-]
-
-/**
- * 自愈治理设置（下拉）：
- * - 开关：是否启用凭据自愈
- * - 冷却间隔：两次自愈的最小间隔（打断持续 403 死循环的关键）
- * - 连续上限：连续自愈达到该轮数且期间无成功则停止（0=不限）
- * - 只读观测：凭据最大连续轮数 / 累计恢复凭据次数
- */
-function SelfHealConfigButton() {
-  const { data: config, isLoading } = useSelfHealConfig()
-  const { mutate, isPending } = useSetSelfHealConfig()
-  const [open, setOpen] = useState(false)
-  const [roundsInput, setRoundsInput] = useState('')
-
-  useEffect(() => {
-    if (!open) setRoundsInput('')
-  }, [open])
-
-  const enabled = config?.enabled ?? true
-  const busy = isLoading || isPending
-
-  const save = (patch: SelfHealConfigPatch, msg: string) => {
-    mutate(patch, {
-      onSuccess: () => toast.success(msg),
-      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
-    })
-  }
-
-  const submitRounds = (e: React.FormEvent) => {
-    e.preventDefault()
-    const n = parseInt(roundsInput, 10)
-    if (Number.isNaN(n) || n < 0 || n > 1000) {
-      toast.error('请输入 0-1000 之间的轮数（0=不限）')
-      return
-    }
-    save({ maxConsecutiveRounds: n }, n === 0 ? '连续自愈已设为不限' : `连续自愈上限已设为 ${n} 轮`)
-    setRoundsInput('')
-  }
-
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={busy}
-          title={enabled ? '凭据自愈：已启用' : '凭据自愈：已关闭'}
-        >
-          {enabled ? (
-            <HeartPulse className="h-3.5 w-3.5 text-emerald-600" />
-          ) : (
-            <HeartCrack className="h-3.5 w-3.5 text-amber-500" />
-          )}
-          <span className="hidden md:inline">
-            {isLoading ? '自愈…' : enabled ? '自愈开' : '自愈关'}
-          </span>
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
-        <DropdownMenuLabel>凭据自愈</DropdownMenuLabel>
-        <div className="px-2 pb-2">
-          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
-            <div className="text-xs">
-              <div className="font-medium">{enabled ? '已启用' : '已关闭'}</div>
-              <div className="text-muted-foreground">
-                当前请求池全灭时按作用域恢复凭据
-              </div>
-            </div>
-            <Switch
-              checked={enabled}
-              disabled={busy}
-              onCheckedChange={(v) => save({ enabled: v }, v ? '已开启凭据自愈' : '已关闭凭据自愈')}
-            />
-          </div>
-          {config && (
-            <div className="mt-2 flex items-center justify-between rounded-md bg-secondary/20 px-2.5 py-1.5 text-xs text-muted-foreground">
-              <span>连续 {config.consecutiveRounds} 轮</span>
-              <span>累计恢复 {config.totalCount} 次</span>
-            </div>
-          )}
-        </div>
-
-        <DropdownMenuLabel className="pt-1">403 封禁识别</DropdownMenuLabel>
-        <div className="px-2 pb-2">
-          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
-            <div className="text-xs">
-              <div className="font-medium">
-                {config?.suspendedDetectionEnabled ?? true ? '已启用' : '已关闭'}
-              </div>
-              <div className="text-muted-foreground">
-                命中封禁文案的 403 立即禁用，不参与自愈
-              </div>
-            </div>
-            <Switch
-              checked={config?.suspendedDetectionEnabled ?? true}
-              disabled={busy}
-              onCheckedChange={(v) =>
-                save({ suspendedDetectionEnabled: v }, v ? '已开启 403 封禁识别' : '已关闭 403 封禁识别')
-              }
-            />
-          </div>
-        </div>
-
-        <DropdownMenuLabel className="pt-1">自愈冷却间隔</DropdownMenuLabel>
-        <div className={cooldownPanelClassName(enabled)}>
-          <div className="grid grid-cols-3 gap-1.5">
-            {SELF_HEAL_INTERVAL_PRESETS.map((p) => (
-              <Button
-                key={p.secs}
-                size="sm"
-                variant={config?.minIntervalSecs === p.secs ? 'default' : 'outline'}
-                className="h-7 text-xs"
-                disabled={busy || !enabled}
-                onClick={() => save({ minIntervalSecs: p.secs }, `自愈冷却已设为「${p.label}」`)}
-              >
-                {p.label}
-              </Button>
-            ))}
-          </div>
-
-          <DropdownMenuLabel className="px-0 pt-2">连续自愈上限（0=不限）</DropdownMenuLabel>
-          <form onSubmit={submitRounds} className="mt-1 flex items-center gap-1.5">
-            <Input
-              type="number"
-              min={0}
-              max={1000}
-              placeholder={`当前 ${config?.maxConsecutiveRounds ?? 5} 轮`}
-              value={roundsInput}
-              onChange={(e) => setRoundsInput(e.target.value)}
-              disabled={busy || !enabled}
-              className="h-7 text-xs"
-            />
-            <span className="text-xs text-muted-foreground">轮</span>
-            <Button
-              type="submit"
-              size="sm"
-              variant="outline"
-              className="h-7 text-xs"
-              disabled={busy || !enabled || !roundsInput.trim()}
-            >
-              保存
-            </Button>
-          </form>
-        </div>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
-/** 紧凑模式（下拉菜单内）的自愈开关项 */
-function SelfHealCompactItems() {
-  const { data: config, isLoading } = useSelfHealConfig()
-  const { mutate, isPending } = useSetSelfHealConfig()
-  const enabled = config?.enabled ?? true
-  const busy = isLoading || isPending
-
-  return (
-    <>
-      <DropdownMenuLabel>凭据自愈</DropdownMenuLabel>
-      <DropdownMenuItem
-        disabled={busy}
-        onSelect={() =>
-          mutate(
-            { enabled: !enabled },
-            {
-              onSuccess: () => toast.success(!enabled ? '已开启凭据自愈' : '已关闭凭据自愈'),
-              onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
-            },
-          )
-        }
-      >
-        {enabled ? <HeartPulse /> : <HeartCrack />}
-        {isLoading
-          ? '自愈加载中'
-          : enabled
-            ? `关闭自愈（连续 ${config?.consecutiveRounds ?? 0} 轮）`
-            : '开启全账号自愈'}
-      </DropdownMenuItem>
-    </>
-  )
-}
-
-function CooldownPresetButtons({
-  cooldownSecs, disabled, onChangeCooldown, onDone,
-}: {
-  cooldownSecs: number
-  disabled: boolean
-  onChangeCooldown: (secs: number) => void
-  onDone?: () => void
-}) {
-  return (
-    <div className="grid grid-cols-3 gap-1">
-      {COOLDOWN_PRESETS.map((preset) => (
-        <CooldownPresetButton
-          key={preset.secs}
-          active={preset.secs === cooldownSecs}
-          disabled={disabled}
-          label={preset.label}
-          secs={preset.secs}
-          onChangeCooldown={onChangeCooldown}
-          onDone={onDone}
-        />
-      ))}
-    </div>
-  )
-}
-
-function CooldownPresetButton({
-  active, disabled, label, secs, onChangeCooldown, onDone,
-}: {
-  active: boolean
-  disabled: boolean
-  label: string
-  secs: number
-  onChangeCooldown: (secs: number) => void
-  onDone?: () => void
-}) {
-  return (
-    <Button
-      type="button"
-      size="sm"
-      variant={active ? 'default' : 'outline'}
-      className="h-7 text-xs"
-      disabled={disabled}
-      onClick={() => {
-        if (!active) onChangeCooldown(secs)
-        onDone?.()
-      }}
-    >
-      {label}
-    </Button>
-  )
-}
-
-function secondsToMinutes(seconds: number) {
-  return Math.round(seconds / SECONDS_PER_MINUTE)
-}
-
-function readThrottleState(
-  config: ThrottleConfigButtonProps['config'],
-): ThrottleState {
-  const cooldownSecs = config?.cooldownSecs ?? DEFAULT_COOLDOWN_SECS
-  return {
-    cooldownMin: secondsToMinutes(cooldownSecs),
-    cooldownSecs,
-    failover: config?.failover ?? true,
-  }
-}
-
-function throttleTitle(loading: boolean, state: ThrottleState) {
-  if (loading) return '加载中…'
-  if (!state.failover) return '账号级风控故障转移：关闭'
-  return `账号级风控故障转移：开启（冷却 ${state.cooldownMin} 分钟）`
-}
-
-function throttleTriggerText(loading: boolean, state: ThrottleState) {
-  if (loading) return '加载中…'
-  if (!state.failover) return '不切换'
-  return `故障转移 · ${state.cooldownMin}m`
-}
-
-function compactThrottleText(loading: boolean, state: ThrottleState) {
-  if (loading) return '故障转移加载中'
-  if (!state.failover) return '开启故障转移'
-  return `关闭故障转移 · ${state.cooldownMin}m`
-}
-
-function invalidCooldownMinutes(minutes: number) {
-  return (
-    Number.isNaN(minutes) ||
-    minutes < MIN_CUSTOM_COOLDOWN_MINUTES ||
-    minutes > MAX_CUSTOM_COOLDOWN_MINUTES
-  )
-}
-
-function cooldownPanelClassName(failover: boolean) {
-  return `px-2 pb-2 ${failover ? '' : 'opacity-60'}`
 }

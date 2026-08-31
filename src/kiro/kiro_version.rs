@@ -8,9 +8,7 @@
 //! - 获取失败时调用方回退到 `config.kiro_version`，不阻塞启动。
 //!
 //! 注意：用量类 REST 接口（getUsageLimits / ListAvailableModels / setUserPreference）
-//! 不使用这里的「最新版本」——新版 IDE 对这些接口强制要求 profileArn，对 Enterprise/IdC
-//! 账号会失败。那几个接口固定使用 [`USAGE_API_KIRO_VERSION`]：该版本无需 profileArn
-//! 即可返回订阅与用量。
+//! 不使用这里的「最新版本」，而是固定使用 [`USAGE_API_KIRO_VERSION`]，见该常量的说明。
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -29,7 +27,11 @@ const METADATA_URL: &str =
     "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json";
 
 /// 用量类接口（getUsageLimits / ListAvailableModels / setUserPreference）固定使用的
-/// Kiro IDE 版本：该版本下上游无需 profileArn 即可返回数据，Enterprise/IdC 账号同样可用。
+/// Kiro IDE 版本，避免 IDE 版本漂移影响用量查询。
+///
+/// 该版本号只影响 User-Agent，不决定是否需要 profileArn：这些接口对
+/// Enterprise / IdC 账号始终要求真实 profileArn（缺失时 0.9.2 报 403、新版报
+/// 400 `Invalid profileArn.`），带上后两个版本返回的数据一致。
 pub const USAGE_API_KIRO_VERSION: &str = "0.9.2";
 
 static LATEST_VERSION: OnceLock<RwLock<Option<String>>> = OnceLock::new();

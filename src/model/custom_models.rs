@@ -1,14 +1,15 @@
 //! 自定义模型全局注册表
 //!
-//! 启动时由 [`init`] 从 `config.custom_models` 装载一次，运行期只读。仿
-//! `crate::token` / `crate::kiro::machine_id` 的 `OnceLock` 惯例，避免把配置表
-//! 逐层透传进 `map_model` / `get_context_window_size` 等无状态自由函数。
+//! 启动时由 [`init`] 从 `config.custom_models` 装载，运行期可通过 Admin API
+//! 热更新（`RwLock` 写锁替换）。仿 `crate::token` / `crate::kiro::machine_id`
+//! 的全局单例惯例，避免把配置表逐层透传进 `map_model` /
+//! `get_context_window_size` 等无状态自由函数。
 //!
 //! 匹配规则：按模型 `id` 大小写不敏感精确匹配；找不到时自动剥离 `-thinking`
 //! 后缀再试一次（与内置 `map_model` 对 thinking 变体的处理保持一致）。
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use super::config::CustomModel;
 
@@ -20,46 +21,51 @@ struct CustomModelRegistry {
     by_id: HashMap<String, usize>,
 }
 
-static REGISTRY: OnceLock<CustomModelRegistry> = OnceLock::new();
+static REGISTRY: RwLock<Option<CustomModelRegistry>> = RwLock::new(None);
 
-/// 初始化自定义模型注册表。
+/// 初始化 / 热更新自定义模型注册表。
 ///
-/// 应在应用启动时调用一次；重复调用会被忽略（`OnceLock` 语义）。后一条同名 id
+/// 启动时调用一次，运行期可通过 Admin API 再次调用以热更新。后一条同名 id
 /// 覆盖前一条的索引，但两者都保留在 `ordered` 中（`/v1/models` 会同时展示）。
 pub fn init(models: Vec<CustomModel>) {
     let mut by_id = HashMap::with_capacity(models.len());
     for (idx, m) in models.iter().enumerate() {
         by_id.insert(m.id.to_ascii_lowercase(), idx);
     }
-    let _ = REGISTRY.set(CustomModelRegistry {
-        ordered: models,
-        by_id,
-    });
+    if let Ok(mut reg) = REGISTRY.write() {
+        *reg = Some(CustomModelRegistry {
+            ordered: models,
+            by_id,
+        });
+    }
 }
 
 /// 按模型名查找自定义模型定义。
 ///
 /// 先按大小写不敏感精确匹配；未命中且名字带 `-thinking` 后缀时，剥离后再试一次。
-pub fn lookup(model: &str) -> Option<&'static CustomModel> {
-    let reg = REGISTRY.get()?;
+pub fn lookup(model: &str) -> Option<CustomModel> {
+    let reg = REGISTRY.read().ok()?;
+    let registry = reg.as_ref()?;
     let key = model.to_ascii_lowercase();
-    if let Some(&idx) = reg.by_id.get(&key) {
-        return reg.ordered.get(idx);
-    }
-    if let Some(stripped) = key.strip_suffix("-thinking") {
-        if let Some(&idx) = reg.by_id.get(stripped) {
-            return reg.ordered.get(idx);
-        }
-    }
-    None
+    let idx = registry
+        .by_id
+        .get(&key)
+        .copied()
+        .or_else(|| {
+            key.strip_suffix("-thinking")
+                .and_then(|stripped| registry.by_id.get(stripped))
+                .copied()
+        })?;
+    registry.ordered.get(idx).cloned()
 }
 
 /// 返回所有已注册的自定义模型（保持配置文件中的原始顺序）。
-pub fn all() -> &'static [CustomModel] {
+pub fn all() -> Vec<CustomModel> {
     REGISTRY
-        .get()
-        .map(|r| r.ordered.as_slice())
-        .unwrap_or(&[])
+        .read()
+        .ok()
+        .and_then(|r| r.as_ref().map(|reg| reg.ordered.clone()))
+        .unwrap_or_default()
 }
 
 /// 是否存在 `backend_id` 等于给定值且声明支持 reasoning 的自定义模型。
@@ -67,9 +73,17 @@ pub fn all() -> &'static [CustomModel] {
 /// `map_model` 把别名映射成 backend_id 后，`model_supports_native_reasoning`
 /// 拿到的是 backend_id；这里按 backend_id 反查，让自定义模型能声明 reasoning 能力。
 pub fn backend_supports_reasoning(backend_id: &str) -> bool {
-    all()
-        .iter()
-        .any(|m| m.backend_id == backend_id && m.supports_reasoning == Some(true))
+    REGISTRY
+        .read()
+        .ok()
+        .and_then(|r| {
+            r.as_ref().map(|reg| {
+                reg.ordered
+                    .iter()
+                    .any(|m| m.backend_id == backend_id && m.supports_reasoning == Some(true))
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

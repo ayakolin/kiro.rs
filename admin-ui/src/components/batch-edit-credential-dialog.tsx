@@ -13,10 +13,28 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { GroupMultiSelect } from '@/components/group-select'
+import {
+  CredentialMetadataField,
+  metadataFieldDefault,
+} from '@/components/credential-metadata-field'
 import { updateCredential } from '@/api/credentials'
-import type { CredentialStatusItem } from '@/types/api'
+import type {
+  CredentialMetadata,
+  CredentialMetadataSchema,
+  CredentialSaleStatus,
+  CredentialStatusItem,
+  CredentialType,
+  UpdateCredentialRequest,
+} from '@/types/api'
 
 type GroupMode = 'replace' | 'add' | 'remove'
+
+/** 状态接口的 metadata 带展示信息；批量编辑提交时只发送实际值。 */
+function metadataValues(metadata: CredentialStatusItem['metadata']): CredentialMetadata {
+  return Object.fromEntries(
+    Object.entries(metadata ?? {}).map(([key, detail]) => [key, detail.value]),
+  ) as CredentialMetadata
+}
 
 interface BatchEditCredentialDialogProps {
   open: boolean
@@ -25,6 +43,7 @@ interface BatchEditCredentialDialogProps {
   credentials: CredentialStatusItem[]
   /** 现有分组选项（去重聚合） */
   groupOptions: string[]
+  metadataSchema?: CredentialMetadataSchema
   /** 完成后回调（清空选择等） */
   onDone: () => void
 }
@@ -40,6 +59,7 @@ export function BatchEditCredentialDialog({
   onOpenChange,
   credentials,
   groupOptions,
+  metadataSchema,
   onDone,
 }: BatchEditCredentialDialogProps) {
   const queryClient = useQueryClient()
@@ -50,6 +70,12 @@ export function BatchEditCredentialDialog({
 
   const [editSource, setEditSource] = useState(false)
   const [sourceChannel, setSourceChannel] = useState('')
+  const [editType, setEditType] = useState(false)
+  const [credentialType, setCredentialType] = useState<CredentialType>('normal')
+  const [editSaleStatus, setEditSaleStatus] = useState(false)
+  const [saleStatus, setSaleStatus] = useState<CredentialSaleStatus>('not_for_sale')
+  const [editSalePrice, setEditSalePrice] = useState(false)
+  const [salePrice, setSalePrice] = useState('')
 
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -61,6 +87,14 @@ export function BatchEditCredentialDialog({
       setGroups([])
       setEditSource(false)
       setSourceChannel('')
+      setEditType(false)
+      setCredentialType(metadataFieldDefault(metadataSchema, 'type', 'normal') as CredentialType)
+      setEditSaleStatus(false)
+      setSaleStatus(
+        metadataFieldDefault(metadataSchema, 'saleStatus', 'not_for_sale') as CredentialSaleStatus,
+      )
+      setEditSalePrice(false)
+      setSalePrice('')
       setRunning(false)
       setProgress({ current: 0, total: 0 })
     }
@@ -74,8 +108,17 @@ export function BatchEditCredentialDialog({
   }
 
   const handleApply = async () => {
-    if (!editGroups && !editSource) {
+    if (!editGroups && !editSource && !editType && !editSaleStatus && !editSalePrice) {
       toast.error('请至少开启一项要修改的字段')
+      return
+    }
+    const parsedSalePrice = salePrice.trim() === '' ? undefined : Number(salePrice)
+    if (
+      editSalePrice
+      && parsedSalePrice !== undefined
+      && (!Number.isFinite(parsedSalePrice) || parsedSalePrice < 0)
+    ) {
+      toast.error('销售价格必须是大于或等于 0 的数字')
       return
     }
     setRunning(true)
@@ -84,9 +127,21 @@ export function BatchEditCredentialDialog({
     let fail = 0
     for (let i = 0; i < credentials.length; i++) {
       const c = credentials[i]
-      const req: Record<string, unknown> = {}
+      const req: UpdateCredentialRequest = {}
       if (editGroups) req.groups = computeGroups(c.groups ?? [])
       if (editSource) req.sourceChannel = sourceChannel.trim()
+      if (editType || editSaleStatus || editSalePrice) {
+        const metadata: CredentialMetadata = {
+          ...metadataValues(c.metadata),
+          ...(editType ? { type: credentialType } : {}),
+          ...(editSaleStatus ? { saleStatus } : {}),
+        }
+        if (editSalePrice) {
+          if (parsedSalePrice === undefined) delete metadata.salePrice
+          else metadata.salePrice = parsedSalePrice
+        }
+        req.metadata = metadata
+      }
       try {
         await updateCredential(c.id, req)
         ok++
@@ -164,6 +219,78 @@ export function BatchEditCredentialDialog({
                   disabled={running}
                 />
                 <p className="text-[11px] text-muted-foreground">纯备注，标记账号来源/渠道。</p>
+              </>
+            )}
+          </div>
+
+          {/* 账号类型区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改账号类型</span>
+              <Switch checked={editType} onCheckedChange={setEditType} disabled={running} />
+            </label>
+            {editType && (
+              <>
+                <CredentialMetadataField
+                  schema={metadataSchema}
+                  fieldKey="type"
+                  value={credentialType}
+                  onValueChange={(value) => setCredentialType(value as CredentialType)}
+                  disabled={running}
+                />
+                <p className="text-[11px] text-muted-foreground">其他扩展字段保持不变。</p>
+              </>
+            )}
+          </div>
+
+          {/* 在售状态区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改在售状态</span>
+              <Switch
+                checked={editSaleStatus}
+                onCheckedChange={setEditSaleStatus}
+                disabled={running}
+              />
+            </label>
+            {editSaleStatus && (
+              <>
+                <CredentialMetadataField
+                  schema={metadataSchema}
+                  fieldKey="saleStatus"
+                  value={saleStatus}
+                  onValueChange={(value) => setSaleStatus(value as CredentialSaleStatus)}
+                  disabled={running}
+                />
+                <p className="text-[11px] text-muted-foreground">其他扩展字段保持不变。</p>
+              </>
+            )}
+          </div>
+
+          {/* 销售价格区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改销售价格（CNY）</span>
+              <Switch
+                checked={editSalePrice}
+                onCheckedChange={setEditSalePrice}
+                disabled={running}
+              />
+            </label>
+            {editSalePrice && (
+              <>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={salePrice}
+                  onChange={(event) => setSalePrice(event.target.value)}
+                  placeholder="留空表示清除价格"
+                  disabled={running}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  应用到所有选中账号，卡片中按人民币格式显示。
+                </p>
               </>
             )}
           </div>

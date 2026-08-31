@@ -702,9 +702,29 @@ fn conversation_fingerprint(req: &MessagesRequest) -> u64 {
 
 /// 从 Claude Code 的 user_id 中提取 session 标识。
 ///
-/// 格式形如 `user_<hash>_account__session_<uuid>`，取 `_session_` 之后的部分。
-/// 不含该标记时返回 None（交由调用方退回 key_id）。
+/// 支持两种形态：
+/// 1. JSON 对象：`{"device_id":"...","account_uuid":"...","session_id":"<uuid>"}`
+///    —— 新版 Claude Code 实际发送的形态，取 `session_id` 字段。
+/// 2. 字符串：`user_<hash>_account__session_<uuid>` —— 取 `_session_` 之后的部分。
+///
+/// 两者都取不到时返回 None（交由调用方退回 key_id）。
+///
+/// 注意这里**刻意不做 UUID 校验**，与 [`super::converter`] 里同名函数的语义不同：
+/// converter 提取的是发往 Kiro 上游的 `conversationId`，受协议约束必须是合法 UUID；
+/// 而这里只需要一个跨轮稳定、跨会话唯一的隔离标识，任何非空串都能胜任。收紧成
+/// UUID 反而会让使用自定义 session 格式的第三方客户端退化回 key 粒度隔离。
 fn extract_session_id(user_id: &str) -> Option<String> {
+    // JSON 形态优先：非 `{` 开头的串会在 serde_json 第一个字节就失败，开销可忽略。
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
+        && let Some(sid) = json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        return Some(sid.to_string());
+    }
+
     user_id
         .split_once("_session_")
         .map(|(_, sid)| sid.trim().to_string())
@@ -1405,6 +1425,52 @@ mod tests {
         assert!(c.cache_read > 0, "同一 key_id 应命中自己的前缀");
     }
 
+    /// 端到端回归：JSON 形态的 user_id（新版 Claude Code 实际发送的）必须与字符串
+    /// 形态一样按会话隔离缓存。
+    ///
+    /// 这里刻意用 `key_id == 0`（共享主 Key）——一旦 session 提取失配，
+    /// [`isolation_seed`] 会返回 None、`extract_segments` 直接返回空段，缓存模拟
+    /// **整体关闭**，`cache_read` 恒为 0、token 全部记进 `input_tokens`。
+    /// 所以最后一条 `cache_read > 0` 断言正是这个 bug 的探针。
+    #[test]
+    fn metadata_json_session_scopes_cache() {
+        use super::super::types::{Message, MessagesRequest, Metadata};
+        let body = "conversation prefix that stays stable ".repeat(20);
+        let make = |session: &str| MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message { role: "assistant".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(
+                    serde_json::json!({
+                        "device_id": "2721550240e8e5303fa95053fab0666443ab2b2ea79c2fc67bb6ff336f1297a9",
+                        "account_uuid": "",
+                        "session_id": session,
+                    })
+                    .to_string(),
+                ),
+            }),
+        };
+        let cache = CacheMeter::new(None);
+        let s1a = compute_cache_usage(&cache, &make("c479866d-b846-4e87-807b-a5ed0d84948c"), 0);
+        assert_eq!(s1a.cache_read, 0, "首轮无历史可命中");
+        assert!(s1a.cache_covered_est > 0, "JSON session 应启用缓存模拟");
+        let s2 = compute_cache_usage(&cache, &make("00000000-0000-0000-0000-000000000000"), 0);
+        assert_eq!(s2.cache_read, 0, "不同 session 不应命中");
+        let s1b = compute_cache_usage(&cache, &make("c479866d-b846-4e87-807b-a5ed0d84948c"), 0);
+        assert!(s1b.cache_read > 0, "相同 session 应命中");
+    }
+
     /// 会话隔离：metadata.user_id 里 session 不同 → 不命中；session 相同 → 命中。
     #[test]
     fn metadata_session_scopes_cache() {
@@ -1924,6 +1990,30 @@ mod tests {
         );
         assert_eq!(extract_session_id("no-session-here"), None);
         assert_eq!(extract_session_id("trailing_session_"), None);
+    }
+
+    /// 新版 Claude Code 的 user_id 是 JSON 对象（实测抓包形态）。旧的
+    /// `split_once("_session_")` 对它必然失配——JSON 里是 `,"session_id":`，
+    /// `session` 前面是引号不是下划线——会静默退回 key 隔离，
+    /// 在 `key_id == 0`（共享主 Key）时更是直接关掉整个缓存模拟。
+    #[test]
+    fn extract_session_id_parses_json_format() {
+        let user_id = r#"{"device_id":"2721550240e8e5303fa95053fab0666443ab2b2ea79c2fc67bb6ff336f1297a9","account_uuid":"","session_id":"c479866d-b846-4e87-807b-a5ed0d84948c"}"#;
+        assert_eq!(
+            extract_session_id(user_id),
+            Some("c479866d-b846-4e87-807b-a5ed0d84948c".to_string())
+        );
+    }
+
+    /// JSON 但缺 / 空 session_id：没有可用的会话维度，必须退回 key 隔离而不是
+    /// 拿空串当种子（空串会让所有此类请求落进同一个隔离域，产生跨会话假命中）。
+    #[test]
+    fn extract_session_id_json_without_session_falls_back() {
+        assert_eq!(extract_session_id(r#"{"device_id":"abc"}"#), None);
+        assert_eq!(
+            extract_session_id(r#"{"device_id":"abc","session_id":""}"#),
+            None
+        );
     }
 
     /// token 口径纯净性：cum_tokens 只算原文，不含 role / 签名前缀 / 分隔符噪声。

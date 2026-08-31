@@ -1,6 +1,6 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,13 +9,16 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::admin::types::GlobalProxyResponse;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    KiroCredentials, normalize_import_auth_method, validate_external_idp_endpoint,
+    CredentialMetadata, KiroCredentials, credential_metadata_schema, normalize_credential_metadata_schema,
+    normalize_import_auth_method, validate_credential_metadata,
+    validate_credential_metadata_schema, validate_external_idp_endpoint,
 };
 use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
 use crate::kiro::model::requests::conversation::{
@@ -32,22 +35,104 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
+    AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
+    AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
+    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialMetadataDetail,
+    CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, CustomModelsConfigResponse, CustomModelItem,
+    EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    CredentialMetadataSchemaConfig,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
-    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-    SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    SetLogGovernanceConfigRequest,
+    SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// 将原始 metadata 与 schema 合并为客户端可直接消费的字段列表。
+///
+/// Schema 字段保持其配置顺序，未登记的扩展字段按 key 排序追加；旧凭据缺失的字段
+/// 使用 schema 默认值，既避免客户端重复做 join，也不会丢掉自定义 metadata。
+fn credential_metadata_details(
+    metadata: &CredentialMetadata,
+    schema: &serde_json::Value,
+) -> BTreeMap<String, CredentialMetadataDetail> {
+    let values = match serde_json::to_value(metadata)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+    {
+        Some(values) => values,
+        None => return BTreeMap::new(),
+    };
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+
+    let mut keys: Vec<String> = properties
+        .map(|fields| fields.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut extra_keys: Vec<String> = values
+        .keys()
+        .filter(|key| !properties.is_some_and(|fields| fields.contains_key(*key)))
+        .cloned()
+        .collect();
+    extra_keys.sort();
+    keys.extend(extra_keys);
+
+    keys.into_iter()
+        .filter_map(|key| {
+            let field = properties.and_then(|fields| fields.get(&key));
+            let value = values.get(&key).cloned().or_else(|| {
+                field.and_then(|schema_field| schema_field.get("default").cloned())
+            })?;
+            let title = field
+                .and_then(|schema_field| schema_field.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|title| !title.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| key.clone());
+            let description = field
+                .and_then(|schema_field| schema_field.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_owned);
+            let value_label = field
+                .and_then(|schema_field| schema_field.get("oneOf"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|options| {
+                    options.iter().find_map(|opt| {
+                        let konst = opt.get("const")?;
+                        if konst == &value {
+                            opt.get("title")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+            Some((
+                key,
+                CredentialMetadataDetail {
+                    title,
+                    description,
+                    value,
+                    value_label,
+                },
+            ))
+        })
+        .collect()
+}
 
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
@@ -220,6 +305,8 @@ pub struct AdminService {
     proxy_pool: ProxyPoolManager,
     /// 在线镜像更新运行时配置
     update_config: Mutex<RuntimeUpdateConfig>,
+    /// 凭据 metadata schema；设置页修改后即时生效。
+    credential_metadata_schema: Mutex<serde_json::Value>,
     /// 最近一次"检查更新"结果（带 TTL，用于减少 GitHub API 调用）
     update_check_cache: Mutex<Option<CachedUpdateCheck>>,
     /// 进行中的 IdC 设备授权会话
@@ -550,6 +637,26 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let credential_metadata_schema = match token_manager
+            .config()
+            .credential_metadata_schema
+            .clone()
+        {
+            Some(schema) => {
+                let schema = normalize_credential_metadata_schema(schema);
+                match validate_credential_metadata_schema(&schema) {
+                    Ok(()) => schema,
+                    Err(error) => {
+                        tracing::warn!(
+                            "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
+                            error
+                        );
+                        credential_metadata_schema()
+                    }
+                }
+            }
+            None => credential_metadata_schema(),
+        };
 
         let svc = Self {
             token_manager,
@@ -559,6 +666,7 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
             update_config: Mutex::new(update_config),
+            credential_metadata_schema: Mutex::new(credential_metadata_schema),
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -614,6 +722,7 @@ impl AdminService {
             snapshot.current_id
         };
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let metadata_schema = self.credential_metadata_schema.lock().clone();
 
         // 一次性快照余额缓存，避免 N 次加锁
         let balance_snapshot: HashMap<u64, CachedBalance> = {
@@ -631,6 +740,7 @@ impl AdminService {
                     .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
+                let metadata = credential_metadata_details(&entry.metadata, &metadata_schema);
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -647,6 +757,7 @@ impl AdminService {
                     api_key_hash: entry.api_key_hash,
                     masked_api_key: entry.masked_api_key,
                     email: entry.email,
+                    subscription_title: entry.subscription_title,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
@@ -656,21 +767,46 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    metadata,
                     balance,
                     balance_updated_at,
+                    created_at: entry.created_at,
                 }
             })
             .collect();
 
-        // 按优先级排序（数字越小优先级越高）
-        credentials.sort_by_key(|c| c.priority);
+        // 与调度器保持一致：优先级越小越靠前，同优先级按 ID 升序。
+        credentials.sort_by_key(|c| (c.priority, c.id));
 
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
             current_id: exposed_current_id,
+            metadata_schema,
             credentials,
         }
+    }
+
+    pub fn get_credential_metadata_schema(&self) -> CredentialMetadataSchemaConfig {
+        CredentialMetadataSchemaConfig {
+            schema: self.credential_metadata_schema.lock().clone(),
+        }
+    }
+
+    pub fn set_credential_metadata_schema(
+        &self,
+        req: CredentialMetadataSchemaConfig,
+    ) -> Result<CredentialMetadataSchemaConfig, AdminServiceError> {
+        validate_credential_metadata_schema(&req.schema)
+            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        let schema_for_save = req.schema.clone();
+        self.token_manager
+            .update_config_file(move |config| {
+                config.credential_metadata_schema = Some(schema_for_save);
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        *self.credential_metadata_schema.lock() = req.schema;
+        Ok(self.get_credential_metadata_schema())
     }
 
     /// 导出凭据为兼容 JSON（嵌套 `Account` 格式）
@@ -686,7 +822,7 @@ impl AdminService {
         if let Some(filter) = id_filter {
             credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
         }
-        credentials.sort_by_key(|c| c.priority);
+        credentials.sort_by_key(|c| (c.priority, c.id.unwrap_or(u64::MAX)));
 
         let accounts = credentials
             .into_iter()
@@ -1198,6 +1334,8 @@ impl AdminService {
         req: AddCredentialRequest,
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        validate_credential_metadata(&req.metadata, &self.credential_metadata_schema.lock())
+            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
@@ -1290,6 +1428,9 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            metadata: req.metadata,
+            // 创建时间由 token_manager.add_credential 在入库时统一写入
+            created_at: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -1401,6 +1542,10 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
+        if let Some(metadata) = req.metadata.as_ref() {
+            validate_credential_metadata(metadata, &self.credential_metadata_schema.lock())
+                .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        }
         self.token_manager
             .update_credential(
                 id,
@@ -1414,6 +1559,7 @@ impl AdminService {
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
+                req.metadata,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -1443,33 +1589,165 @@ impl AdminService {
         }
     }
 
-    /// 获取全局代理 URL
-    pub fn get_global_proxy(&self) -> Option<String> {
-        self.token_manager.proxy().map(|p| p.url.clone())
+    /// 获取全局代理配置
+    pub fn get_global_proxy(&self) -> GlobalProxyResponse {
+        let proxy = self.token_manager.proxy();
+        GlobalProxyResponse {
+            proxy_url: proxy.as_ref().map(|p| p.url.clone()),
+            proxy_username: proxy.as_ref().and_then(|p| p.username.clone()),
+            proxy_password_set: proxy.as_ref().and_then(|p| p.password.as_ref()).is_some(),
+        }
     }
 
-    /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
-    pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
+    /// 设置全局代理配置（None url 表示清除）并持久化到配置文件
+    pub fn set_global_proxy(
+        &self,
+        url: Option<String>,
+        username: Option<String>,
+        password: Option<Option<String>>,
+    ) -> Result<(), AdminServiceError> {
         if let Some(ref u) = url {
-            let valid_prefix = u.starts_with("http://")
-                || u.starts_with("https://")
-                || u.starts_with("socks5://")
-                || u.starts_with("socks4://");
+            let normalized = u.to_ascii_lowercase();
+            let valid_prefix = [
+                "http://",
+                "https://",
+                "socks4://",
+                "socks4a://",
+                "socks5://",
+                "socks5h://",
+            ]
+            .iter()
+            .any(|scheme| normalized.starts_with(scheme));
             if !valid_prefix {
                 return Err(AdminServiceError::InvalidCredential(
-                    "代理 URL 格式无效，需以 http://、https://、socks5:// 或 socks4:// 开头"
+                    "代理 URL 格式无效，需以 http://、https://、socks4://、socks4a://、socks5:// 或 socks5h:// 开头"
                         .to_string(),
                 ));
             }
         }
 
-        let proxy = url.as_deref().map(ProxyConfig::new);
-        self.token_manager.set_global_proxy(proxy);
+        let username_for_save = username.clone().filter(|s| !s.is_empty());
+        let current_password = self.token_manager.proxy().and_then(|proxy| proxy.password);
+        let password_for_save = match (url.as_ref(), password) {
+            (None, _) => None,
+            (Some(_), None) => current_password,
+            (Some(_), Some(value)) => value.filter(|s| !s.is_empty()),
+        };
 
-        // 从磁盘加载最新 config 再写，避免覆盖其他字段的并发修改
+        let proxy = url.as_deref().map(|u| {
+            let mut cfg = ProxyConfig::new(u);
+            cfg.username = username_for_save.clone();
+            cfg.password = password_for_save.clone();
+            cfg
+        });
+        // 从磁盘加载最新 config 再写；持久化成功后才切换运行时代理，避免半更新。
         let url_for_save = url;
-        self.update_config_file(move |c| c.proxy_url = url_for_save);
+        self.token_manager
+            .update_config_file(move |c| {
+                c.proxy_url = url_for_save;
+                c.proxy_username = username_for_save;
+                c.proxy_password = password_for_save;
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        self.token_manager.set_global_proxy(proxy);
         Ok(())
+    }
+
+    /// 获取所有自定义模型配置。
+    pub fn get_custom_models(&self) -> CustomModelsConfigResponse {
+        let models = crate::model::custom_models::all()
+            .into_iter()
+            .map(|m| CustomModelItem {
+                id: m.id,
+                backend_id: m.backend_id,
+                display_name: m.display_name,
+                context_window: m.context_window,
+                max_tokens: m.max_tokens,
+                supports_reasoning: m.supports_reasoning,
+                owned_by: m.owned_by,
+            })
+            .collect();
+        CustomModelsConfigResponse { models }
+    }
+
+    /// 批量替换自定义模型配置（校验 → 持久化 config.json → 热更新内存注册表）。
+    pub fn set_custom_models(
+        &self,
+        req: SetCustomModelsRequest,
+    ) -> Result<CustomModelsConfigResponse, AdminServiceError> {
+        // 校验必填字段
+        for (i, m) in req.models.iter().enumerate() {
+            let id = m.id.trim();
+            let backend_id = m.backend_id.trim();
+            if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条模型的 id 必须是 1-128 个非控制字符",
+                    i + 1,
+                )));
+            }
+            if backend_id.is_empty() || backend_id.len() > 256 || backend_id.chars().any(char::is_control) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条模型（{}）的 backend_id 必须是 1-256 个非控制字符",
+                    i + 1, id,
+                )));
+            }
+            if let Some(value) = m.context_window {
+                if !(1..=10_000_000).contains(&value) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "第 {} 条模型的 contextWindow 必须在 1 到 10000000 之间",
+                        i + 1
+                    )));
+                }
+            }
+            if let Some(value) = m.max_tokens {
+                if !(1..=1_000_000).contains(&value) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "第 {} 条模型的 maxTokens 必须在 1 到 1000000 之间",
+                        i + 1
+                    )));
+                }
+            }
+        }
+
+        let mut seen_ids = HashSet::new();
+        for model in &req.models {
+            let key = model.id.trim().to_ascii_lowercase();
+            if !seen_ids.insert(key) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "自定义模型 id 不能重复（不区分大小写）".to_string(),
+                ));
+            }
+        }
+
+        // 转换为 config::CustomModel 并持久化
+        let custom_models: Vec<crate::model::config::CustomModel> = req
+            .models
+            .into_iter()
+            .map(|m| crate::model::config::CustomModel {
+                id: m.id.trim().to_string(),
+                backend_id: m.backend_id.trim().to_string(),
+                display_name: m.display_name,
+                context_window: m.context_window,
+                max_tokens: m.max_tokens,
+                supports_reasoning: m.supports_reasoning,
+                owned_by: m.owned_by,
+            })
+            .collect();
+
+        let models_for_config = custom_models.clone();
+        self.token_manager
+            .update_config_file(move |c| {
+                c.custom_models = models_for_config;
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        // 热更新内存注册表
+        crate::model::custom_models::init(custom_models);
+
+        // 使所有已缓存的模型列表失效，确保下次查询反映最新自定义模型
+        self.token_manager.invalidate_all_model_caches();
+
+        Ok(self.get_custom_models())
     }
 
     /// 持久化新的登录API密钥（adminApiKey）到配置文件（内存中的 key 由 handler 层负责更新）
@@ -2067,6 +2345,30 @@ impl AdminService {
         Ok(self.get_account_throttle_config())
     }
 
+    /// 获取单账号 RPM 限流配置
+    pub fn get_account_rpm_limit_config(&self) -> AccountRpmLimitConfigResponse {
+        let (enabled, limit) = self.token_manager.get_account_rpm_limit_config();
+        AccountRpmLimitConfigResponse { enabled, limit }
+    }
+
+    /// 更新单账号 RPM 限流配置
+    pub fn set_account_rpm_limit_config(
+        &self,
+        req: SetAccountRpmLimitConfigRequest,
+    ) -> Result<AccountRpmLimitConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.limit.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 limit 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_account_rpm_limit_config(req.enabled, req.limit)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_account_rpm_limit_config())
+    }
+
     /// 获取自愈治理配置
     pub fn get_self_heal_config(&self) -> SelfHealConfigResponse {
         let (
@@ -2544,6 +2846,7 @@ impl AdminService {
                 None,            // proxy_password 不修改
                 None,            // groups 不修改
                 None,            // source_channel 不修改
+                None,            // metadata 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2613,7 +2916,7 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
+                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
                 .is_ok()
             {
                 assigned += 1;
@@ -3386,6 +3689,44 @@ mod tests {
         assert!(validate_model_id("auto").is_err());
         assert!(validate_model_id("AUTO").is_err());
         assert!(validate_model_id(&"x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn metadata_details_include_schema_description_and_current_value() {
+        let mut metadata = CredentialMetadata::default();
+        metadata
+            .extra
+            .insert("region".to_string(), serde_json::json!("us-east-1"));
+        let mut schema = credential_metadata_schema();
+        schema["properties"]["region"] = serde_json::json!({
+            "title": "区域",
+            "description": "凭据所属区域",
+            "type": "string"
+        });
+
+        let details = credential_metadata_details(&metadata, &schema);
+        let region = details.get("region").expect("应返回扩展 metadata 字段");
+
+        assert_eq!(region.title, "区域");
+        assert_eq!(region.description.as_deref(), Some("凭据所属区域"));
+        assert_eq!(region.value, serde_json::json!("us-east-1"));
+    }
+
+    #[tokio::test]
+    async fn global_proxy_response_redacts_password() {
+        let proxy = ProxyConfig::new("socks5h://127.0.0.1:1080").with_auth("user", "secret");
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), Some(proxy), None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+
+        let response = service.get_global_proxy();
+        let json = serde_json::to_value(response).unwrap();
+
+        assert_eq!(json["proxyPasswordSet"], true);
+        assert!(json.get("proxyPassword").is_none());
+        assert!(!json.to_string().contains("secret"));
     }
 
     #[tokio::test]

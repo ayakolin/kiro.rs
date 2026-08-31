@@ -6,6 +6,7 @@ import {
   Clock3,
   Loader2,
   Play,
+  Radio,
   RefreshCw,
 } from 'lucide-react'
 import {
@@ -47,6 +48,19 @@ function formatSelectionSource(data: AvailableModelsResponse) {
     case 'balanced':
       return `均衡选择凭据 #${data.id}`
   }
+}
+
+/** 毫秒时间戳 → 简短相对时间（如"刚刚"、"1分钟前"、"5分钟前"） */
+function relativeTime(ms: number): string {
+  const diffSecs = Math.max(0, Math.floor((Date.now() - ms) / 1000))
+  if (diffSecs < 10) return '刚刚'
+  if (diffSecs < 60) return `${diffSecs} 秒前`
+  const mins = Math.floor(diffSecs / 60)
+  if (mins < 60) return `${mins} 分钟前`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours} 小时前`
+  const days = Math.floor(hours / 24)
+  return `${days} 天前`
 }
 
 export function AvailableModelsDialog({
@@ -133,8 +147,16 @@ export function AvailableModelsDialog({
             </Button>
           </div>
           {query.data && (
-            <div className="text-xs text-muted-foreground">
-              {formatSelectionSource(query.data)}，共 {query.data.models.length} 个模型
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span>{formatSelectionSource(query.data)}，共 {query.data.models.length} 个模型</span>
+              {query.dataUpdatedAt > 0 && (
+                <span className="inline-flex items-center gap-1 text-[11px]">
+                  <Radio className="h-3 w-3 text-emerald-500" />
+                  <span className="tabular-nums" title={new Date(query.dataUpdatedAt).toLocaleString('zh-CN')}>
+                    实时 · {relativeTime(query.dataUpdatedAt)}
+                  </span>
+                </span>
+              )}
             </div>
           )}
         </DialogHeader>

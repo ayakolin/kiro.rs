@@ -326,6 +326,20 @@ pub struct CredentialDistribution {
     pub errors: u64,
 }
 
+/// 入口 Key 分布
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyDistribution {
+    pub key_id: u64,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub errors: u64,
+    pub credits: f64,
+}
+
 /// 概览：今日 + 累计
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -550,6 +564,55 @@ impl UsageAggregator {
         out
     }
 
+    /// 入口 Key 分布
+    ///
+    /// 按 key 维度横向汇总时间窗内的用量。`cred_filter` 为 `Some` 时（分组筛选），
+    /// 仅统计命中白名单凭据的记录，走 `by_key_credential`；否则走预聚合的 `by_key`。
+    pub fn query_by_key(
+        &self,
+        window: StatsQueryWindow,
+        cred_filter: Option<&std::collections::HashSet<u64>>,
+    ) -> Vec<KeyDistribution> {
+        let inner = self.inner.read();
+        let buckets = select_buckets(&inner, window.granularity);
+        let mut acc: HashMap<u64, BucketStats> = HashMap::new();
+        for b in buckets.iter().filter(|b| bucket_in_window(b, window)) {
+            match cred_filter {
+                None => {
+                    for (key_id, stats) in &b.by_key {
+                        acc.entry(*key_id).or_default().add_stats(stats);
+                    }
+                }
+                Some(allow) => {
+                    for (key_id, group) in &b.by_key_credential {
+                        let entry = acc.entry(*key_id).or_default();
+                        for (cid, cs) in group {
+                            if allow.contains(cid) {
+                                entry.add_stats(cs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out: Vec<KeyDistribution> = acc
+            .into_iter()
+            .filter(|(_, stats)| stats.calls > 0)
+            .map(|(key_id, stats)| KeyDistribution {
+                key_id,
+                calls: stats.calls,
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
+                cache_creation_tokens: stats.cache_creation_tokens,
+                cache_read_tokens: stats.cache_read_tokens,
+                errors: stats.errors,
+                credits: stats.credits,
+            })
+            .collect();
+        out.sort_by(|a, b| b.calls.cmp(&a.calls));
+        out
+    }
+
     /// 概览（今日 + 最近 7 天）
     pub fn overview(&self) -> OverviewStats {
         let inner = self.inner.read();
@@ -753,6 +816,50 @@ mod tests {
         let by_cred = agg.query_by_credential(window, None, None);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
+
+        let by_key = agg.query_by_key(window, None);
+        assert_eq!(by_key.len(), 1);
+        assert_eq!(by_key[0].key_id, 1);
+        assert_eq!(by_key[0].calls, 2);
+        assert_eq!(by_key[0].input_tokens, 2000);
+    }
+
+    #[test]
+    fn query_by_key_ranks_multiple_keys() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now().to_rfc3339();
+        let mk = |key_id: u64, cred: u64, input: u64| UsageRecord {
+            ts: now.clone(),
+            key_id,
+            credential_id: cred,
+            model: "m".to_string(),
+            input_tokens: input,
+            output_tokens: 10,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.01,
+            duration_ms: 100,
+            status: "success".to_string(),
+        };
+        agg.ingest(&mk(1, 5, 100));
+        agg.ingest(&mk(2, 6, 300));
+        agg.ingest(&mk(2, 6, 300));
+
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let by_key = agg.query_by_key(window, None);
+        assert_eq!(by_key.len(), 2);
+        // key 2 调用更多 → 排在前面
+        assert_eq!(by_key[0].key_id, 2);
+        assert_eq!(by_key[0].calls, 2);
+        assert_eq!(by_key[0].input_tokens, 600);
+        assert_eq!(by_key[1].key_id, 1);
+
+        // 分组白名单只放行凭据 5 → 仅 key 1 命中
+        let allow: std::collections::HashSet<u64> = [5u64].into_iter().collect();
+        let filtered = agg.query_by_key(window, Some(&allow));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].key_id, 1);
+        assert_eq!(filtered[0].input_tokens, 100);
     }
 
     #[test]

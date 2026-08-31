@@ -17,8 +17,17 @@ import {
   type BatchImportItemEvent,
   type BatchImportSummary,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  CredentialMetadata,
+  CredentialSaleStatus,
+  CredentialType,
+} from '@/types/api'
 import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
+import {
+  metadataFieldDefault,
+  metadataFieldValues,
+} from '@/components/credential-metadata-field'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -45,6 +54,7 @@ interface CredentialInput {
   tokenEndpoint?: string
   issuerUrl?: string
   scopes?: string
+  metadata?: Partial<CredentialMetadata>
 }
 
 interface VerificationResult {
@@ -144,6 +154,27 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
 
+        const metadataSchema = existingCredentials?.metadataSchema
+        const metadataType = cred.metadata?.type
+          ?? metadataFieldDefault(metadataSchema, 'type', 'normal')
+        const typeValues = metadataFieldValues(metadataSchema, 'type')
+        if (typeValues.length > 0 && !typeValues.includes(metadataType)) {
+          updateResult(i, { status: 'failed', error: 'metadata.type 不符合当前 schema' })
+          continue
+        }
+        const saleStatus = cred.metadata?.saleStatus
+          ?? metadataFieldDefault(metadataSchema, 'saleStatus', 'not_for_sale')
+        const saleStatusValues = metadataFieldValues(metadataSchema, 'saleStatus')
+        if (saleStatusValues.length > 0 && !saleStatusValues.includes(saleStatus)) {
+          updateResult(i, { status: 'failed', error: 'metadata.saleStatus 不符合当前 schema' })
+          continue
+        }
+        const metadata: CredentialMetadata = {
+          ...cred.metadata,
+          type: metadataType as CredentialType,
+          saleStatus: saleStatus as CredentialSaleStatus,
+        }
+
         // 若凭据未指定代理且代理池有可用代理，随机分配一个
         if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
           const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
@@ -184,6 +215,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
+              metadata,
             },
           })
         } else {
@@ -239,6 +271,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
+              metadata,
             },
           })
         }

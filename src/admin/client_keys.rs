@@ -45,6 +45,12 @@ pub struct ClientKey {
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
+    /// 累计积分（credit）使用上限。None 表示不限制。
+    ///
+    /// 达到上限后该 Key 的后续请求会被鉴权层拒绝（HTTP 429）。上限基于累计
+    /// `total_credits`，通过「重置统计」清零后可重新计费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     /// 绑定的账号分组名（可选）
     ///
     /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
@@ -55,6 +61,17 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
+}
+
+/// 鉴权结果：区分「命中」「超额」「未命中」，供中间件返回不同 HTTP 状态。
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyAuth {
+    /// 命中且未超额，携带 Key id
+    Ok(u64),
+    /// 命中但已达积分上限
+    OverLimit { id: u64, used: f64, limit: f64 },
+    /// 未匹配到任何启用的 Key
+    NotFound,
 }
 
 /// `by_key` 仅用于判重；鉴权扫描 `entries` 并做常量时间比较。
@@ -177,6 +194,7 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
         };
@@ -220,6 +238,7 @@ impl ClientKeyManager {
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
                     total_credits: 0.0,
+                    max_credits: None,
                     group: None,
                     is_system: true,
                 },
@@ -431,7 +450,20 @@ impl ClientKeyManager {
     }
 
     /// 不校验前缀，常量时间匹配所有启用 Key；命中后更新使用记录。
+    ///
+    /// 仅返回命中的 Key id（不含额度判定）。需要额度拦截时用 [`Self::verify_and_touch_ex`]。
+    #[allow(dead_code)] // 保留的兼容接口，生产路径已切换到 verify_and_touch_ex
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
+        match self.verify_and_touch_ex(presented) {
+            KeyAuth::Ok(id) => Some(id),
+            // 兼容旧语义：超额与未命中都视为 None
+            KeyAuth::OverLimit { .. } | KeyAuth::NotFound => None,
+        }
+    }
+
+    /// 常量时间匹配所有启用 Key；命中后若已达积分上限则返回 [`KeyAuth::OverLimit`]，
+    /// 否则累加调用次数并返回 [`KeyAuth::Ok`]。
+    pub fn verify_and_touch_ex(&self, presented: &str) -> KeyAuth {
         let mut inner = self.inner.write();
         let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
@@ -443,13 +475,49 @@ impl ClientKeyManager {
                 // 不 break，继续完整扫描以保持常量时间
             }
         }
-        let id = hit_id?;
+        let Some(id) = hit_id else {
+            return KeyAuth::NotFound;
+        };
         if let Some(entry) = inner.entries.get_mut(&id) {
+            // 达到积分上限：拒绝，不累加调用次数
+            if let Some(limit) = entry.max_credits {
+                if entry.total_credits >= limit {
+                    return KeyAuth::OverLimit {
+                        id,
+                        used: entry.total_credits,
+                        limit,
+                    };
+                }
+            }
             entry.total_calls += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
-        Some(id)
+        KeyAuth::Ok(id)
+    }
+
+    /// 设置或清除单个 Key 的积分使用上限。`None` 表示取消限制。
+    ///
+    /// 传入 `Some(v)` 时会归一为非负有限值；小于 0 或非有限值一律拒绝为无效。
+    /// 返回 `false` 表示 Key 不存在或入参非法。
+    pub fn set_max_credits(&self, id: u64, max_credits: Option<f64>) -> bool {
+        if let Some(v) = max_credits {
+            if !v.is_finite() || v < 0.0 {
+                return false;
+            }
+        }
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                e.max_credits = max_credits;
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
     }
 
     /// 在请求结束时累计 Token 用量并落盘
@@ -557,6 +625,48 @@ mod tests {
         assert_eq!(e.total_output_tokens, 80);
         assert_eq!(e.total_cache_creation_tokens, 5);
         assert_eq!(e.total_cache_read_tokens, 10);
+    }
+
+    #[test]
+    fn max_credits_blocks_when_exceeded() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        assert!(mgr.set_max_credits(entry.id, Some(2.0)));
+
+        // 未超额：正常放行
+        assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+
+        // 累计到达上限后拒绝
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 2.5);
+        match mgr.verify_and_touch_ex(&entry.key) {
+            KeyAuth::OverLimit { id, used, limit } => {
+                assert_eq!(id, entry.id);
+                assert!((used - 2.5).abs() < 1e-9);
+                assert!((limit - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected OverLimit, got {other:?}"),
+        }
+        // 旧接口兼容：超额返回 None
+        assert_eq!(mgr.verify_and_touch(&entry.key), None);
+
+        // 重置统计后恢复放行
+        assert!(mgr.reset_stats(entry.id));
+        assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+
+        // 清除上限：不再拦截
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 999.0);
+        assert!(mgr.set_max_credits(entry.id, None));
+        assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+    }
+
+    #[test]
+    fn set_max_credits_rejects_invalid() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        assert!(!mgr.set_max_credits(entry.id, Some(-1.0)));
+        assert!(!mgr.set_max_credits(entry.id, Some(f64::NAN)));
+        assert!(!mgr.set_max_credits(999, Some(5.0)));
+        assert!(mgr.set_max_credits(entry.id, Some(0.0)));
     }
 
     #[test]

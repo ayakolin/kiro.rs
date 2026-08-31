@@ -14,6 +14,8 @@ pub enum EventType {
     ToolUse,
     /// 计费事件
     Metering,
+    /// 精确 token 用量元数据事件
+    Metadata,
     /// 上下文使用率事件
     ContextUsage,
     /// 推理内容事件
@@ -29,6 +31,7 @@ impl EventType {
             "assistantResponseEvent" => Self::AssistantResponse,
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
+            "metadataEvent" => Self::Metadata,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
             _ => Self::Unknown,
@@ -41,6 +44,7 @@ impl EventType {
             Self::AssistantResponse => "assistantResponseEvent",
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
+            Self::Metadata => "metadataEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::ReasoningContent => "reasoningContentEvent",
             Self::Unknown => "unknown",
@@ -73,11 +77,13 @@ pub enum Event {
     ToolUse(super::ToolUseEvent),
     /// 计费
     Metering(super::MeteringEvent),
+    /// 精确 token 用量元数据
+    Metadata(super::MetadataEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
     /// 推理内容
     ReasoningContent(super::ReasoningContentEvent),
-    /// 未知事件 (保留原始帧数据)
+    /// 未知事件
     Unknown {},
     /// 服务端错误
     Error {
@@ -125,6 +131,10 @@ impl Event {
             EventType::Metering => {
                 let payload = super::MeteringEvent::from_frame(&frame)?;
                 Ok(Self::Metering(payload))
+            }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
             }
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
@@ -181,6 +191,7 @@ mod tests {
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
+        assert_eq!(EventType::from_str("metadataEvent"), EventType::Metadata);
         assert_eq!(
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage
@@ -199,5 +210,6 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+        assert_eq!(EventType::Metadata.as_str(), "metadataEvent");
     }
 }

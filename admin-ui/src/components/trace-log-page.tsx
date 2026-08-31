@@ -1,27 +1,16 @@
-import { useState } from 'react'
-import { toast } from 'sonner'
+import { useEffect, useMemo, useState } from 'react'
 import {
   ScrollText,
-  RefreshCw,
   ChevronRight,
   ChevronLeft,
-  ChevronDown,
   AlertTriangle,
   CheckCircle2,
   Unplug,
-  Settings2,
+  Search,
+  X,
 } from 'lucide-react'
-import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuLabel,
-} from '@/components/ui/dropdown-menu'
 import {
   Tooltip,
   TooltipContent,
@@ -36,13 +25,26 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
+import { AutoRefreshControl } from '@/components/console/auto-refresh-control'
+import { PageHeader } from '@/components/console/page-header'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
+import { useUrlState } from '@/hooks/use-url-state'
 import {
-  useLogGovernanceConfig,
-  useSetLogGovernanceConfig,
-} from '@/hooks/use-credentials'
-import { extractErrorMessage } from '@/lib/utils'
+  ConsoleTable,
+  type ConsoleColumn,
+} from '@/components/console/data-table'
+import {
+  DetailDrawer,
+  DrawerField,
+  DrawerSection,
+} from '@/components/console/detail-drawer'
+import {
+  TimeRangePicker,
+  rangeToStartMs,
+  type TimeRange,
+} from '@/components/console/time-range'
+import { outcomeTone, railDotClass, type RailTone } from '@/components/console/rail'
 import type { TraceAttempt, TraceQuery, TraceRecord } from '@/types/api'
 
 /** 失败分类 → 中文标签 + Badge 颜色 */
@@ -70,6 +72,27 @@ function outcomeStyle(outcome: string): {
     default:
       return { label: outcome || '未知', variant: 'secondary' }
   }
+}
+
+/**
+ * 失败分类 → 轨迹节点圆点色。
+ *
+ * 委托给共享的状态轨映射：日志行的左侧色轨、凭据行的状态、这里的链路节点用同一套
+ * 四档语义，异常在三个页面里是同一个颜色。原先本页自带一份 switch，与凭据卡片各判
+ * 一次，账号风控在一边是 amber、另一边是 orange。
+ */
+function outcomeDot(outcome: string): string {
+  return railDotClass(outcomeTone(outcome))
+}
+
+/** 整条 trace 的严重度 → 左侧色轨 */
+function traceTone(rec: TraceRecord): RailTone {
+  if (rec.finalStatus === 'success') {
+    // 成功但重试过：请求被救回来了，可池子里有凭据在失败 —— 值得看一眼，但不是故障
+    return rec.totalAttempts > 1 ? 'warn' : 'none'
+  }
+  if (rec.finalStatus === 'interrupted') return 'warn'
+  return outcomeTone(rec.errorType ?? '')
 }
 
 /** 最终状态 → 徽章 */
@@ -228,84 +251,127 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function TraceRow({ rec }: { rec: TraceRecord }) {
-  const [open, setOpen] = useState(false)
-  const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
+/**
+ * 故障转移轨迹（本页签名元素）：把一次请求的 attempts[] 画成横向重试链路，
+ * 按每跳结果着色。单次成功只显示一个安静的圆点；重试/故障转移时展开为带凭据号
+ * 的节点串，让"这次请求怎么被救回来的"一眼可读。顺序即尝试次序。
+ */
+function AttemptChain({ rec }: { rec: TraceRecord }) {
+  const attempts = rec.attempts ?? []
+  if (attempts.length === 0) {
+    return <span className="text-muted-foreground/50">—</span>
+  }
+  if (attempts.length === 1 && rec.finalStatus === 'success') {
+    return (
+      <span className={`inline-block h-2 w-2 rounded-full ${outcomeDot(attempts[0].outcome)}`} />
+    )
+  }
   return (
-    <>
-      <tr
-        className="cursor-pointer whitespace-nowrap border-b border-border/40 hover:bg-accent/40"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <td className="py-2.5 pl-3 pr-2">
-          {open ? (
-            <ChevronDown className="h-4 w-4 text-muted-foreground" />
-          ) : (
-            <ChevronRight className="h-4 w-4 text-muted-foreground" />
-          )}
-        </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground whitespace-nowrap">
-          {formatTime(rec.ts)}
-        </td>
-        <td className="py-2.5 pr-3 text-[13px]">
-          <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
-          {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
-        </td>
-        <td className="py-2.5 pr-3 text-[13px]">
-          <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
-        </td>
-        <td className="py-2.5 pr-3">
-          <StatusBadge status={rec.finalStatus} />
-        </td>
-        <TraceCredentialCell rec={rec} />
-        <td className="py-2.5 pr-3 text-[12px] tabular-nums">
-          <TokenCell rec={rec} />
-        </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums">
-          {rec.credits != null && rec.credits > 0 ? rec.credits.toFixed(4) : '—'}
-        </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
-          {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
-        </td>
-        <td className="py-2.5 pr-3">
-          {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
-        </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums">
-          {Math.max(0, rec.totalAttempts - 1)}
-        </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
-          {formatDuration(rec.durationMs)}
-        </td>
-      </tr>
-      {open && <ExpandedTraceRow rec={rec} />}
-    </>
-  )
-}
-
-function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
-  return (
-    <td className="py-2.5 pr-3 text-[13px]">
-      <span className="inline-block max-w-[220px] truncate align-middle">
-        {credLabel(rec.finalCredentialId, rec.finalEmail)}
+    <TooltipProvider delayDuration={150}>
+      <span className="inline-flex items-center gap-1">
+        {attempts.map((a, i) => (
+          <span key={a.attempt} className="inline-flex items-center gap-1">
+            {i > 0 && <span className="text-muted-foreground/40">→</span>}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="inline-flex cursor-default items-center gap-1 rounded border border-border/60 bg-secondary/40 px-1.5 py-0.5 font-mono text-[11px] tabular-nums">
+                  <span className={`h-1.5 w-1.5 rounded-full ${outcomeDot(a.outcome)}`} />
+                  {a.credentialId > 0 ? `#${a.credentialId}` : '—'}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent className="font-mono text-[11px]">
+                第 {a.attempt + 1} 跳 · {outcomeStyle(a.outcome).label}
+                {a.httpStatus != null ? ` · HTTP ${a.httpStatus}` : ''}
+                {a.endpoint ? ` · ${a.endpoint}` : ''} · {formatDuration(a.durationMs)}
+              </TooltipContent>
+            </Tooltip>
+          </span>
+        ))}
       </span>
-    </td>
+    </TooltipProvider>
   )
 }
 
-function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
+/**
+ * 计费面板：以 credit（上游 meteringEvent 的真实计费）为核心，直观体现缓存省钱效果。
+ *
+ * 关键指标「每千输入 token 的 credit」：Kiro 后端对命中缓存的输入按更低费率计费，
+ * 所以同规模输入下，该比值越低 = 缓存命中越多 = 越省钱。冷启动请求（大前缀首次进
+ * 缓存）该比值偏高，之后重复内容命中后明显下降——对比同类请求的这个值即可看出缓存
+ * 有没有帮你省钱。
+ *
+ * 注：input token 为 contextUsage 推算的粗粒度估算；credit 是上游真实计费口径，
+ * 是判断成本的可信信号（缓存的 cache_read token 为中转层估算，仅供参考）。
+ */
+function CacheBillingPanel({ rec }: { rec: TraceRecord }) {
+  const credit = rec.credits ?? 0
+  if (credit <= 0) return null
+  // 总输入 = 未缓存输入 + 缓存创建 + 缓存读取。
+  // 这是缓存拆分的不变量（split_against_total 保证三者之和 == 总 prompt），
+  // 用作分母才稳定；rec.inputTokens 在有缓存拆分时只剩「未缓存那部分」，不能当分母。
+  const freshInput = rec.inputTokens ?? 0
+  const cacheCreation = rec.cacheCreationTokens ?? 0
+  const cacheRead = rec.cacheReadTokens ?? 0
+  const promptTotal = freshInput + cacheCreation + cacheRead
+  const perK = promptTotal > 0 ? credit / (promptTotal / 1000) : null
+
+  // boldness 只花在一处：credit（真实成本）为主角，其余中性陪衬。
+  const items: Array<{ label: string; value: string; hint?: string; primary?: boolean }> = [
+    { label: '真实计费', value: credit.toFixed(4), hint: 'credit（上游 metering）', primary: true },
+    { label: '总输入 Token', value: formatTokens(promptTotal), hint: '含缓存命中·估算' },
+  ]
+  if (perK != null) {
+    items.push({
+      label: '每千输入 credit',
+      value: perK.toFixed(4),
+      hint: '越低=缓存命中越多',
+    })
+  }
+  // 有缓存拆分时，额外展示「未缓存输入」（真正按全价计费的部分）
+  if (cacheRead > 0 || cacheCreation > 0) {
+    items.push({
+      label: '未缓存输入',
+      value: formatTokens(freshInput),
+      hint: '按全价计费部分·估算',
+    })
+  }
+
   return (
-    <tr className="border-b border-border/40 bg-secondary/20">
-      <td colSpan={12} className="px-3 py-3">
-        <ExpandedDetail rec={rec} />
-      </td>
-    </tr>
+    <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
+      <div className="mb-2 flex items-center gap-2 text-[12px] font-medium text-muted-foreground">
+        <span>计费与缓存效率</span>
+        <span className="text-[11px] font-normal text-muted-foreground/70">
+          credit 为上游真实计费，是判断缓存省钱的可信信号
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-3">
+        {items.map((it) => (
+          <div key={it.label} className="min-w-0">
+            <div className="text-[11px] text-muted-foreground">{it.label}</div>
+            <div
+              className={
+                it.primary
+                  ? 'font-mono tabular-nums text-[15px] font-semibold text-sky-700 dark:text-sky-300'
+                  : 'font-mono tabular-nums text-[15px] font-medium text-foreground/85'
+              }
+            >
+              {it.value}
+            </div>
+            {it.hint && (
+              <div className="text-[10px] text-muted-foreground/70">{it.hint}</div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
   )
 }
 
-/** 展开后的链路详情：错误摘要 + 每跳时间线 */
+/** 展开后的链路详情：计费/缓存效率 + 错误摘要 + 每跳时间线 */
 function ExpandedDetail({ rec }: { rec: TraceRecord }) {
   return (
     <div className="space-y-3">
+      <CacheBillingPanel rec={rec} />
       {rec.errorMessage && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[13px] text-destructive">
           {rec.errorMessage}
@@ -362,152 +428,195 @@ function Select({
   )
 }
 
-/** 日志治理设置下拉：trace 启用开关 + trace 保留天数 + usage 保留天数 */
-function GovernanceButton() {
-  const [open, setOpen] = useState(false)
-  const { data: cfg, isLoading } = useLogGovernanceConfig()
-  const { mutate, isPending } = useSetLogGovernanceConfig()
-  const [traceDays, setTraceDays] = useState('')
-  const [usageDays, setUsageDays] = useState('')
+const PAGE_SIZE = 50
 
-  const enabled = cfg?.traceEnabled ?? true
+/** 默认时间窗口：24 小时。够覆盖"昨天那次失败"，又不至于一上来就全表扫。 */
+const DEFAULT_RANGE_MINUTES = '1440'
 
-  const save = (patch: Record<string, unknown>, ok: string) => {
-    mutate(patch, {
-      onSuccess: () => toast.success(ok),
-      onError: (err) => toast.error('保存失败：' + extractErrorMessage(err)),
-    })
-  }
+const URL_DEFAULTS = {
+  status: '',
+  errorType: '',
+  keyId: '',
+  group: '',
+  q: '',
+  range: DEFAULT_RANGE_MINUTES,
+  page: '0',
+}
 
-  const submitDays = (
-    e: React.FormEvent,
-    field: 'traceRetentionDays' | 'usageLogRetentionDays',
-    raw: string,
-    reset: () => void,
-  ) => {
-    e.preventDefault()
-    const n = parseInt(raw, 10)
-    if (isNaN(n) || n < 1 || n > 365) {
-      toast.error('保留天数需在 1..=365')
-      return
-    }
-    save({ [field]: n }, '保留天数已更新')
-    reset()
-  }
+/** 搜索输入防抖：输入过程中不打请求，停手 300ms 再查 */
+function useDebounced<T>(value: T, delay = 300): T {
+  const [debounced, setDebounced] = useState(value)
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebounced(value), delay)
+    return () => window.clearTimeout(t)
+  }, [value, delay])
+  return debounced
+}
 
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <Button size="sm" variant="outline">
-          <Settings2 className="h-3.5 w-3.5" />
-          治理设置
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
-        <DropdownMenuLabel>请求链路追踪</DropdownMenuLabel>
-        <div className="px-2 pb-2">
-          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
-            <div className="text-xs">
-              <div className="font-medium text-foreground">
-                {enabled ? '已启用' : '已关闭'}
-              </div>
-              <div className="leading-snug text-muted-foreground">
-                {enabled
-                  ? '记录每次请求的完整重试链路到 traces.db'
-                  : '不再写入新链路（历史记录仍可查询）'}
-              </div>
-            </div>
-            <Switch
-              checked={enabled}
-              disabled={isLoading || isPending}
-              onCheckedChange={(v) =>
-                save({ traceEnabled: v }, v ? '已开启链路追踪' : '已关闭链路追踪')
-              }
-            />
-          </div>
-        </div>
-        <DropdownMenuLabel className="pt-1">
-          trace 保留天数（当前 {cfg?.traceRetentionDays ?? '—'}）
-        </DropdownMenuLabel>
-        <form
-          onSubmit={(e) => submitDays(e, 'traceRetentionDays', traceDays, () => setTraceDays(''))}
-          className="flex items-center gap-1.5 px-2 pb-2"
-        >
-          <Input
-            type="number"
-            min={1}
-            max={365}
-            placeholder="天数"
-            value={traceDays}
-            onChange={(e) => setTraceDays(e.target.value)}
-            disabled={isPending}
-            className="h-7 text-xs"
-          />
-          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !traceDays.trim()}>
-            保存
-          </Button>
-        </form>
-        <DropdownMenuLabel className="pt-1">
-          usage 日志保留天数（当前 {cfg?.usageLogRetentionDays ?? '—'}）
-        </DropdownMenuLabel>
-        <form
-          onSubmit={(e) => submitDays(e, 'usageLogRetentionDays', usageDays, () => setUsageDays(''))}
-          className="flex items-center gap-1.5 px-2 pb-2"
-        >
-          <Input
-            type="number"
-            min={1}
-            max={365}
-            placeholder="天数"
-            value={usageDays}
-            onChange={(e) => setUsageDays(e.target.value)}
-            disabled={isPending}
-            className="h-7 text-xs"
-          />
-          <Button type="submit" size="sm" variant="outline" className="h-7 text-xs" disabled={isPending || !usageDays.trim()}>
-            保存
-          </Button>
-        </form>
-      </DropdownMenuContent>
-    </DropdownMenu>
+/** 表格列定义。默认 8 列，其余进列控制菜单 —— 12 列全摆开必然横向滚动。 */
+function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
+  return useMemo(
+    () => [
+      {
+        id: 'ts',
+        header: '时间',
+        cell: (r) => (
+          <span className="console-num text-muted-foreground">
+            {formatTime(r.ts)}
+          </span>
+        ),
+      },
+      {
+        id: 'model',
+        header: '模型',
+        cell: (r) => (
+          <span className="inline-flex max-w-[200px] items-center gap-1.5">
+            <span className="truncate">{r.model}</span>
+            {r.isStream && (
+              <span
+                className="shrink-0 text-[10px] text-muted-foreground"
+                title="流式响应"
+              >
+                流
+              </span>
+            )}
+          </span>
+        ),
+      },
+      {
+        id: 'status',
+        header: '状态',
+        cell: (r) => <StatusBadge status={r.finalStatus} />,
+      },
+      {
+        id: 'credential',
+        header: '最终凭据',
+        cell: (r) => (
+          <span className="inline-block max-w-[190px] truncate">
+            {credLabel(r.finalCredentialId, r.finalEmail)}
+          </span>
+        ),
+      },
+      {
+        id: 'chain',
+        header: '故障转移',
+        hint: '这次请求走过的重试链路，顺序即尝试次序',
+        cell: (r) => <AttemptChain rec={r} />,
+      },
+      {
+        id: 'tokens',
+        header: 'Token',
+        cell: (r) => <TokenCell rec={r} />,
+      },
+      {
+        id: 'credits',
+        header: '费用',
+        align: 'right',
+        hint: 'credit —— 上游 metering 的真实计费',
+        cell: (r) => (
+          <span className="console-num">
+            {r.credits != null && r.credits > 0 ? r.credits.toFixed(4) : '—'}
+          </span>
+        ),
+      },
+      {
+        id: 'duration',
+        header: '耗时',
+        align: 'right',
+        cell: (r) => (
+          <span className="console-num text-muted-foreground">
+            {formatDuration(r.durationMs)}
+          </span>
+        ),
+      },
+      {
+        id: 'key',
+        header: '入口 Key',
+        optional: true,
+        cell: (r) => (
+          <Badge variant="outline">{keyLabel(r.keyId, r.keyName)}</Badge>
+        ),
+      },
+      {
+        id: 'firstToken',
+        header: '首 Token',
+        optional: true,
+        align: 'right',
+        hint: '首个 token 到达耗时，仅流式有值',
+        cell: (r) => (
+          <span className="console-num text-muted-foreground">
+            {r.firstTokenMs != null ? formatDuration(r.firstTokenMs) : '—'}
+          </span>
+        ),
+      },
+      {
+        id: 'errorType',
+        header: '错误类型',
+        optional: true,
+        cell: (r) => {
+          if (!r.errorType) return <span className="text-muted-foreground">—</span>
+          const s = outcomeStyle(r.errorType)
+          return <Badge variant={s.variant}>{s.label}</Badge>
+        },
+      },
+      {
+        id: 'traceId',
+        header: 'Trace ID',
+        optional: true,
+        cell: (r) => (
+          <span className="console-num text-[11px] text-muted-foreground">
+            {r.traceId.slice(0, 12)}
+          </span>
+        ),
+      },
+    ],
+    [],
   )
 }
 
-
-const PAGE_SIZE = 50
-
 export function TraceLogPage() {
-  const [status, setStatus] = useState('')
-  const [errorType, setErrorType] = useState('')
-  const [keyId, setKeyId] = useState('')
-  const [group, setGroup] = useState('')
-  const [onlyFailed, setOnlyFailed] = useState(false)
-  const [page, setPage] = useState(0)
+  const [url, patchUrl, resetUrl] = useUrlState('traces', URL_DEFAULTS)
+  const [searchDraft, setSearchDraft] = useState(url.q)
+  const debouncedSearch = useDebounced(searchDraft)
+  const [detail, setDetail] = useState<TraceRecord | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+
+  // 搜索词稳定后才写进 URL / 触发查询
+  useEffect(() => {
+    if (debouncedSearch !== url.q) patchUrl({ q: debouncedSearch, page: '0' })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch])
+
+  const page = Number(url.page) || 0
+  const range: TimeRange = {
+    minutes: url.range === '' ? null : Number(url.range),
+  }
 
   const { data: keysData } = useClientKeys()
+  const groupOptions = useGroupOptions()
+
   const keyOptions = [
     { value: '', label: '全部 Key' },
     ...(keysData?.keys ?? []).map((k) => ({ value: String(k.id), label: k.name })),
   ]
-
-  const groupOptions = useGroupOptions()
   const groupSelectOptions = [
     { value: '', label: '全部分组' },
     ...groupOptions.map((g) => ({ value: g, label: g })),
   ]
 
-  // 筛选条件变化时回到第一页
-  const resetTo = <T,>(setter: (v: T) => void) => (v: T) => {
-    setter(v)
-    setPage(0)
-  }
+  // 时间窗口按分钟数换算成起始秒；随自动刷新时钟滑动，始终表示“最近 N 分钟”。
+  const startTime = useMemo(() => {
+    const ms = rangeToStartMs(range, now)
+    return ms == null ? undefined : Math.floor(ms / 1000)
+  }, [url.range, now])
 
   const query: TraceQuery = {
-    status: status || undefined,
-    errorType: errorType || undefined,
-    keyId: keyId ? Number(keyId) : undefined,
-    group: group || undefined,
-    onlyFailed: onlyFailed || undefined,
+    status: url.status || undefined,
+    errorType: url.errorType || undefined,
+    keyId: url.keyId ? Number(url.keyId) : undefined,
+    group: url.group || undefined,
+    q: url.q || undefined,
+    startTime,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   }
@@ -515,101 +624,148 @@ export function TraceLogPage() {
   const records = data?.records ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const columns = useTraceColumns()
+
+  const filterCount = [url.status, url.errorType, url.keyId, url.group, url.q].filter(
+    Boolean,
+  ).length
 
   return (
-    <div className="space-y-5">
-      {/* 筛选栏 */}
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="flex items-center gap-2">
-          <ScrollText className="h-5 w-5 text-muted-foreground" />
-          <h2 className="text-lg font-semibold tracking-tight">请求日志</h2>
-          {total > 0 && <Badge variant="secondary">{total}</Badge>}
-        </div>
-        <div className="ml-auto flex flex-wrap items-center gap-2">
-          <Select value={keyId} onChange={resetTo(setKeyId)} options={keyOptions} />
-          <Select value={group} onChange={resetTo(setGroup)} options={groupSelectOptions} />
-          <Select value={status} onChange={resetTo(setStatus)} options={STATUS_OPTIONS} />
-          <Select
-            value={errorType}
-            onChange={resetTo(setErrorType)}
-            options={ERROR_TYPE_OPTIONS}
-          />
-          <Button
-            size="sm"
-            variant={onlyFailed ? 'default' : 'outline'}
-            onClick={() => {
-              setOnlyFailed((v) => !v)
-              setPage(0)
+    <div className="console-scope space-y-4">
+      <PageHeader
+        icon={<ScrollText className="h-4 w-4" />}
+        title="请求日志"
+        meta={
+          <>
+            <span className="console-num text-[13px] text-muted-foreground">
+              {total} 条
+            </span>
+            {filterCount > 0 && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  resetUrl()
+                  setSearchDraft('')
+                }}
+                className="h-7 px-2 text-xs"
+              >
+                清除 {filterCount} 个筛选
+              </Button>
+            )}
+          </>
+        }
+        actions={
+          <AutoRefreshControl
+            onRefresh={() => {
+              // 相对时间窗口需要在每次刷新时重新取“现在”；即使同一秒内点击，也直接 refetch。
+              if (range.minutes != null) {
+                setNow(Date.now())
+              }
+              return refetch()
             }}
-          >
-            只看失败
-          </Button>
-          <GovernanceButton />
-          <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
-            <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-            刷新
-          </Button>
+            isRefreshing={isFetching}
+            resourceLabel="请求日志"
+          />
+        }
+      />
+
+      {/* 筛选栏：文本与分类条件优先，时间范围收在末尾。 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <input
+            type="text"
+            value={searchDraft}
+            onChange={(e) => setSearchDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                setSearchDraft('')
+                e.currentTarget.blur()
+              }
+            }}
+            placeholder="搜索模型 / 报错 / Trace ID"
+            aria-label="搜索日志"
+            className="console-num h-8 w-[min(15rem,52vw)] rounded-lg border border-border bg-card/60 pl-8 pr-7 text-[12.5px] backdrop-blur placeholder:font-sans placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+          />
+          {searchDraft && (
+            <button
+              type="button"
+              onClick={() => setSearchDraft('')}
+              title="清除搜索"
+              className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          )}
         </div>
+        <Select
+          value={url.status}
+          onChange={(v) => patchUrl({ status: v, page: '0' })}
+          options={STATUS_OPTIONS}
+        />
+        <Select
+          value={url.errorType}
+          onChange={(v) => patchUrl({ errorType: v, page: '0' })}
+          options={ERROR_TYPE_OPTIONS}
+        />
+        <Select
+          value={url.keyId}
+          onChange={(v) => patchUrl({ keyId: v, page: '0' })}
+          options={keyOptions}
+        />
+        <Select
+          value={url.group}
+          onChange={(v) => patchUrl({ group: v, page: '0' })}
+          options={groupSelectOptions}
+        />
+        <TimeRangePicker
+          value={range}
+          onChange={(next) =>
+            patchUrl({
+              range: next.minutes == null ? '' : String(next.minutes),
+              page: '0',
+            })
+          }
+        />
       </div>
 
-      <Card>
-        <CardContent className="p-0">
-          {isLoading ? (
-            <div className="p-6 text-sm text-muted-foreground">加载中…</div>
-          ) : records.length === 0 ? (
-            <div className="p-6 text-sm text-muted-foreground">
-              暂无记录。发起几次 /v1/messages 请求后即可看到链路。
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[1080px] text-left">
-                <thead>
-                  <tr className="whitespace-nowrap border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
-                    <th className="py-2 pl-3 pr-2 font-medium"></th>
-                    <th className="py-2 pr-3 font-medium">时间</th>
-                    <th className="py-2 pr-3 font-medium">模型</th>
-                    <th className="py-2 pr-3 font-medium">入口 Key</th>
-                    <th className="py-2 pr-3 font-medium">状态</th>
-                    <th className="py-2 pr-3 font-medium">最终凭据</th>
-                    <th className="py-2 pr-3 font-medium">Token</th>
-                    <th className="py-2 pr-3 font-medium">费用</th>
-                    <th className="py-2 pr-3 font-medium">首Token</th>
-                    <th className="py-2 pr-3 font-medium">错误类型</th>
-                    <th className="py-2 pr-3 font-medium">重试</th>
-                    <th className="py-2 pr-3 font-medium">耗时</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {records.map((rec) => (
-                    <TraceRow key={rec.traceId} rec={rec} />
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      <ConsoleTable
+        rows={records}
+        columns={columns}
+        rowKey={(r) => r.traceId}
+        tone={traceTone}
+        onRowActivate={setDetail}
+        columnsStorageKey="kiro.traces.columns"
+        loading={isLoading}
+        empty={
+          filterCount > 0 || url.range !== ''
+            ? '当前筛选条件下没有记录。放宽时间范围或清除筛选试试。'
+            : '暂无记录。发起几次 /v1/messages 请求后即可看到链路。'
+        }
+      />
 
       {total > PAGE_SIZE && (
         <div className="flex items-center justify-center gap-2">
           <Button
             variant="outline"
             size="sm"
-            onClick={() => setPage((p) => Math.max(0, p - 1))}
+            onClick={() => patchUrl({ page: String(Math.max(0, page - 1)) })}
             disabled={page === 0 || isFetching}
           >
             <ChevronLeft className="h-3.5 w-3.5" />
             上一页
           </Button>
-          <div className="px-3 text-sm tabular-nums text-muted-foreground">
+          <div className="console-num px-3 text-[13px] text-muted-foreground">
             第 <span className="font-medium text-foreground">{page + 1}</span> /{' '}
             {totalPages} 页
-            <span className="mx-1.5 text-muted-foreground/50">·</span>共 {total} 条
           </div>
           <Button
             variant="outline"
             size="sm"
-            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+            onClick={() =>
+              patchUrl({ page: String(Math.min(totalPages - 1, page + 1)) })
+            }
             disabled={page >= totalPages - 1 || isFetching}
           >
             下一页
@@ -617,10 +773,71 @@ export function TraceLogPage() {
           </Button>
         </div>
       )}
+
+      <TraceDetailDrawer rec={detail} onClose={() => setDetail(null)} />
     </div>
   )
 }
 
+/**
+ * 详情抽屉，替掉原先的行展开。
+ *
+ * 行展开会把 34px 的行顶到几百 px，下方所有行位置突变、滚动位置跟着跳 —— 想对比
+ * 相邻两条记录时格外难受。抽屉让表格布局始终稳定，左边列表和右边详情能同时看。
+ */
+function TraceDetailDrawer({
+  rec,
+  onClose,
+}: {
+  rec: TraceRecord | null
+  onClose: () => void
+}) {
+  return (
+    <DetailDrawer
+      open={rec != null}
+      onOpenChange={(open) => {
+        if (!open) onClose()
+      }}
+      title={rec?.model ?? ''}
+      subtitle={rec ? `${formatTime(rec.ts)} · ${rec.traceId}` : undefined}
+    >
+      {rec && (
+        <div className="space-y-1">
+          <DrawerSection title="结果">
+            <DrawerField label="状态">
+              <StatusBadge status={rec.finalStatus} />
+            </DrawerField>
+            {rec.errorType && (
+              <DrawerField label="错误类型">
+                <Badge variant={outcomeStyle(rec.errorType).variant}>
+                  {outcomeStyle(rec.errorType).label}
+                </Badge>
+              </DrawerField>
+            )}
+            <DrawerField label="最终凭据" mono>
+              {credLabel(rec.finalCredentialId, rec.finalEmail)}
+            </DrawerField>
+            <DrawerField label="入口 Key" mono>
+              {keyLabel(rec.keyId, rec.keyName)}
+            </DrawerField>
+            <DrawerField label="总耗时" mono>
+              {formatDuration(rec.durationMs)}
+            </DrawerField>
+            {rec.firstTokenMs != null && (
+              <DrawerField label="首 Token" mono>
+                {formatDuration(rec.firstTokenMs)}
+              </DrawerField>
+            )}
+            {rec.interruptedAfterBytes != null && (
+              <DrawerField label="中断前已发送" mono>
+                {rec.interruptedAfterBytes} 字节
+              </DrawerField>
+            )}
+          </DrawerSection>
 
-
-
+          <ExpandedDetail rec={rec} />
+        </div>
+      )}
+    </DetailDrawer>
+  )
+}

@@ -4,7 +4,63 @@ export interface CredentialsStatusResponse {
   available: number
   /** 优先级模式下的当前优先凭据 ID；均衡模式为 0 */
   currentId: number
+  /** 描述 metadata 字段、值类型和选项的 JSON Schema */
+  metadataSchema: CredentialMetadataSchema
   credentials: CredentialStatusItem[]
+}
+
+export type CredentialType = 'normal' | 'boom'
+export type CredentialSaleStatus = 'not_for_sale' | 'for_sale' | 'sold'
+
+/** 可扩展的凭据元数据；type 和 saleStatus 是固定字段，其余键由后端原样保存。 */
+export interface CredentialMetadata {
+  type: CredentialType
+  saleStatus: CredentialSaleStatus
+  /** 人民币销售价格；未设置时不展示。 */
+  salePrice?: number
+  [key: string]: unknown
+}
+
+/** `/api/admin/credentials` 返回的单个 metadata 字段。 */
+export interface CredentialMetadataDisplay {
+  title: string
+  description?: string
+  value: unknown
+  /** Schema oneOf 中匹配 value 的显示名（如 "normal" → "正常号"），无命中时为 undefined。 */
+  valueLabel?: string
+}
+
+/** 状态接口中的 metadata：字段 key 映射到其描述与当前值。 */
+export type CredentialStatusMetadata = Record<string, CredentialMetadataDisplay>
+
+export interface CredentialMetadataSchemaOption {
+  const: unknown
+  title: string
+}
+
+export interface CredentialMetadataFieldSchema {
+  title: string
+  description?: string
+  type: 'string' | 'number' | 'integer' | 'boolean'
+  default?: unknown
+  minimum?: number
+  oneOf?: CredentialMetadataSchemaOption[]
+  /** 应用于卡片字段值的安全内联 CSS 声明。 */
+  'x-css'?: string
+}
+
+export interface CredentialMetadataSchema {
+  $schema?: string
+  $id?: string
+  title?: string
+  type: 'object'
+  properties: Record<string, CredentialMetadataFieldSchema>
+  required?: string[]
+  additionalProperties: boolean
+}
+
+export interface CredentialMetadataSchemaConfig {
+  schema: CredentialMetadataSchema
 }
 
 // 单个凭据状态
@@ -22,6 +78,8 @@ export interface CredentialStatusItem {
   provider?: string | null
   hasProfileArn: boolean
   email?: string
+  /** 后端持久化的最近一次订阅等级；封禁时仍可显示。 */
+  subscriptionTitle?: string | null
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
@@ -38,10 +96,14 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 已关联描述与当前值的凭据 metadata。 */
+  metadata: CredentialStatusMetadata
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number
+  /** 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 undefined */
+  createdAt?: string
 }
 
 // 余额响应
@@ -139,6 +201,7 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
+  metadata?: CredentialMetadata
 }
 
 // 添加凭据响应
@@ -159,6 +222,8 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
+  /** 整体更新 metadata；调用方应保留不认识的扩展字段 */
+  metadata?: CredentialMetadata
 }
 
 // 更新 refreshToken 请求
@@ -246,10 +311,15 @@ export interface AssignRoundRobinResponse {
 // 全局代理配置
 export interface GlobalProxyResponse {
   proxyUrl: string | null
+  proxyUsername: string | null
+  proxyPasswordSet: boolean
 }
 
 export interface SetGlobalProxyRequest {
   proxyUrl: string | null
+  proxyUsername?: string | null
+  /** Omit to preserve the existing password; send null to clear it. */
+  proxyPassword?: string | null
 }
 
 // 在线更新配置
@@ -383,6 +453,10 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 累计 credit 使用量 */
+  totalCredits: number
+  /** 积分使用上限（未设置时为 undefined，表示不限制） */
+  maxCredits?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
@@ -398,6 +472,8 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  /** 积分使用上限（可选，不传表示不限制） */
+  maxCredits?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -474,6 +550,18 @@ export interface CredentialDistribution {
   errors: number
 }
 
+export interface KeyDistribution {
+  keyId: number
+  name: string
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  errors: number
+  credits: number
+}
+
 // ============ 请求链路追踪 ============
 
 /** 单次上游尝试 */
@@ -542,6 +630,12 @@ export interface TraceQuery {
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
   onlyFailed?: boolean
+  /** 时间窗口起点（Unix 秒，含）。与后端 traces.ts_epoch 同单位 */
+  startTime?: number
+  /** 时间窗口终点（Unix 秒，含） */
+  endTime?: number
+  /** 关键字模糊匹配：模型名 / traceId / 错误信息 */
+  q?: string
   limit?: number
   offset?: number
 }
@@ -561,6 +655,19 @@ export interface FailureStats {
 
 /** credentialId(字符串) → 失败分类计数 */
 export type FailureStatsMap = Record<string, FailureStats>
+
+// ============ 自定义模型 ============
+
+/** 单条自定义模型（与 config.json customModels 数组一一对应） */
+export interface CustomModelItem {
+  id: string
+  backendId: string
+  displayName?: string
+  contextWindow?: number
+  maxTokens?: number
+  supportsReasoning?: boolean
+  ownedBy?: string
+}
 
 // ============ 账号分组（独立实体）============
 

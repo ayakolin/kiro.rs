@@ -14,18 +14,22 @@ use super::{
         check_proxy, check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
-        export_credentials, force_refresh_token, get_account_throttle_config, get_all_credentials,
-        get_credential_balance, get_credential_models, get_current_models, get_global_proxy,
+        export_credentials, force_refresh_token, get_account_rpm_limit_config,
+        get_account_throttle_config, get_all_credentials,
+        get_credential_balance, get_credential_metadata_schema, get_credential_models,
+        get_current_models, get_global_proxy, get_custom_models,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_self_heal_config,
         get_update_config, list_client_keys, list_groups, list_traces, poll_idc_login,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
         reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
-        rollback_image_update, rotate_client_key, set_account_throttle_config,
-        set_client_key_disabled, set_credential_disabled, set_credential_overage,
-        set_credential_priority, set_global_proxy, set_load_balancing_mode,
+        rollback_image_update, rotate_client_key, set_account_rpm_limit_config,
+        set_account_throttle_config, set_client_key_disabled, set_client_key_max_credits,
+        set_credential_disabled, set_credential_metadata_schema, set_credential_overage,
+        set_credential_priority, set_custom_models, set_global_proxy, set_load_balancing_mode,
         set_log_governance_config, set_proxy_enabled, set_self_heal_config, set_update_config,
         start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
-        stats_by_credential, stats_by_model, stats_overview, stats_timeseries, test_model,
+        stats_by_credential, stats_by_key, stats_by_model, stats_overview, stats_timeseries,
+        test_model,
         trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
     },
@@ -109,6 +113,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_account_throttle_config).put(set_account_throttle_config),
         )
         .route(
+            "/config/account-rpm-limit",
+            get(get_account_rpm_limit_config).put(set_account_rpm_limit_config),
+        )
+        .route(
             "/config/self-heal",
             get(get_self_heal_config).put(set_self_heal_config),
         )
@@ -117,8 +125,16 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_log_governance_config).put(set_log_governance_config),
         )
         .route(
+            "/config/credential-metadata-schema",
+            get(get_credential_metadata_schema).put(set_credential_metadata_schema),
+        )
+        .route(
             "/config/global-proxy",
             get(get_global_proxy).put(set_global_proxy),
+        )
+        .route(
+            "/config/custom-models",
+            get(get_custom_models).put(set_custom_models),
         )
         .route(
             "/config/update",
@@ -168,6 +184,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/client-keys/{id}/disabled", post(set_client_key_disabled))
         .route(
+            "/client-keys/{id}/max-credits",
+            post(set_client_key_max_credits),
+        )
+        .route(
             "/client-keys/{id}/reset-stats",
             post(reset_client_key_stats),
         )
@@ -178,6 +198,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
+        .route("/stats/by-key", get(stats_by_key))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))
         .layer(middleware::from_fn_with_state(

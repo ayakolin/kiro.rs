@@ -1,6 +1,7 @@
 //! Admin API 类型定义
 
 use crate::admin::proxy_pool::ProxyHealth;
+use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
 
 // ============ 凭据状态 ============
@@ -15,6 +16,8 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
     pub current_id: u64,
+    /// 凭据 metadata 的 JSON Schema
+    pub metadata_schema: serde_json::Value,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -52,6 +55,9 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 最近一次查询到的 Kiro 订阅等级；不依赖当前余额缓存。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -74,12 +80,34 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据 metadata；key 为字段名，值包含显示文案、描述和实际值。
+    pub metadata: std::collections::BTreeMap<String, CredentialMetadataDetail>,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
     /// 余额缓存的更新时间（Unix 秒，仅在 balance 有值时返回）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_updated_at: Option<f64>,
+    /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
+/// 单个凭据 metadata 字段的可展示信息。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialMetadataDetail {
+    /// 面向用户的字段名称；没有 Schema 定义时回退为 key。
+    pub title: String,
+    /// Schema 字段描述；未定义扩展字段时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 凭据上的实际值；旧凭据缺失时可回退到 Schema 默认值。
+    pub value: serde_json::Value,
+    /// Schema oneOf 中匹配 value 的显示名（如 "normal" → "正常号"）。
+    /// 未命中 oneOf 或该字段无 oneOf 时为 None，前端可回退显示 value。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_label: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -194,6 +222,9 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 凭据扩展元数据（默认账号类型为 normal）
+    #[serde(default)]
+    pub metadata: CredentialMetadata,
 }
 
 fn default_auth_method() -> String {
@@ -232,6 +263,9 @@ pub struct UpdateCredentialRequest {
     /// 账号来源渠道（None 表示不修改，空串表示清除）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 凭据扩展元数据（None 表示不修改）
+    #[serde(default)]
+    pub metadata: Option<CredentialMetadata>,
 }
 
 /// 添加凭据成功响应
@@ -480,6 +514,28 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
+/// 单账号 RPM 限流配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRpmLimitConfigResponse {
+    /// 是否启用单账号 RPM 主动限流
+    pub enabled: bool,
+    /// 每账号每分钟请求次数上限
+    pub limit: u32,
+}
+
+/// 更新单账号 RPM 限流配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountRpmLimitConfigRequest {
+    /// 是否启用限流；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 每分钟上限；缺省表示不修改，1..=100000
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 /// 自愈治理配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -540,6 +596,13 @@ pub struct SetLogGovernanceConfigRequest {
     /// 用量日志保留天数，1..=365
     #[serde(default)]
     pub usage_log_retention_days: Option<u32>,
+}
+
+/// 凭据 metadata schema 配置响应/更新请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialMetadataSchemaConfig {
+    pub schema: serde_json::Value,
 }
 
 // ============ 代理池 ============
@@ -657,6 +720,10 @@ pub struct AssignProxyRequest {
 pub struct GlobalProxyResponse {
     /// 当前全局代理 URL（null 表示未配置）
     pub proxy_url: Option<String>,
+    /// 代理认证用户名
+    pub proxy_username: Option<String>,
+    /// 是否已配置代理认证密码；不回显密码本身。
+    pub proxy_password_set: bool,
 }
 
 /// 设置全局代理请求
@@ -665,6 +732,13 @@ pub struct GlobalProxyResponse {
 pub struct SetGlobalProxyRequest {
     /// 代理 URL，null 表示清除全局代理
     pub proxy_url: Option<String>,
+    /// 代理认证用户名（仅 proxy_url 不为 null 时有效）
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// 代理认证密码（仅 proxy_url 不为 null 时有效）。省略表示保留现有密码，
+    /// 显式 null 表示清除密码。
+    #[serde(default)]
+    pub proxy_password: Option<Option<String>>,
 }
 
 // ============ 在线更新配置 ============
@@ -816,6 +890,11 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    /// 累计 credit 使用量（用于与上限比较）
+    pub total_credits: f64,
+    /// 积分使用上限（None 表示不限制）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
@@ -840,6 +919,9 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 积分使用上限（可选；None / 省略表示不限制）
+    #[serde(default)]
+    pub max_credits: Option<f64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -860,6 +942,15 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+}
+
+/// 设置客户端 Key 的积分使用上限
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetClientKeyMaxCreditsRequest {
+    /// 积分上限；null 或省略表示取消限制
+    #[serde(default)]
+    pub max_credits: Option<f64>,
 }
 
 // ============ IdC 设备授权登录 ============
@@ -1152,4 +1243,45 @@ pub struct DeleteGroupQuery {
     /// 强制删除：即使仍有引用也删；同时级联清理凭据 / Key 的引用
     #[serde(default)]
     pub force: bool,
+}
+
+// ============ 自定义模型 ============
+
+/// 自定义模型配置响应（列表）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModelsConfigResponse {
+    pub models: Vec<CustomModelItem>,
+}
+
+/// 单条自定义模型条目（与 `config::CustomModel` 字段一一对应，仅用于 Admin API 序列化）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModelItem {
+    /// 客户端请求时使用的模型名（别名）。匹配大小写不敏感。
+    pub id: String,
+    /// 映射到的 Kiro 后端模型 ID（实际下发给上游）。
+    pub backend_id: String,
+    /// `/v1/models` 展示名（可选，缺省用 `id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// 上下文窗口大小（可选，缺省 200000）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i32>,
+    /// 单次响应最大 token 数（可选，缺省 64000）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
+    /// 是否支持原生 reasoning（可选，缺省 false）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
+    /// `/v1/models` 的 `owned_by` 字段（可选，缺省 "custom"）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_by: Option<String>,
+}
+
+/// 批量设置自定义模型请求（整体替换 `config.json` 中的 `customModels` 数组）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCustomModelsRequest {
+    pub models: Vec<CustomModelItem>,
 }

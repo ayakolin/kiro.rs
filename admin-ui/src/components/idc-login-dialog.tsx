@@ -9,114 +9,12 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
-import {
-  Select,
-  SelectGroup,
-  SelectLabel,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
-} from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { RegionSelect } from '@/components/region-select'
 import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
 import type { StartIdcLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
-
-/** 预设 SSO 区域（分组 + 显示名），与 AWS 常用区域一致 */
-const SSO_REGION_GROUPS: { group: string; items: [string, string][] }[] = [
-  {
-    group: 'US',
-    items: [
-      ['us-east-1', 'us-east-1 (N. Virginia)'],
-      ['us-east-2', 'us-east-2 (Ohio)'],
-      ['us-west-1', 'us-west-1 (N. California)'],
-      ['us-west-2', 'us-west-2 (Oregon)'],
-    ],
-  },
-  {
-    group: 'Europe',
-    items: [
-      ['eu-west-1', 'eu-west-1 (Ireland)'],
-      ['eu-west-2', 'eu-west-2 (London)'],
-      ['eu-west-3', 'eu-west-3 (Paris)'],
-      ['eu-central-1', 'eu-central-1 (Frankfurt)'],
-      ['eu-north-1', 'eu-north-1 (Stockholm)'],
-      ['eu-south-1', 'eu-south-1 (Milan)'],
-    ],
-  },
-  {
-    group: 'Asia Pacific',
-    items: [
-      ['ap-northeast-1', 'ap-northeast-1 (Tokyo)'],
-      ['ap-northeast-2', 'ap-northeast-2 (Seoul)'],
-      ['ap-northeast-3', 'ap-northeast-3 (Osaka)'],
-      ['ap-southeast-1', 'ap-southeast-1 (Singapore)'],
-      ['ap-southeast-2', 'ap-southeast-2 (Sydney)'],
-      ['ap-south-1', 'ap-south-1 (Mumbai)'],
-      ['ap-east-1', 'ap-east-1 (Hong Kong)'],
-    ],
-  },
-  {
-    group: 'Other',
-    items: [
-      ['ca-central-1', 'ca-central-1 (Canada)'],
-      ['sa-east-1', 'sa-east-1 (São Paulo)'],
-      ['me-south-1', 'me-south-1 (Bahrain)'],
-      ['af-south-1', 'af-south-1 (Cape Town)'],
-    ],
-  },
-]
-
-const KNOWN_SSO_REGIONS = SSO_REGION_GROUPS.flatMap((g) => g.items.map(([v]) => v))
-
-/** SSO 区域选择：下拉预设区域 + 始终可输入的自定义文本框 */
-function RegionSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const inputRef = useRef<HTMLInputElement>(null)
-  const selectValue = KNOWN_SSO_REGIONS.includes(value) ? value : 'custom'
-  const handleSelectChange = (v: string) => {
-    if (v !== 'custom') {
-      onChange(v)
-      return
-    }
-    if (KNOWN_SSO_REGIONS.includes(value)) onChange('')
-    requestAnimationFrame(() => inputRef.current?.focus())
-  }
-
-  return (
-    <div className="flex gap-2">
-      <Select value={selectValue} onValueChange={handleSelectChange}>
-        <SelectTrigger className="flex-1 h-10">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {SSO_REGION_GROUPS.map((g) => (
-            <SelectGroup key={g.group}>
-              <SelectLabel>{g.group}</SelectLabel>
-              {g.items.map(([v, label]) => (
-                <SelectItem key={v} value={v}>
-                  {label}
-                </SelectItem>
-              ))}
-            </SelectGroup>
-          ))}
-          <SelectGroup>
-            <SelectLabel>自定义</SelectLabel>
-            <SelectItem value="custom">-- 自定义输入 --</SelectItem>
-          </SelectGroup>
-        </SelectContent>
-      </Select>
-      <Input
-        ref={inputRef}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder="例如: cn-north-1"
-        className="w-36"
-      />
-    </div>
-  )
-}
 
 interface IdcLoginDialogProps {
   open: boolean

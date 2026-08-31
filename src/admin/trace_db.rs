@@ -187,6 +187,12 @@ pub struct TraceQuery {
     /// 按账号分组筛选：只返回最终凭据属于这些 id 的 trace。
     /// 由 handler 层在查询前根据 group 参数转换为凭据 id 白名单填入。
     pub credential_ids: Option<Vec<u64>>,
+    /// 时间窗口起点（Unix **秒**，含）。与 `ts_epoch` 列同单位，走 `idx_traces_ts` 索引。
+    pub start_ts: Option<i64>,
+    /// 时间窗口终点（Unix **秒**，含）
+    pub end_ts: Option<i64>,
+    /// 关键字模糊匹配：模型名 / trace_id / 错误信息 的子串（大小写不敏感）
+    pub keyword: Option<String>,
     /// 返回条数上限
     pub limit: usize,
     /// 偏移量（分页用）
@@ -453,6 +459,29 @@ impl TraceStore {
         }
         if q.only_failed {
             clauses.push("final_status != 'success'".to_string());
+        }
+        // 时间窗口：与 ts_epoch 同为 Unix 秒，命中 idx_traces_ts(ts_epoch DESC)
+        if let Some(start) = q.start_ts {
+            clauses.push("ts_epoch >= ?".to_string());
+            params.push(Box::new(start));
+        }
+        if let Some(end) = q.end_ts {
+            clauses.push("ts_epoch <= ?".to_string());
+            params.push(Box::new(end));
+        }
+        // 关键字：排查时手里通常只有一个模型名、一段报错或一个 trace_id，
+        // 与其让用户先想清楚该填哪个字段，不如一个框同时匹配这三处。
+        // LIKE 无法走索引，但已被上面的时间窗口把扫描范围收窄。
+        if let Some(kw) = &q.keyword {
+            let pattern = format!("%{}%", kw.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            clauses.push(
+                "(model LIKE ? ESCAPE '\\' OR trace_id LIKE ? ESCAPE '\\' \
+                 OR IFNULL(error_message, '') LIKE ? ESCAPE '\\')"
+                    .to_string(),
+            );
+            params.push(Box::new(pattern.clone()));
+            params.push(Box::new(pattern.clone()));
+            params.push(Box::new(pattern));
         }
         let where_sql = if clauses.is_empty() {
             String::new()
@@ -982,5 +1011,118 @@ mod tests {
         let out = truncate_snippet(&long).unwrap();
         assert!(out.ends_with("…(truncated)"));
         assert!(out.len() <= ERROR_SNIPPET_MAX + 20);
+    }
+
+    /// 指定发生时刻的样本（时间窗口筛选需要可控的 ts）
+    fn sample_at(trace_id: &str, model: &str, ago_secs: i64) -> TraceRecord {
+        let mut rec = sample(TraceSample {
+            trace_id,
+            status: "success",
+            credential_id: 5,
+            model,
+        });
+        rec.ts = (Utc::now() - chrono::Duration::seconds(ago_secs)).to_rfc3339();
+        rec
+    }
+
+    #[test]
+    fn time_window_filters_by_ts_epoch() {
+        let store = mem_store();
+        store.insert(&sample_at("recent", "m1", 60)); // 1 分钟前
+        store.insert(&sample_at("mid", "m1", 60 * 30)); // 30 分钟前
+        store.insert(&sample_at("old", "m1", 60 * 60 * 48)); // 48 小时前
+
+        let now = Utc::now().timestamp();
+        let ids = |q: &TraceQuery| {
+            let mut v: Vec<String> = store.query(q).into_iter().map(|r| r.trace_id).collect();
+            v.sort();
+            v
+        };
+
+        // 最近 15 分钟：只剩 1 分钟前那条
+        assert_eq!(
+            ids(&TraceQuery {
+                start_ts: Some(now - 15 * 60),
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["recent"]
+        );
+
+        // 最近 1 小时：含 1 分钟 + 30 分钟两条
+        assert_eq!(
+            ids(&TraceQuery {
+                start_ts: Some(now - 60 * 60),
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["mid", "recent"]
+        );
+
+        // 上界：只要 30 分钟前及更早，排除 1 分钟前那条
+        assert_eq!(
+            ids(&TraceQuery {
+                end_ts: Some(now - 10 * 60),
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["mid", "old"]
+        );
+
+        // 不带时间条件时全部返回，保证既有调用方行为不变
+        assert_eq!(
+            ids(&TraceQuery {
+                limit: 50,
+                ..Default::default()
+            })
+            .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn keyword_matches_model_trace_id_and_error() {
+        let store = mem_store();
+        store.insert(&sample(TraceSample {
+            trace_id: "aaa-111",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-7",
+        }));
+        store.insert(&sample(TraceSample {
+            trace_id: "bbb-222",
+            status: "error", // error_message = "blocked"
+            credential_id: 6,
+            model: "claude-sonnet-4-5",
+        }));
+
+        let ids = |kw: &str| {
+            let mut v: Vec<String> = store
+                .query(&TraceQuery {
+                    keyword: Some(kw.to_string()),
+                    limit: 50,
+                    ..Default::default()
+                })
+                .into_iter()
+                .map(|r| r.trace_id)
+                .collect();
+            v.sort();
+            v
+        };
+
+        // 命中模型名
+        assert_eq!(ids("opus"), vec!["aaa-111"]);
+        // 命中 trace_id
+        assert_eq!(ids("bbb"), vec!["bbb-222"]);
+        // 命中错误信息
+        assert_eq!(ids("blocked"), vec!["bbb-222"]);
+        // 公共子串同时命中两条
+        assert_eq!(ids("claude"), vec!["aaa-111", "bbb-222"]);
+        // 无命中
+        assert!(ids("nonexistent").is_empty());
+
+        // LIKE 元字符被转义：% 不再是通配符，不应匹配任何记录
+        assert!(ids("%").is_empty(), "% 应按字面量处理");
+        assert!(ids("_").is_empty(), "_ 应按字面量处理");
     }
 }

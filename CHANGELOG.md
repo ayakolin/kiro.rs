@@ -4,6 +4,151 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-08-26
+
+主题：**Responses / Codex 流式链路稳定性、客户端 Key 配额治理、运维控制台与凭据元数据管理，以及 Enterprise / IdC 兼容性修复**。本版合并 PR #66、#67、#70、#71、#74、#75，并补充后续的控制台主题、刷新和移动端布局改进。新增字段均提供默认值，升级无需迁移现有配置、凭据或客户端 Key 文件。
+
+### ✨ 新增 — 按入口 Key 用量分布与积分上限
+
+> 来源：[PR #70](https://github.com/ZyphrZero/kiro.rs/pull/70)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- 新增 `GET /api/admin/stats/by-key` 与「按入口 Key 分布」面板，按时间窗横向汇总调用次数、输入/输出/缓存 Token、异常数和 credit，并支持按分组过滤。
+- `ClientKey` 支持 `maxCredits` 累计积分上限；新增 `POST /api/admin/client-keys/{id}/max-credits`，创建 Key 时也可设置，传 `null` 可清除限制。
+- 达到上限的请求返回 HTTP 429 `rate_limit_error`，不累加调用次数，也不写入用量日志与链路追踪；重置统计后可重新计费。
+- 上限是请求结束时入账的软配额，并发中的请求可能在最终计量前同时通过检查，实际用量可能略超配置值。
+
+### ✨ 新增 — 运维控制台、凭据元数据与模型管理
+
+> 来源：[PR #71](https://github.com/ZyphrZero/kiro.rs/pull/71)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- 凭据、设置、请求日志三页重构为运维控制台：设置项集中管理并即时保存，日志支持时间范围 / 关键字筛选、URL 状态同步、列控制和右侧详情抽屉，凭据页提供状态筛选条、分页、批量操作和优先级预览。
+- 新增可扩展凭据 Metadata schema：字段定义、默认值、`oneOf` 描述和值标签由后端统一提供；支持实时预览、全局缓存刷新、批量编辑 / 导入，以及凭据卡片和列表中的元数据展示。
+- 新增自定义模型管理与凭据编辑 Tab，按厂商组织模型设置；校验并报告模型持久化失败，代理 URL / 认证字段校验更严格，凭据级代理故障时可自动切换，全局代理支持独立用户名和密码。
+- 优先级调度严格跳过无效凭据；空字符串 `proxyUrl` 按未配置处理，避免启动失败。
+
+### 🔧 修复 — Responses / Codex 流式传输与 WebSearch 长连接
+
+> 来源：[PR #67](https://github.com/ZyphrZero/kiro.rs/pull/67)。提交人：[@stormrise](https://github.com/stormrise)，感谢贡献。
+
+- Responses API 改为增量翻译 Anthropic 事件，稳定输出 item / SSE 顺序，减少 Codex 长连接中的断流、空响应和重复结束事件。
+- WebSearch 多轮请求持续发送保活与搜索进度；客户端取消会向上游传播，错误、中断和正常结束统一结算 usage 与 trace，避免悬挂请求或漏记计量。
+- 改进近期 Codex reasoning、function / custom 工具及工具结果续接的兼容性，保持与 Anthropic 流式链路一致。
+
+### 🔧 修复 — 混合 WebSearch 请求的链路追踪
+
+> 来源：[PR #66](https://github.com/ZyphrZero/kiro.rs/pull/66)。提交人：[@KtzeAbyss](https://github.com/KtzeAbyss)，感谢贡献。
+
+- 混合 `web_search` + 客户端工具的请求现在完整记录 trace、尝试链路和最终状态；内部搜索循环不再让请求从追踪统计中消失。
+- 统一混合场景的 WebSearch 路由、工具去重和失败传播，便于在 Admin 日志中还原实际执行过程。
+
+### 🔧 修复 — Enterprise / IdC 的真实 `profileArn`
+
+> 来源：[PR #74](https://github.com/ZyphrZero/kiro.rs/pull/74) 与 [PR #75](https://github.com/ZyphrZero/kiro.rs/pull/75)。提交人：[@lijmyeah](https://github.com/lijmyeah)、[@ZyphrZero](https://github.com/ZyphrZero)，感谢贡献。
+
+- `getUsageLimits`、`ListAvailableModels` 等用量 / 模型接口调用前解析并携带真实 `profileArn`，修复 Enterprise / IAM Identity Center 凭据刷新余额和模型列表时的 403。
+- `setUserPreference` 同样按账号解析真实 ARN；Builder ID 占位 ARN 不再误用于需要真实用户配置的请求。
+- 复用已有的凭据级解析与缓存逻辑，解析失败时返回明确错误，不改变普通 Builder ID / Social 请求行为。
+
+### 🎨 Admin UI 体验改进
+
+- 新增可持久化的多主题选择器，主题偏好写入本地存储并在启动时恢复。
+- 控制台页面统一页头、自动刷新与刷新状态；模型、Metadata、日志和分组页面的筛选与操作布局更紧凑。
+- 修复客户端 Key 表格圆角裁切、凭据卡片与批量操作栏在窄屏下的溢出和遮挡，移动端菜单与操作按钮布局更加稳定。
+
+### 🔒 兼容性与测试
+
+- `Cargo.toml`、`Cargo.lock`、`admin-ui/package.json` 版本统一为 `0.8.0`。
+- 新增配置、客户端 Key、凭据 Metadata 字段均兼容旧文件；未设置 `maxCredits` 时行为与此前一致。
+
+## [0.7.6] - 2026-08-13
+
+主题：**修复 GPT-5.6 推理参数、OpenAI 会话缓存与 Token 用量统计，同时校正 Claude Code 会话隔离和 Opus 5 上下文窗口识别**。本版聚焦协议转换与计量准确性，不新增配置项或迁移步骤。
+
+### 🔧 修复 — GPT-5.6 推理参数与 OpenAI 上游缓存
+
+> 来源：[PR #64](https://github.com/ZyphrZero/kiro.rs/pull/64)。提交人：[@kiim-wong](https://github.com/kiim-wong)，感谢贡献。
+
+- **按模型族生成正确的 effort 字段**：GPT-5.6 sol/terra/luna 现在通过 `additionalModelRequestFields.reasoning.effort` 传递 `none`、`low`、`medium`、`high`、`xhigh` 或 `max`；Claude 模型继续使用 `output_config.effort`。
+- **为 OpenAI 请求建立稳定的会话亲和**：Chat Completions 与 Responses 会依次从 `prompt_cache_key`、`x-session-affinity`、`x-client-request-id` 和 `session_id` 提取 UUID，并复用为 Kiro `conversationId`，使同一会话能够命中上游缓存。
+- **保持无状态请求的原有边界**：会话标识缺失或非法时仍生成随机 `conversationId`，不会把不同请求错误归入同一会话。
+
+### 📊 修复 — OpenAI Token 与缓存用量统计
+
+- **优先采用服务端精确计量**：解析 `metadataEvent.tokenUsage` 中的未缓存输入、缓存写入、缓存读取和输出 Token；服务端未提供时再依次回退到上下文用量与本地估算。
+- **修正 OpenAI Usage 映射**：`input_tokens` 现在包含未缓存输入、缓存写入和缓存读取；Responses API 的 `cached_tokens` 对应实际缓存读取量。
+- **统一流式请求的最终用量**：多轮 Web Search 会累加各轮计量，正常完成、错误和中断路径使用同一份最终用量快照。
+
+### 🔧 修复 — Claude Code 缓存计量的会话隔离
+
+> 来源：[PR #63](https://github.com/ZyphrZero/kiro.rs/pull/63)。提交人：[@childe](https://github.com/childe)，感谢贡献。
+
+- **支持 JSON 形态的 `user_id`**：缓存计量会从 Claude Code 当前发送的 JSON 元数据中提取 `session_id`，恢复共享系统密钥下的会话级缓存隔离。
+- **兼容旧格式**：JSON 解析失败时继续识别原有的 `..._session_<uuid>` 字符串，既有客户端无需迁移。
+- **避免并行会话相互干扰**：使用客户端密钥时，缓存作用域不再因 JSON 元数据无法识别而退化到密钥级别。
+
+### 🔧 修复 — Opus 5 的 1M 上下文窗口
+
+> 来源：[PR #61](https://github.com/ZyphrZero/kiro.rs/pull/61)。提交人：[@lijmyeah](https://github.com/lijmyeah)，感谢贡献。
+
+- **将 `claude-opus-5` 纳入 1M 模型族**：Opus 5 及其别名、带后缀模型名不再错误回退到 200K 上下文窗口。
+- **校正上下文进度与自动压缩时机**：Context Usage 换算基于正确的窗口大小，避免用量显示偏低以及上下文接近上限时未及时触发压缩。
+- **补充模型识别回归测试**：覆盖 Opus 5 的标准名、别名和后缀形式，并确保 Opus 4.5 不被误判为 1M 模型。
+
+### 🔒 兼容性
+
+- 无新增配置项、依赖或数据迁移。
+- 旧式 Claude Code 会话标识继续受支持；缺少合法会话标识的 OpenAI 请求继续使用随机会话 ID。
+
+## [0.7.5] - 2026-08-05
+
+主题：**为多账号调度加入单账号 RPM 主动限流，并集中增强管理端的凭据筛选、批量操作、创建时间、请求计费与移动端可用性**。本版同时加固 WebSearch MCP 的查询参数兼容和 Enterprise / IdC 路由；新增配置默认关闭或带有 `serde(default)`，旧 `config.json` 与 `credentials.json` 无需迁移。
+
+### ✨ 新功能 — 单账号 RPM 主动限流
+
+> 来源：[PR #55](https://github.com/ZyphrZero/kiro.rs/pull/55)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- **每凭据独立滑动窗口**：新增 `accountRpmLimitEnabled`（默认 `false`）与 `accountRpmLimit`（默认 `60`），每个账号独立维护 60 秒请求窗口；达到上限后临时退出候选，请求自动故障转移到下一可用账号。
+- **只统计真实业务请求**：Admin 模型发现等只读操作不占用额度；配置可通过 `GET|PUT /api/admin/config/account-rpm-limit` 在运行时读取、修改并持久化。
+- **并发额度原子预留**：过期清理、上限校验与请求记账在同一把凭据锁内完成；并发请求竞争失败时重新选择账号，不会同时穿透只读检查而超过配置上限。
+- **标准 429 响应**：所有匹配账号都耗尽 RPM 时返回类型化 HTTP 429，并按最早释放的滑动窗口计算 `Retry-After`，不再退化为“所有凭据均已禁用”的通用错误。
+- **完整管理端设置**：顶栏提供启停、常用预设与自定义每分钟上限；移动端与桌面端复用同一配置面板。
+
+### ✨ 增强 — 凭据列表与批量操作
+
+> 来源：[PR #56](https://github.com/ZyphrZero/kiro.rs/pull/56) 与 [PR #58](https://github.com/ZyphrZero/kiro.rs/pull/58)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- **多字段排序**：支持按优先级、成功次数、累计失败、最后使用时间与 ID 排序；重复选择同一字段可切换升降序，“从未使用”始终排在末尾，同值使用 ID 稳定排序。
+- **按状态隐藏**：可组合隐藏当前优先、已启用、已禁用、冷却中和已超额凭据；排序或筛选变化后自动回到第一页。
+- **排序与拖拽语义隔离**：仅“手动顺序”允许拖拽调整优先级，字段排序期间隐藏拖拽手柄，避免视觉顺序与服务端优先级混淆。
+- **批量删除进度与失败重试**：逐项展示删除进度和最终成功/失败统计；部分失败时仅保留失败凭据的选择状态，方便直接重试，并确保异常路径也会退出删除中状态。
+- **记录凭据添加时间**：凭据新增可选 RFC3339 `createdAt`，所有新增入口统一补写，导入数据已有时间则保留；旧凭据无值时显示“未知”，无需迁移存量文件。
+
+### 📊 增强 — 请求计费与缓存效率
+
+> 来源：[PR #60](https://github.com/ZyphrZero/kiro.rs/pull/60)。提交人：[@bestK](https://github.com/bestK)，感谢贡献。
+
+- **Trace 详情新增计费面板**：展示上游 `meteringEvent` 的真实 credit、每千输入 Token 的 credit，以及缓存创建、缓存读取和未缓存输入等拆分指标。
+- **修正计费效率分母**：每千输入 credit 使用“未缓存输入 + cache creation + cache read”的总输入作为分母；存在缓存拆分时单独展示未缓存输入，避免高缓存命中请求被计算成异常高成本。
+
+### 🔧 修复 — WebSearch MCP 路由加固
+
+> 来源：[PR #57](https://github.com/ZyphrZero/kiro.rs/pull/57)。提交人：[@soeric](https://github.com/soeric)，感谢贡献。
+
+- **兼容多种查询入参**：统一提取 `query`、`search_query`、`q`、`queries` 及嵌套 `text` / `value`，自动去除首尾空白并选择首个非空查询。
+- **区分空结果与真实失败**：缺少有效查询时不调用 MCP；上游明确返回“无结果”时作为空搜索继续，其它 MCP 错误仍显式传播，不伪装为成功。
+- **Enterprise / IdC 搜索可用**：纯 MCP / WebSearch 请求在调用前补齐 `profileArn`，与常规模型请求保持一致，同时继续遵守客户端 Key 的凭据分组隔离。
+
+### 📱 修复 — 移动端管理体验
+
+- **客户端 Key 操作列固定**：宽表横向滚动时最后的编辑、启停、重置与删除操作列始终固定在右侧，并使用实体背景和边界避免内容透叠。
+- **自愈与限流选项不再缺失**：移动端紧凑菜单展示完整的自愈开关、403 封禁识别、冷却间隔、连续轮数、RPM 开关、预设和自定义上限。
+- **长菜单适配动态视口**：顶部工具菜单限制在移动端动态视口内并支持纵向滚动，避免浏览器地址栏或短屏裁掉底部配置。
+
+### 🔒 兼容性与测试
+
+- RPM 限流默认关闭；新增配置与 `createdAt` 均兼容旧文件，升级不改变现有账号的默认调度行为。
+- 新增 WebSearch 查询规范化、MCP 空结果、RPM 滑动窗口与 429、凭据添加时间等回归测试；Rust 全量测试与 Admin UI 类型检查、生产构建均通过。
+
 ## [0.7.4] - 2026-07-28
 
 主题：**修复 IdC / Enterprise 重新登录后 Token 无法刷新，以及持续 403 场景下“全账号自愈”陷入 `全禁 → 自愈 → 403 → 再禁` 死循环的问题**。本版合并 [PR #52](https://github.com/ZyphrZero/kiro.rs/pull/52) 与 [issue #51](https://github.com/ZyphrZero/kiro.rs/issues/51) 的修复：重新登录会整体替换与 OIDC 客户端绑定的凭据；账号池则精准识别 403 封禁，并通过配置驱动的**节流 + 连续上限 + 可观测**治理自愈行为。新增配置字段均 `serde(default)`，旧 `config.json` 无需改动。
