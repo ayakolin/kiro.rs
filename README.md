@@ -2,6 +2,8 @@
 
 **该项目基于 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 进行的二次开发**
 
+Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
+
 `kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 与 OpenAI Chat Completions / Responses API 兼容代理。它把 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 等请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
 
 项目当前的核心目标是：让 Claude Code、Codex CLI、Anthropic / OpenAI SDK 或其它兼容客户端，通过统一的本地 / 自托管服务访问 Kiro 账号能力，同时在服务端集中处理多凭据、token 刷新、故障转移、用量统计和可观测性。
@@ -743,8 +745,10 @@ credential.authRegion -> credential.region -> config.authRegion -> config.region
 API 请求：
 
 ```text
-credential.apiRegion -> config.apiRegion -> config.region
+credential.apiRegion -> credential.region -> config.apiRegion -> config.region
 ```
+
+仅配置凭据 `region` 时，Token 刷新和 API 请求都默认使用该区域。需要分开设置时，使用凭据级 `authRegion` 和 `apiRegion`；`authRegion` 本身不作为 API 请求区域的回退值。
 
 部分 REST / 管理类上游接口只在 `us-east-1` 和 `eu-central-1` 提供服务，代码会按账号区域选择候选端点并在必要时回退。
 
@@ -866,6 +870,8 @@ git diff --check
 ## 💬 社区支持
 
 欢迎到 [linux.do](https://linux.do/) 交流、分享和反馈。
+
+也欢迎加入 [Telegram 讨论群组：kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)。
 
 <a id="acknowledgements"></a>
 ## 🙏 致谢

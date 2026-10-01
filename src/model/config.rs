@@ -166,6 +166,21 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 会话粘性路由开关（默认 true）。
+    ///
+    /// 开启后同一 `conversationId` 的后续轮次优先沿用上一轮成功的凭据；该凭据不可用
+    /// （禁用 / 冷却 / RPM 打满 / 不支持模型 / 不在分组）时才回落到 `load_balancing_mode`。
+    /// 注意：Kiro 上游 prompt cache 按 profile 隔离而非按账号，同 profile 的账号之间换号
+    /// 不会丢缓存；粘性主要在多 profile 部署下保住缓存，单 profile 下作用是会话可追溯。
+    /// 注意：粘性优先于 priority 模式的「高优先级恢复后立即回切」，代价是
+    /// 会话在 TTL 内不会主动迁回高优先级凭据。
+    #[serde(default = "default_session_affinity_enabled")]
+    pub session_affinity_enabled: bool,
+
+    /// 会话绑定的有效期（秒，默认 3600）。每次成功请求都会续期。
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    pub session_affinity_ttl_secs: u64,
+
     /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
     ///
     /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
@@ -244,6 +259,15 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 是否启用中转层 prompt cache 本地计量模拟。未设置时回落到
+    /// `KIRO_RS_CACHE_METERING` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后：不查不写任何缓存态，usage 全量计入 `input_tokens`、
+    /// `cache_creation_input_tokens` / `cache_read_input_tokens` 恒为 0。
+    /// 上游若下发真实 `metadataEvent.tokenUsage`，仍按真值上报，不受此开关影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_enabled: Option<bool>,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -317,6 +341,14 @@ fn default_tls_backend() -> TlsBackend {
 
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
+}
+
+fn default_session_affinity_enabled() -> bool {
+    true
+}
+
+fn default_session_affinity_ttl_secs() -> u64 {
+    3600
 }
 
 fn default_account_throttle_failover() -> bool {
@@ -410,6 +442,8 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            session_affinity_enabled: default_session_affinity_enabled(),
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
@@ -422,6 +456,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            cache_metering_enabled: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),

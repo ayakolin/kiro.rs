@@ -125,8 +125,58 @@ pub struct TraceRecord {
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
+    /// 发给上游的 `conversationId`（Claude Code 的 session UUID；无 metadata 的客户端为每次随机）。
+    /// 同一会话的多轮请求共享此值，可据此把一个会话的全部轮次串起来。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 会话粘性路由结果，见 [`sticky`]。None = 老记录 / 未走凭据选择。
+    #[serde(default)]
+    pub sticky_outcome: Option<String>,
+    /// 本次请求前该会话绑定的凭据 id。与 `final_credential_id` 不同即为「换号」。
+    /// None = 该会话此前无绑定（首轮 / 已过期）。
+    #[serde(default)]
+    pub previous_credential_id: Option<u64>,
+    /// token / cache 三项的来源，见 [`usage_source`]。None = 老记录 / 错误早退无用量。
+    #[serde(default)]
+    pub usage_source: Option<String>,
+    /// 客户端 IP（转发头优先，回落到 TCP 对端）。None = 老记录 / 无法确定。
+    #[serde(default)]
+    pub client_ip: Option<String>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
+}
+
+/// 会话粘性路由结果（record.sticky_outcome 取值）
+pub mod sticky {
+    /// 绑定凭据可用，本次沿用
+    pub const HIT: &str = "hit";
+    /// 该会话无绑定（首轮或绑定已过期）
+    pub const MISS_FIRST: &str = "miss_first";
+    /// 有绑定但该凭据当前不可用（禁用 / 冷却 / RPM 打满 / 不支持模型 / 不在分组）
+    pub const MISS_UNAVAILABLE: &str = "miss_unavailable";
+    /// 粘性路由已关闭
+    pub const OFF: &str = "off";
+}
+
+/// usage 三项的来源（record.usage_source 取值）
+pub mod usage_source {
+    /// 上游 `metadataEvent.tokenUsage` 精确值
+    pub const PROVIDER: &str = "provider";
+    /// 本地 CacheMeter 按 cache_control 断点估算
+    pub const SIMULATED: &str = "simulated";
+    /// 无断点 / 计量关闭：全量计入 input，缓存两项为 0
+    pub const NONE: &str = "none";
+}
+
+/// provider 选定凭据后回报的路由决策（每次 acquire 一次；web_search 多轮时取首轮）。
+#[derive(Debug, Clone)]
+pub struct TraceRoute {
+    /// 发给上游的 conversationId
+    pub session_id: Option<String>,
+    /// 见 [`sticky`]
+    pub sticky_outcome: &'static str,
+    /// 本次选号前该会话绑定的凭据
+    pub previous_credential_id: Option<u64>,
 }
 
 /// 失败分类（attempt.outcome / record.error_type 取值）
@@ -161,9 +211,12 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
     Some(format!("{}…(truncated)", &trimmed[..end]))
 }
 
-/// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]
+/// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]，
+/// 每次选定凭据后调用 [`Self::on_route`]。
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
+    /// 凭据选择结果（粘性命中 / 换号）。默认空实现，非 trace 场景零开销。
+    fn on_route(&self, _route: TraceRoute) {}
 }
 
 /// 查询过滤条件
@@ -191,8 +244,14 @@ pub struct TraceQuery {
     pub start_ts: Option<i64>,
     /// 时间窗口终点（Unix **秒**，含）
     pub end_ts: Option<i64>,
-    /// 关键字模糊匹配：模型名 / trace_id / 错误信息 的子串（大小写不敏感）
+    /// 关键字模糊匹配：模型名 / trace_id / 错误信息 / session_id 的子串（大小写不敏感）
     pub keyword: Option<String>,
+    /// 会话 id 精确匹配：把同一会话的所有轮次拉出来
+    pub session_id: Option<String>,
+    /// 仅返回「换号」请求：previous_credential_id 非空且 != final_credential_id
+    pub only_switched: bool,
+    /// 客户端 IP 精确匹配
+    pub client_ip: Option<String>,
     /// 返回条数上限
     pub limit: usize,
     /// 偏移量（分页用）
@@ -262,7 +321,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 7] = [
+        let columns: [(&str, &str); 12] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -270,6 +329,11 @@ impl TraceStore {
             ("credits", "REAL NOT NULL DEFAULT 0"),
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
+            ("session_id", "TEXT"),
+            ("sticky_outcome", "TEXT"),
+            ("previous_credential_id", "INTEGER"),
+            ("usage_source", "TEXT"),
+            ("client_ip", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -280,6 +344,11 @@ impl TraceStore {
                 ))?;
             }
         }
+        // session_id / client_ip 索引放在 migrate 里而不是 SCHEMA：老库补列之后才能建
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id);
+             CREATE INDEX IF NOT EXISTS idx_traces_client_ip ON traces(client_ip);",
+        )?;
         // 老库 key_source 列首次添加后，按 key_id 语义回填：master apiKey (key_id=0) 之外都视为客户端 Key。
         if key_source_added {
             conn.execute_batch(
@@ -334,8 +403,10 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                 credits, first_token_ms, session_id, sticky_outcome, previous_credential_id, \
+                 usage_source, client_ip) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,\
+                 ?21,?22,?23,?24,?25)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -357,6 +428,11 @@ impl TraceStore {
                     rec.cache_read_tokens as i64,
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
+                    rec.session_id,
+                    rec.sticky_outcome,
+                    rec.previous_credential_id.map(|v| v as i64),
+                    rec.usage_source,
+                    rec.client_ip,
                 ],
             )?;
             for a in &rec.attempts {
@@ -460,6 +536,20 @@ impl TraceStore {
         if q.only_failed {
             clauses.push("final_status != 'success'".to_string());
         }
+        if let Some(s) = &q.session_id {
+            clauses.push("session_id = ?".to_string());
+            params.push(Box::new(s.clone()));
+        }
+        if q.only_switched {
+            clauses.push(
+                "previous_credential_id IS NOT NULL AND previous_credential_id != final_credential_id"
+                    .to_string(),
+            );
+        }
+        if let Some(ip) = &q.client_ip {
+            clauses.push("client_ip = ?".to_string());
+            params.push(Box::new(ip.clone()));
+        }
         // 时间窗口：与 ts_epoch 同为 Unix 秒，命中 idx_traces_ts(ts_epoch DESC)
         if let Some(start) = q.start_ts {
             clauses.push("ts_epoch >= ?".to_string());
@@ -469,19 +559,21 @@ impl TraceStore {
             clauses.push("ts_epoch <= ?".to_string());
             params.push(Box::new(end));
         }
-        // 关键字：排查时手里通常只有一个模型名、一段报错或一个 trace_id，
-        // 与其让用户先想清楚该填哪个字段，不如一个框同时匹配这三处。
+        // 关键字：排查时手里通常只有一个模型名、一段报错、一个 trace_id、会话 id 或 IP，
+        // 与其让用户先想清楚该填哪个字段，不如一个框同时匹配这几处。
         // LIKE 无法走索引，但已被上面的时间窗口把扫描范围收窄。
         if let Some(kw) = &q.keyword {
             let pattern = format!("%{}%", kw.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
             clauses.push(
                 "(model LIKE ? ESCAPE '\\' OR trace_id LIKE ? ESCAPE '\\' \
-                 OR IFNULL(error_message, '') LIKE ? ESCAPE '\\')"
+                 OR IFNULL(error_message, '') LIKE ? ESCAPE '\\' \
+                 OR IFNULL(session_id, '') LIKE ? ESCAPE '\\' \
+                 OR IFNULL(client_ip, '') LIKE ? ESCAPE '\\')"
                     .to_string(),
             );
-            params.push(Box::new(pattern.clone()));
-            params.push(Box::new(pattern.clone()));
-            params.push(Box::new(pattern));
+            for _ in 0..5 {
+                params.push(Box::new(pattern.clone()));
+            }
         }
         let where_sql = if clauses.is_empty() {
             String::new()
@@ -510,7 +602,8 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
+             session_id, sticky_outcome, previous_credential_id, usage_source, client_ip \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -537,6 +630,11 @@ impl TraceStore {
                 cache_read_tokens: row.get::<_, i64>(16)? as u64,
                 credits: row.get::<_, f64>(17)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
+                session_id: row.get(19)?,
+                sticky_outcome: row.get(20)?,
+                previous_credential_id: row.get::<_, Option<i64>>(21)?.map(|v| v as u64),
+                usage_source: row.get(22)?,
+                client_ip: row.get(23)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -713,7 +811,12 @@ CREATE TABLE IF NOT EXISTS traces (
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     credits           REAL NOT NULL DEFAULT 0,
-    first_token_ms    INTEGER
+    first_token_ms    INTEGER,
+    session_id        TEXT,
+    sticky_outcome    TEXT,
+    previous_credential_id INTEGER,
+    usage_source      TEXT,
+    client_ip         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -773,6 +876,11 @@ mod tests {
             cache_read_tokens: 101760,
             credits: 0.0,
             first_token_ms: None,
+            session_id: Some("sess-1".to_string()),
+            sticky_outcome: Some(sticky::HIT.to_string()),
+            previous_credential_id: Some(input.credential_id),
+            usage_source: Some(usage_source::SIMULATED.to_string()),
+            client_ip: Some("203.0.113.9".to_string()),
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -1001,6 +1109,191 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_and_switch_filters() {
+        let store = mem_store();
+        // 同一会话三轮：首轮无绑定，第二轮粘性命中，第三轮换号
+        let mut first = sample(TraceSample {
+            trace_id: "s1-turn1",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        first.sticky_outcome = Some(sticky::MISS_FIRST.to_string());
+        first.previous_credential_id = None;
+        store.insert(&first);
+
+        let mut second = sample(TraceSample {
+            trace_id: "s1-turn2",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        second.previous_credential_id = Some(5);
+        store.insert(&second);
+
+        let mut third = sample(TraceSample {
+            trace_id: "s1-turn3",
+            status: "success",
+            credential_id: 7,
+            model: "m1",
+        });
+        third.sticky_outcome = Some(sticky::MISS_UNAVAILABLE.to_string());
+        third.previous_credential_id = Some(5);
+        store.insert(&third);
+
+        let mut other = sample(TraceSample {
+            trace_id: "s2-turn1",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        other.session_id = Some("sess-2".to_string());
+        store.insert(&other);
+
+        let ids = |q: TraceQuery| {
+            let mut v: Vec<String> = store.query(&q).into_iter().map(|r| r.trace_id).collect();
+            v.sort();
+            v
+        };
+
+        assert_eq!(
+            ids(TraceQuery {
+                session_id: Some("sess-1".to_string()),
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["s1-turn1", "s1-turn2", "s1-turn3"]
+        );
+        assert_eq!(
+            ids(TraceQuery {
+                only_switched: true,
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["s1-turn3"],
+            "只有 previous != final 才算换号；首轮 previous 为空不算"
+        );
+        // 关键字也能命中 session_id
+        assert_eq!(
+            ids(TraceQuery {
+                keyword: Some("sess-2".to_string()),
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["s2-turn1"]
+        );
+
+        let out = store.query(&TraceQuery {
+            session_id: Some("sess-1".to_string()),
+            limit: 50,
+            ..Default::default()
+        });
+        let turn3 = out.iter().find(|r| r.trace_id == "s1-turn3").unwrap();
+        assert_eq!(turn3.sticky_outcome.as_deref(), Some(sticky::MISS_UNAVAILABLE));
+        assert_eq!(turn3.previous_credential_id, Some(5));
+        assert_eq!(turn3.usage_source.as_deref(), Some(usage_source::SIMULATED));
+    }
+
+    #[test]
+    fn client_ip_roundtrip_and_filters() {
+        let store = mem_store();
+        store.insert(&sample(TraceSample {
+            trace_id: "from-a",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        let mut other = sample(TraceSample {
+            trace_id: "from-b",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        other.client_ip = Some("198.51.100.7".to_string());
+        store.insert(&other);
+        let mut unknown = sample(TraceSample {
+            trace_id: "no-ip",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        unknown.client_ip = None;
+        store.insert(&unknown);
+
+        let ids = |q: TraceQuery| {
+            let mut v: Vec<String> = store.query(&q).into_iter().map(|r| r.trace_id).collect();
+            v.sort();
+            v
+        };
+
+        // 精确筛选
+        assert_eq!(
+            ids(TraceQuery {
+                client_ip: Some("203.0.113.9".to_string()),
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["from-a"]
+        );
+        // 关键字子串命中 IP
+        assert_eq!(
+            ids(TraceQuery {
+                keyword: Some("51.100".to_string()),
+                limit: 50,
+                ..Default::default()
+            }),
+            vec!["from-b"]
+        );
+        // 往返：None 保持 None
+        let all = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        let no_ip = all.iter().find(|r| r.trace_id == "no-ip").unwrap();
+        assert_eq!(no_ip.client_ip, None);
+        let from_a = all.iter().find(|r| r.trace_id == "from-a").unwrap();
+        assert_eq!(from_a.client_ip.as_deref(), Some("203.0.113.9"));
+    }
+
+    #[test]
+    fn migrate_adds_route_columns_to_old_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟只有基础列的老库
+        conn.execute_batch(
+            "CREATE TABLE traces (trace_id TEXT PRIMARY KEY, ts TEXT NOT NULL, ts_epoch INTEGER NOT NULL, \
+             key_id INTEGER NOT NULL, model TEXT NOT NULL, is_stream INTEGER NOT NULL, \
+             final_status TEXT NOT NULL, final_credential_id INTEGER NOT NULL, error_type TEXT, \
+             error_message TEXT, total_attempts INTEGER NOT NULL, duration_ms INTEGER NOT NULL, \
+             interrupted_after_bytes INTEGER);
+             CREATE TABLE trace_attempts (trace_id TEXT NOT NULL, attempt INTEGER NOT NULL, \
+             credential_id INTEGER NOT NULL, endpoint TEXT NOT NULL, http_status INTEGER, \
+             outcome TEXT NOT NULL, error_snippet TEXT, duration_ms INTEGER NOT NULL, \
+             PRIMARY KEY (trace_id, attempt));",
+        )
+        .unwrap();
+        TraceStore::migrate(&conn).unwrap();
+        let store = TraceStore {
+            conn: Mutex::new(conn),
+            enabled: AtomicBool::new(true),
+            retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+        };
+        store.insert(&sample(TraceSample {
+            trace_id: "t1",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id.as_deref(), Some("sess-1"));
+        assert_eq!(out[0].sticky_outcome.as_deref(), Some(sticky::HIT));
+        assert_eq!(out[0].client_ip.as_deref(), Some("203.0.113.9"));
     }
 
     #[test]

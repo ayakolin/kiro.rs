@@ -44,6 +44,8 @@ use super::types::{
     EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     CredentialMetadataSchemaConfig,
+    CacheMeteringConfigResponse, SetCacheMeteringConfigRequest,
+    SessionAffinityConfigResponse, SetSessionAffinityConfigRequest,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
@@ -317,6 +319,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// prompt cache 本地计量模拟句柄（开关运行时可改）
+    cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
 }
 
 /// Social 登录会话状态
@@ -672,6 +676,7 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            cache_meter: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -711,6 +716,56 @@ impl AdminService {
         self.trace_store = trace_store;
         self.usage_recorder = usage_recorder;
         self
+    }
+
+    /// 注入 prompt cache 计量模拟句柄，用于运行时切换总开关。
+    pub fn with_cache_meter(
+        mut self,
+        cache_meter: crate::anthropic::cache_metering::SharedCacheMeter,
+    ) -> Self {
+        self.cache_meter = Some(cache_meter);
+        self
+    }
+
+    /// 查询 prompt cache 计量模拟配置。
+    ///
+    /// 运行时句柄优先（反映当前真实生效状态）；句柄缺失时回落到 config.json
+    /// 显式值、再回落到环境变量与默认值，与启动时的优先级一致。
+    pub fn get_cache_metering_config(&self) -> CacheMeteringConfigResponse {
+        let enabled = match self.cache_meter.as_ref() {
+            Some(meter) => meter.is_enabled(),
+            None => self
+                .token_manager
+                .config()
+                .cache_metering_enabled
+                .or_else(crate::anthropic::cache_metering::CacheMeter::metering_enabled_from_env)
+                .unwrap_or(true),
+        };
+        CacheMeteringConfigResponse { enabled }
+    }
+
+    /// 更新 prompt cache 计量模拟配置：改运行时原子值 + 持久化到 config.json。
+    pub fn set_cache_metering_config(
+        &self,
+        req: SetCacheMeteringConfigRequest,
+    ) -> Result<CacheMeteringConfigResponse, AdminServiceError> {
+        let Some(enabled) = req.enabled else {
+            return Err(AdminServiceError::InvalidCredential(
+                "请提供 enabled 字段".to_string(),
+            ));
+        };
+
+        if let Some(meter) = &self.cache_meter {
+            meter.set_enabled(enabled);
+        }
+        if let Err(e) = self
+            .token_manager
+            .update_config_file(|config| config.cache_metering_enabled = Some(enabled))
+        {
+            tracing::warn!("持久化 prompt cache 计量开关配置失败: {}", e);
+        }
+
+        Ok(self.get_cache_metering_config())
     }
 
     /// 获取所有凭据状态
@@ -753,6 +808,7 @@ impl AdminService {
                     auth_method: entry.auth_method,
                     provider: entry.provider,
                     has_profile_arn: entry.has_profile_arn,
+                    profile_arn: entry.profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     api_key_hash: entry.api_key_hash,
                     masked_api_key: entry.masked_api_key,
@@ -2317,6 +2373,36 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取会话粘性路由配置与运行时统计
+    pub fn get_session_affinity_config(&self) -> SessionAffinityConfigResponse {
+        let stats = self.token_manager.session_affinity().stats();
+        SessionAffinityConfigResponse {
+            enabled: stats.enabled,
+            ttl_secs: stats.ttl_secs,
+            hits: stats.hits,
+            misses: stats.misses,
+            active_bindings: stats.active_bindings,
+        }
+    }
+
+    /// 更新会话粘性路由配置（运行时生效 + 持久化 config.json）
+    pub fn set_session_affinity_config(
+        &self,
+        req: SetSessionAffinityConfigRequest,
+    ) -> Result<SessionAffinityConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.ttl_secs.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 ttlSecs 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_session_affinity_config(req.enabled, req.ttl_secs)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_session_affinity_config())
     }
 
     /// 获取账号级风控故障转移配置

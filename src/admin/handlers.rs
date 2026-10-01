@@ -26,6 +26,7 @@ use super::{
         CredentialMetadataSchemaConfig,
         SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest,
+        SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
@@ -634,6 +635,42 @@ pub async fn set_log_governance_config(
     Json(payload): Json<SetLogGovernanceConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_log_governance_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-metering
+/// 获取 prompt cache 本地计量模拟开关
+pub async fn get_cache_metering_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_metering_config())
+}
+
+/// PUT /api/admin/config/cache-metering
+/// 切换 prompt cache 本地计量模拟开关（运行时生效 + 持久化 config.json）
+pub async fn set_cache_metering_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCacheMeteringConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_metering_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/session-affinity
+/// 获取会话粘性路由配置与命中统计
+pub async fn get_session_affinity_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_session_affinity_config())
+}
+
+/// PUT /api/admin/config/session-affinity
+/// 更新会话粘性路由开关 / TTL（运行时生效 + 持久化 config.json）
+pub async fn set_session_affinity_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSessionAffinityConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_session_affinity_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1436,7 +1473,8 @@ pub async fn stats_by_key(
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
 /// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed /
-///            startTime / endTime（Unix 秒）/ q（关键字）/ limit / offset
+///            sessionId / onlySwitched / clientIp / startTime / endTime（Unix 秒）/ q（关键字）/
+///            limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
@@ -1473,6 +1511,18 @@ pub async fn list_traces(
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false),
+        session_id: params
+            .get("sessionId")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        only_switched: params
+            .get("onlySwitched")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false),
+        client_ip: params
+            .get("clientIp")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         credential_ids,
         // startTime / endTime 为 Unix 秒，与 traces.ts_epoch 同单位
         start_ts: params.get("startTime").and_then(|s| s.parse::<i64>().ok()),
@@ -1561,6 +1611,11 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                "sessionId": r.session_id,
+                "stickyOutcome": r.sticky_outcome,
+                "previousCredentialId": r.previous_credential_id,
+                "usageSource": r.usage_source,
+                "clientIp": r.client_ip,
                 "attempts": attempts,
             })
         })

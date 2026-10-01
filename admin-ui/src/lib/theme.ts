@@ -2,11 +2,10 @@ export const THEME_STORAGE_KEY = 'adminTheme'
 
 export type ThemeId =
   | 'system'
+  | 'graphite'
   | 'ocean'
   | 'forest'
-  | 'violet'
   | 'amber'
-  | 'rose'
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 
@@ -18,8 +17,6 @@ export interface ThemeSelection {
 export interface ThemeMetadata {
   id: ThemeId
   name: string
-  description: string
-  swatch: string
 }
 
 export const DEFAULT_THEME_SELECTION: ThemeSelection = {
@@ -30,45 +27,28 @@ export const DEFAULT_THEME_SELECTION: ThemeSelection = {
 export const THEME_METADATA: readonly ThemeMetadata[] = [
   {
     id: 'system',
-    name: '系统蓝',
-    description: '清爽中性的系统蓝',
-    swatch: 'hsl(211 100% 50%)',
+    name: '清透青',
+  },
+  {
+    id: 'graphite',
+    name: '石墨灰',
   },
   {
     id: 'ocean',
-    name: '海洋青',
-    description: '冷静通透的海洋青',
-    swatch: 'hsl(193 84% 42%)',
+    name: '海洋蓝',
   },
   {
     id: 'forest',
-    name: '森林绿',
-    description: '稳定自然的森林绿',
-    swatch: 'hsl(151 60% 38%)',
-  },
-  {
-    id: 'violet',
-    name: '紫罗兰',
-    description: '沉静鲜明的紫罗兰',
-    swatch: 'hsl(262 72% 56%)',
+    name: '松林绿',
   },
   {
     id: 'amber',
-    name: '琥珀',
-    description: '温暖醒目的琥珀色',
-    swatch: 'hsl(38 92% 50%)',
-  },
-  {
-    id: 'rose',
-    name: '玫瑰',
-    description: '柔和有力的玫瑰色',
-    swatch: 'hsl(347 75% 52%)',
+    name: '琥珀金',
   },
 ] as const
 
 const THEME_IDS = new Set<ThemeId>(THEME_METADATA.map(({ id }) => id))
 const THEME_MODES = new Set<ThemeMode>(['light', 'dark', 'system'])
-let transitionTimer: number | undefined
 
 export function isThemeId(value: unknown): value is ThemeId {
   return typeof value === 'string' && THEME_IDS.has(value as ThemeId)
@@ -107,27 +87,4 @@ export function applyTheme(selection: ThemeSelection, isDark = resolveDarkMode(s
   root.dataset.theme = selection.palette
   root.classList.toggle('dark', isDark)
   return isDark
-}
-
-export function applyThemeWithTransition(
-  selection: ThemeSelection,
-  isDark = resolveDarkMode(selection),
-): boolean {
-  if (typeof document === 'undefined') return isDark
-
-  const root = document.documentElement
-  root.classList.add('theme-transition')
-  // Ensure the transition rule is committed before changing the custom properties.
-  void root.offsetWidth
-  const resolved = applyTheme(selection, isDark)
-  if (typeof window !== 'undefined') {
-    if (transitionTimer !== undefined) window.clearTimeout(transitionTimer)
-    transitionTimer = window.setTimeout(() => {
-      root.classList.remove('theme-transition')
-      transitionTimer = undefined
-    }, 260)
-  } else {
-    root.classList.remove('theme-transition')
-  }
-  return resolved
 }

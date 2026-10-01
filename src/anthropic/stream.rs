@@ -2705,6 +2705,16 @@ impl BufferedStreamContext {
         )
     }
 
+    /// 上游是否下发了精确 tokenUsage；配合 [`Self::cache_usage`] 推断 usage 来源。
+    pub fn has_provider_usage(&self) -> bool {
+        self.inner.provider_token_usage.is_some()
+    }
+
+    /// 本地 CacheMeter 的覆盖情况
+    pub fn cache_usage(&self) -> &super::cache_metering::CacheUsage {
+        &self.inner.cache_usage
+    }
+
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()

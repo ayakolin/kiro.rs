@@ -125,10 +125,15 @@ export function OverviewPage() {
   return (
     <div>
       <PageHeader
-        className="mb-4"
+        breadcrumbs={[{ label: '控制台' }, { label: '仪表概览', active: true }]}
         icon={<Activity className="h-4 w-4" />}
-        title="概览"
-        description="中转站调用情况、Token 消耗趋势与上游凭据贡献"
+        title="仪表概览"
+        description="实时监控 API 请求流量、Token 消耗分布与上游渠道贡献。"
+        badge={
+          <Badge variant="secondary" className="font-mono text-xs">
+            {timeLabel(filters.timeFilter)}
+          </Badge>
+        }
         actions={
           <AutoRefreshControl
             onRefresh={refreshStats}
@@ -143,7 +148,7 @@ export function OverviewPage() {
         stats={rangeStats}
         timeText={timeLabel(filters.timeFilter)}
       />
-      <KeyFilterCard
+      <StatsFilters
         keyFilter={filters.keyFilter}
         keys={keysData?.keys ?? []}
         selectedLabel={selectedKeyLabel}
@@ -311,7 +316,7 @@ function StatsCards({
   )
 }
 
-function KeyFilterCard({
+function StatsFilters({
   keyFilter,
   keys,
   onChange,
@@ -329,49 +334,45 @@ function KeyFilterCard({
   onGroupChange: (value: string) => void
 }) {
   return (
-    <Card className="mb-6">
-      <CardContent className="p-4 sm:p-5">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium">统计筛选</div>
-            <div className="truncate text-[12px] text-muted-foreground">
-              {selectedLabel}
-              {groupFilter !== 'all' && ` · 分组：${groupFilter}`}
-            </div>
-          </div>
-          <div className="flex flex-col gap-2 sm:flex-row">
-            {/* 入口 Key 筛选 */}
-            <Select value={keyFilter} onValueChange={onChange}>
-              <SelectTrigger className="h-8 w-full sm:w-[180px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent align="end">
-                <SelectItem value="all">全部入口 Key</SelectItem>
-                {keys.map((key) => (
-                  <SelectItem key={key.id} value={String(key.id)}>
-                    {key.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {/* 账号分组筛选 */}
-            <Select value={groupFilter} onValueChange={onGroupChange}>
-              <SelectTrigger className="h-8 w-full sm:w-[180px]">
-                <SelectValue placeholder="全部分组" />
-              </SelectTrigger>
-              <SelectContent align="end">
-                <SelectItem value="all">全部分组</SelectItem>
-                {groupOptions.map((g) => (
-                  <SelectItem key={g} value={g}>
-                    {g}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
+    <section aria-label="统计筛选" className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">统计筛选</div>
+        <div className="truncate text-[12px] text-muted-foreground">
+          {selectedLabel}
+          {groupFilter !== 'all' && ` · 分组：${groupFilter}`}
         </div>
-      </CardContent>
-    </Card>
+      </div>
+      <div className="flex flex-col gap-2 sm:flex-row">
+        {/* 入口 Key 筛选 */}
+        <Select value={keyFilter} onValueChange={onChange}>
+          <SelectTrigger className="h-8 w-full sm:w-[180px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent align="end">
+            <SelectItem value="all">全部入口 Key</SelectItem>
+            {keys.map((key) => (
+              <SelectItem key={key.id} value={String(key.id)}>
+                {key.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {/* 账号分组筛选 */}
+        <Select value={groupFilter} onValueChange={onGroupChange}>
+          <SelectTrigger className="h-8 w-full sm:w-[180px]">
+            <SelectValue placeholder="全部分组" />
+          </SelectTrigger>
+          <SelectContent align="end">
+            <SelectItem value="all">全部分组</SelectItem>
+            {groupOptions.map((g) => (
+              <SelectItem key={g} value={g}>
+                {g}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    </section>
   )
 }
 
@@ -748,17 +749,17 @@ function StatCard({
   extra?: React.ReactNode
 }) {
   return (
-    <Card className={cn('hover:shadow-apple-lg hover:-translate-y-0.5', className)}>
-      <CardContent className="p-4 sm:p-5">
-        <div className="flex min-h-[34px] items-start gap-2">
-          <div className="mt-0.5 shrink-0 text-muted-foreground">{icon}</div>
+    <Card className={cn('hover:border-primary/30', className)}>
+      <CardContent className="p-3.5 sm:p-4">
+        <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
-            <div className="truncate text-[13px] font-medium text-foreground">{label}</div>
-            <div className="mt-0.5 truncate text-[11px] text-muted-foreground">{meta}</div>
+            <div className="truncate text-xs font-medium text-muted-foreground">{label}</div>
+            <div className="mt-0.5 truncate text-[11px] text-muted-foreground/80">{meta}</div>
           </div>
+          <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent text-primary">{icon}</div>
         </div>
-        <div className="ml-6 mt-4 flex min-h-[36px] items-end justify-between gap-3">
-          <span className="min-w-0 truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">{value}</span>
+        <div className="mt-3 flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
+          <span className="min-w-0 break-all font-mono text-xl font-semibold tabular-nums sm:text-2xl text-foreground">{value}</span>
           <div className="shrink-0">{extra}</div>
         </div>
       </CardContent>

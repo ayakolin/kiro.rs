@@ -47,6 +47,10 @@ pub struct CredentialStatusItem {
     pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// Profile ARN 原文。上游 prompt cache 按 profile 隔离，同 profile 的账号互相共享缓存；
+    /// 前端据此分组，用于判断「换号是否会丢缓存」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
     /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
@@ -596,6 +600,46 @@ pub struct SetLogGovernanceConfigRequest {
     /// 用量日志保留天数，1..=365
     #[serde(default)]
     pub usage_log_retention_days: Option<u32>,
+}
+
+/// prompt cache 本地计量模拟配置响应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeteringConfigResponse {
+    /// 计量模拟是否启用
+    pub enabled: bool,
+}
+
+/// prompt cache 本地计量模拟配置更新请求。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCacheMeteringConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// 会话粘性路由配置 + 运行时统计响应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAffinityConfigResponse {
+    pub enabled: bool,
+    pub ttl_secs: u64,
+    /// 进程启动以来粘性命中次数
+    pub hits: u64,
+    /// 进程启动以来粘性未命中次数（首轮 + 绑定不可用；关闭期间不计）
+    pub misses: u64,
+    /// 当前未过期的会话绑定数
+    pub active_bindings: usize,
+}
+
+/// 会话粘性路由配置更新请求。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionAffinityConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
 }
 
 /// 凭据 metadata schema 配置响应/更新请求。

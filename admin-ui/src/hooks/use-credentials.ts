@@ -24,6 +24,10 @@ import {
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getCacheMeteringConfig,
+  setCacheMeteringConfig,
+  getSessionAffinityConfig,
+  setSessionAffinityConfig,
   getGlobalProxy,
   setGlobalProxy,
   getCustomModels,
@@ -331,6 +335,44 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取 prompt cache 计量模拟开关
+export function useCacheMeteringConfig() {
+  return useQuery({
+    queryKey: ['cacheMeteringConfig'],
+    queryFn: getCacheMeteringConfig,
+  })
+}
+
+// 切换 prompt cache 计量模拟开关
+export function useSetCacheMeteringConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheMeteringConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheMeteringConfig'] })
+    },
+  })
+}
+
+// 会话粘性路由配置 + 命中统计（统计随请求变化，30s 刷一次）
+export function useSessionAffinityConfig() {
+  return useQuery({
+    queryKey: ['sessionAffinityConfig'],
+    queryFn: getSessionAffinityConfig,
+    refetchInterval: 30_000,
+  })
+}
+
+export function useSetSessionAffinityConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSessionAffinityConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['sessionAffinityConfig'] })
     },
   })
 }

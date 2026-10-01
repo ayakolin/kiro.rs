@@ -25,6 +25,9 @@ export async function getTraces(query: TraceQuery): Promise<TracePage> {
   if (query.model) params.model = query.model
   if (query.group) params.group = query.group
   if (query.onlyFailed) params.onlyFailed = 'true'
+  if (query.sessionId) params.sessionId = query.sessionId
+  if (query.onlySwitched) params.onlySwitched = 'true'
+  if (query.clientIp) params.clientIp = query.clientIp
   if (query.startTime != null) params.startTime = String(query.startTime)
   if (query.endTime != null) params.endTime = String(query.endTime)
   if (query.q) params.q = query.q

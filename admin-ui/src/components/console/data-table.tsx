@@ -1,10 +1,10 @@
-import {
+import React, {
   useCallback,
   useMemo,
   useState,
   type ReactNode,
 } from 'react'
-import { Columns3, Check } from 'lucide-react'
+import { Columns3, Check, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -18,15 +18,12 @@ import { cn } from '@/lib/utils'
 import { railClass, type RailTone } from './rail'
 
 /**
- * 运维密集表格 —— 凭据 / 日志共用。
+ * 控制台表格：客户端 Key、分组和请求日志共用。
  *
- * 与「卡片」形态的分工：卡片是看的，表格是做的。所以这里的每个取舍都偏向
- * 「一屏能扫多少行」和「操作是否紧凑」：
- *
- * - 行高 34px、字号 12.5px（`.console-table`，见 index.css）
+ * - 行高至少 48px、字号 12.5px（`.console-table`，见 index.css）
  * - sticky 表头，长列表滚动时列名不丢
  * - 左侧 3px 状态色轨代替整行染色：既标状态，又不牺牲文字对比度
- * - 行内操作 hover 才显形（`.console-row-actions`），静默时不干扰扫读
+ * - 行内操作常驻显示，鼠标、键盘和触屏均可直接操作
  * - 可选列进列控制菜单并记住选择，避免 12 列硬挤出横向滚动
  */
 export interface ConsoleColumn<T> {
@@ -51,9 +48,17 @@ export interface ConsoleTableProps<T> {
   selectable?: boolean
   selected?: Set<number | string>
   onSelectedChange?: (next: Set<number | string>) => void
-  /** 点击行触发，通常用来开详情抽屉 */
+  /** 点击行触发 */
   onRowActivate?: (row: T) => void
-  /** 行右侧的处置动作，hover / focus 行才显形 */
+  /** 展开行渲染函数；传入即开启可折叠行模式 */
+  renderExpandedRow?: (row: T) => ReactNode
+  /** 受控的已展开行 key 集合 */
+  expandedKeys?: Set<number | string>
+  /** 展开行改变回调 */
+  onExpandedKeysChange?: (next: Set<number | string>) => void
+  /** 点击整行是否切换展开，默认 true */
+  expandOnRowClick?: boolean
+  /** 行右侧常驻显示的处置动作 */
   rowActions?: (row: T) => ReactNode
   /** 列可见性持久化 key；不给则不显示列控制菜单 */
   columnsStorageKey?: string
@@ -118,7 +123,7 @@ function useColumnVisibility<T>(
   return { ordered, visible, toggle }
 }
 
-export function ConsoleTable<T>({
+function ConsoleTableImpl<T>({
   rows,
   columns,
   rowKey,
@@ -127,6 +132,10 @@ export function ConsoleTable<T>({
   selected,
   onSelectedChange,
   onRowActivate,
+  renderExpandedRow,
+  expandedKeys,
+  onExpandedKeysChange,
+  expandOnRowClick = true,
   rowActions,
   columnsStorageKey,
   loading = false,
@@ -137,6 +146,20 @@ export function ConsoleTable<T>({
     columns,
     columnsStorageKey,
   )
+
+  const [internalExpandedKeys, setInternalExpandedKeys] = useState<Set<number | string>>(new Set())
+  const effectiveExpandedKeys = expandedKeys ?? internalExpandedKeys
+  const setEffectiveExpandedKeys = onExpandedKeysChange ?? setInternalExpandedKeys
+
+  const toggleExpand = useCallback((key: number | string) => {
+    const next = new Set(effectiveExpandedKeys)
+    if (next.has(key)) {
+      next.delete(key)
+    } else {
+      next.add(key)
+    }
+    setEffectiveExpandedKeys(next)
+  }, [effectiveExpandedKeys, setEffectiveExpandedKeys])
 
   const allSelected =
     rows.length > 0 && rows.every((r) => selected?.has(rowKey(r)))
@@ -158,6 +181,11 @@ export function ConsoleTable<T>({
   }
 
   const hasHiddenOption = columns.some((c) => c.optional)
+  const colSpanTotal =
+    ordered.length +
+    (selectable ? 1 : 0) +
+    (renderExpandedRow ? 1 : 0) +
+    (rowActions ? 1 : 0)
 
   return (
     <div className="console-scope space-y-2">
@@ -195,10 +223,11 @@ export function ConsoleTable<T>({
         </div>
       )}
 
-      <div className="overflow-x-auto rounded-xl border border-border/60 bg-card/80 backdrop-blur-xl">
+      <div className="overflow-x-auto rounded-xl border border-border/60 bg-card [transform:translateZ(0)]">
         <table className="console-table">
           <thead>
             <tr>
+              {renderExpandedRow && <th className="w-8 px-1 text-center" />}
               {selectable && (
                 <th className="w-9 pl-3">
                   <Checkbox
@@ -224,48 +253,98 @@ export function ConsoleTable<T>({
             {rows.map((row) => {
               const key = rowKey(row)
               const isSelected = selected?.has(key) ?? false
+              const isExpanded = effectiveExpandedKeys.has(key)
+              const canClickRow = Boolean(onRowActivate || (renderExpandedRow && expandOnRowClick))
               return (
-                <tr
-                  key={key}
-                  data-selected={isSelected || undefined}
-                  className={cn(onRowActivate && 'cursor-pointer')}
-                  onClick={() => onRowActivate?.(row)}
-                >
-                  {selectable && (
-                    <td
-                      className={cn('pl-3', tone && railClass(tone(row)))}
-                      onClick={(e) => e.stopPropagation()}
+                <React.Fragment key={key}>
+                  <tr
+                    data-selected={isSelected || undefined}
+                    data-expanded={isExpanded || undefined}
+                    className={cn(canClickRow && 'cursor-pointer')}
+                    onClick={() => {
+                      onRowActivate?.(row)
+                      if (renderExpandedRow && expandOnRowClick) {
+                        toggleExpand(key)
+                      }
+                    }}
+                  >
+                    {renderExpandedRow && (
+                      <td
+                        className={cn(
+                          'w-8 px-1.5 text-center',
+                          !selectable && tone && railClass(tone(row)),
+                        )}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          toggleExpand(key)
+                        }}
+                      >
+                        <button
+                          type="button"
+                          className="inline-flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                          title={isExpanded ? '收起详情' : '展开详情'}
+                          aria-label={isExpanded ? '收起详情' : '展开详情'}
+                        >
+                          <ChevronRight
+                            className={cn(
+                              'h-3.5 w-3.5 transition-transform duration-200',
+                              isExpanded && 'rotate-90 text-foreground',
+                            )}
+                          />
+                        </button>
+                      </td>
+                    )}
+                    {selectable && (
+                      <td
+                        className={cn(
+                          'pl-3',
+                          !renderExpandedRow && tone && railClass(tone(row)),
+                        )}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <Checkbox
+                          checked={isSelected}
+                          onCheckedChange={() => toggleOne(key)}
+                          aria-label="选中此行"
+                        />
+                      </td>
+                    )}
+                    {ordered.map((c, ci) => (
+                      <td
+                        key={c.id}
+                        className={cn(
+                          c.align === 'right' && 'text-right',
+                          // 无展开列与复选框列时，色轨落在第一个数据列上
+                          !renderExpandedRow && !selectable && ci === 0 && tone && railClass(tone(row)),
+                        )}
+                      >
+                        {c.cell(row)}
+                      </td>
+                    ))}
+                    {rowActions && (
+                      <td
+                        className="pr-3 text-right"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="flex items-center justify-end gap-1">
+                          {rowActions(row)}
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                  {renderExpandedRow && isExpanded && (
+                    <tr
+                      key={`${key}-expanded`}
+                      className="border-b border-border/60 bg-muted/15"
                     >
-                      <Checkbox
-                        checked={isSelected}
-                        onCheckedChange={() => toggleOne(key)}
-                        aria-label="选中此行"
-                      />
-                    </td>
+                      <td colSpan={colSpanTotal} className="p-0">
+                        <div className="border-l-2 border-primary/40 bg-card p-4">
+                          {renderExpandedRow(row)}
+                        </div>
+                      </td>
+                    </tr>
                   )}
-                  {ordered.map((c, ci) => (
-                    <td
-                      key={c.id}
-                      className={cn(
-                        c.align === 'right' && 'text-right',
-                        // 无复选框列时，色轨落在第一个数据列上
-                        !selectable && ci === 0 && tone && railClass(tone(row)),
-                      )}
-                    >
-                      {c.cell(row)}
-                    </td>
-                  ))}
-                  {rowActions && (
-                    <td
-                      className="pr-3 text-right"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="console-row-actions flex items-center justify-end gap-1">
-                        {rowActions(row)}
-                      </div>
-                    </td>
-                  )}
-                </tr>
+                </React.Fragment>
               )
             })}
           </tbody>
@@ -285,3 +364,7 @@ export function ConsoleTable<T>({
     </div>
   )
 }
+
+export const ConsoleTable = React.memo(ConsoleTableImpl) as <T>(
+  props: ConsoleTableProps<T>
+) => React.ReactElement | null

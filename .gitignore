@@ -31,3 +31,11 @@
 .ace-tool/
 .codegraph/
 .claude/
+
+# 本地调研用的外部仓库克隆与草稿，不应进版本库
+.research/
+
+# 本地缓存/粘性测试沙箱（含凭据副本，绝对不能提交）
+/.local-test/
+/aab822_*.json
+/jac0991_*.json

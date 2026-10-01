@@ -28,6 +28,8 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
+    /// 客户端 IP（转发头优先，回落到 TCP 对端），仅用于请求日志
+    pub client_ip: Option<String>,
 }
 
 /// 应用共享状态
@@ -124,10 +126,12 @@ pub async fn auth_middleware(
         match mgr.verify_and_touch_ex(&presented) {
             KeyAuth::Ok(id) => {
                 let group = mgr.group_of(id);
+                let client_ip = auth::extract_client_ip(&request);
                 request.extensions_mut().insert(KeyContext {
                     key_id: id,
                     group,
                     key_source: TraceKeySource::ClientKey,
+                    client_ip,
                 });
                 return next.run(request).await;
             }

@@ -4,8 +4,22 @@ import { Cpu, Bot, Sparkles, Wrench, Plus, Trash2, Save, Loader2, AlertCircle } 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { SettingGroup } from '@/components/console/setting-row'
-import { useCustomModels, useSetCustomModels, useCurrentCredentialModels } from '@/hooks/use-credentials'
+import {
+  SettingGroup,
+  SettingSwitch,
+  SettingNumber,
+  useFieldSaver,
+} from '@/components/console/setting-row'
+import {
+  useCustomModels,
+  useSetCustomModels,
+  useCurrentCredentialModels,
+  useCacheMeteringConfig,
+  useSetCacheMeteringConfig,
+  useSessionAffinityConfig,
+  useSetSessionAffinityConfig,
+} from '@/hooks/use-credentials'
+import { reportSaveError } from '@/components/settings/report-error'
 import { extractErrorMessage, cn, parseError } from '@/lib/utils'
 import type { CustomModelItem, AvailableModelItem } from '@/types/api'
 
@@ -77,6 +91,22 @@ function UpstreamModelRow({ model }: { model: AvailableModelItem }) {
 
 export function ModelsSection() {
   const [vendor, setVendor] = useState<VendorKey>('anthropic')
+
+  // Prompt Cache 计量模拟开关
+  const { data: cacheMetering, isLoading: cacheLoading } = useCacheMeteringConfig()
+  const { mutate: mutateCacheMetering } = useSetCacheMeteringConfig()
+  const cacheSaver = useFieldSaver(mutateCacheMetering, reportSaveError)
+  const cacheMeteringEnabled = cacheMetering?.enabled ?? true
+
+  // 会话粘性路由
+  const { data: affinity, isLoading: affinityLoading } = useSessionAffinityConfig()
+  const { mutate: mutateAffinity } = useSetSessionAffinityConfig()
+  const affinitySaver = useFieldSaver(mutateAffinity, reportSaveError)
+  const affinityEnabled = affinity?.enabled ?? true
+  const affinityTtlSecs = affinity?.ttlSecs ?? 3600
+  const affinityTotal = (affinity?.hits ?? 0) + (affinity?.misses ?? 0)
+  const affinityHitPct =
+    affinityTotal > 0 ? ((affinity!.hits / affinityTotal) * 100).toFixed(1) : null
 
   // 上游模型
   const upstreamQuery = useCurrentCredentialModels(vendor !== 'custom')
@@ -175,7 +205,64 @@ export function ModelsSection() {
   const customCount = drafts.length
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      <SettingGroup
+        title="Prompt Cache 提示词缓存"
+        description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量"
+      >
+        <SettingSwitch
+          label="模拟 prompt cache 计量"
+          hint={
+            cacheMeteringEnabled
+              ? '按客户端声明的 cache_control 断点估算缓存读取与创建，如实上报命中量；终端客户端（如 Claude Code、Cursor）可正常识别缓存命中'
+              : '输入 Token 全额计入 input tokens，缓存两项恒为 0；彻底关闭缓存计量模拟'
+          }
+          checked={cacheMeteringEnabled}
+          onChange={(next) => cacheSaver.save('cacheMetering', { enabled: next })}
+          pending={cacheSaver.isSaving('cacheMetering')}
+          saved={cacheSaver.isSaved('cacheMetering')}
+          disabled={cacheLoading}
+        />
+      </SettingGroup>
+
+      <SettingGroup
+        title="会话粘性路由"
+        description="开启后同一会话的后续轮次优先沿用上一轮成功的账号；该账号不可用时才回落到负载均衡。上游 prompt cache 按 profile 隔离：账号同属一个 profile 时换号不丢缓存（凭据页顶部有标记），跨 profile 部署时粘性才真正保住缓存。"
+      >
+        <SettingSwitch
+          label="同一会话优先沿用上一轮账号"
+          hint={
+            affinityEnabled
+              ? affinityHitPct != null
+                ? `运行以来粘性命中率 ${affinityHitPct}%（命中 ${affinity!.hits} / 未命中 ${affinity!.misses}），当前有效绑定 ${affinity!.activeBindings} 个会话。请求日志里可按「仅换号」筛出未沿用的轮次。`
+                : '尚无统计。粘性优先于 priority 模式的「高优先级恢复后立即回切」；会话在有效期内不会主动迁回高优先级账号。'
+              : '每轮独立按负载均衡选号；多账号下同一会话大概率在账号间跳转，上游缓存难以复用。'
+          }
+          checked={affinityEnabled}
+          onChange={(next) => affinitySaver.save('affinityEnabled', { enabled: next })}
+          pending={affinitySaver.isSaving('affinityEnabled')}
+          saved={affinitySaver.isSaved('affinityEnabled')}
+          disabled={affinityLoading}
+        />
+        {affinityEnabled && (
+          <SettingNumber
+            label="绑定有效期"
+            hint="会话与账号绑定的保留时长，每次成功请求都会续期。与上游缓存 TTL 量级对齐即可，过长会让长会话一直占着某个账号。"
+            value={affinityTtlSecs}
+            min={1}
+            max={1440}
+            unit="分钟"
+            toDisplay={(v) => Math.round(v / 60)}
+            fromDisplay={(v) => v * 60}
+            presets={[5, 60, 240]}
+            onCommit={(next) => affinitySaver.save('affinityTtl', { ttlSecs: next })}
+            pending={affinitySaver.isSaving('affinityTtl')}
+            saved={affinitySaver.isSaved('affinityTtl')}
+            disabled={affinityLoading}
+          />
+        )}
+      </SettingGroup>
+
       <SettingGroup
         title="可用模型"
         description="按厂商查看上游可用模型，或自定义模型别名与元数据。"

@@ -77,6 +77,8 @@ export interface CredentialStatusItem {
   authMethod: string | null
   provider?: string | null
   hasProfileArn: boolean
+  /** Profile ARN 原文。上游 prompt cache 按 profile 隔离：同 profile 的账号互相共享缓存 */
+  profileArn?: string | null
   email?: string
   /** 后端持久化的最近一次订阅等级；封禁时仍可显示。 */
   subscriptionTitle?: string | null
@@ -614,8 +616,21 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** 发给上游的 conversationId；同一会话多轮共享，可据此串起整个会话 */
+  sessionId?: string | null
+  /** 会话粘性路由结果：hit / miss_first / miss_unavailable / off；老记录为 null */
+  stickyOutcome?: StickyOutcome | null
+  /** 本次请求前该会话绑定的凭据；与 finalCredentialId 不同即为「换号」 */
+  previousCredentialId?: number | null
+  /** token/cache 三项来源：provider（上游真值）/ simulated（本地估算）/ none（无断点） */
+  usageSource?: UsageSource | null
+  /** 客户端 IP（X-Forwarded-For / X-Real-IP 优先，回落到 TCP 对端）；老记录为 null */
+  clientIp?: string | null
   attempts: TraceAttempt[]
 }
+
+export type StickyOutcome = 'hit' | 'miss_first' | 'miss_unavailable' | 'off'
+export type UsageSource = 'provider' | 'simulated' | 'none'
 
 /** 链路查询参数 */
 export interface TraceQuery {
@@ -630,11 +645,17 @@ export interface TraceQuery {
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
   onlyFailed?: boolean
+  /** 会话 id 精确匹配：把同一会话的全部轮次拉出来 */
+  sessionId?: string
+  /** 仅返回换号请求（previousCredentialId 非空且 != finalCredentialId） */
+  onlySwitched?: boolean
+  /** 客户端 IP 精确匹配 */
+  clientIp?: string
   /** 时间窗口起点（Unix 秒，含）。与后端 traces.ts_epoch 同单位 */
   startTime?: number
   /** 时间窗口终点（Unix 秒，含） */
   endTime?: number
-  /** 关键字模糊匹配：模型名 / traceId / 错误信息 */
+  /** 关键字模糊匹配：模型名 / traceId / 错误信息 / sessionId / clientIp */
   q?: string
   limit?: number
   offset?: number
