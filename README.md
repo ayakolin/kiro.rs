@@ -713,6 +713,10 @@ data/
 - `cache_read_input_tokens`
 - `output_tokens`
 
+顶层 `cache_control` 的自动断点覆盖最后一个可缓存块，包括本轮用户输入：新内容首次计入缓存创建，后续请求匹配已有前缀时计入缓存读取。字符串消息与等价的单个 `text` 块使用相同缓存键。
+
+上游 `metadataEvent.tokenUsage` 提供精确用量时优先采用上游值。请求日志的 `usageSource=provider` 表示上游用量，`simulated` 表示本地回退估算；本地模拟不会降低上游 credits 消耗，也不保证固定命中率。
+
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI
 
