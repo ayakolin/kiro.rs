@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixes
+
+- Stop rejecting requests whose history contains a Claude Code `Read` call with `pages` (HTTP 400 `工具映射不支持: Claude Code Read.pages has no Kiro read_file equivalent`). The field has no Kiro `read_file` equivalent and only appears in replayed history the client cannot correct, so it is now dropped instead of failing the whole session.
+
 ## [0.9.1] - 2026-10-08
 
 主题：**凭据调度与额度恢复、账号级 429 故障转移、Codex 压缩缓存复用，以及模型上下文、Token 计量和流式链路修复**。本版汇总 `v0.9.0` 之后合并的 9 个 PR；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。
