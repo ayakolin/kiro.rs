@@ -496,26 +496,41 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
-/// 账号级风控故障转移配置响应
+/// 账号级 429 限流故障转移配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountThrottleConfigResponse {
-    /// 是否启用账号级 429 故障转移
+    /// 是否在账号级 429 时冷却并切换凭据
     pub failover: bool,
     /// 冷却时长（秒）
     pub cooldown_secs: u64,
 }
 
-/// 更新账号级风控故障转移配置
+/// 更新账号级 429 限流故障转移配置
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetAccountThrottleConfigRequest {
-    /// 是否启用故障转移；缺省表示不修改
+    /// 是否按需切换凭据；缺省表示不修改
     #[serde(default)]
     pub failover: Option<bool>,
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+}
+
+/// 普通模型 API 429 自动重试配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelApiRetryConfigResponse {
+    /// 是否由中转自动重试无需切换凭据的普通 429
+    pub enabled: bool,
+}
+
+/// 更新普通模型 API 429 自动重试配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelApiRetryConfigRequest {
+    pub enabled: bool,
 }
 
 /// 单账号 RPM 限流配置响应
@@ -538,6 +553,22 @@ pub struct SetAccountRpmLimitConfigRequest {
     /// 每分钟上限；缺省表示不修改，1..=100000
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// 月度额度重置后自动恢复配置响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaResetRecoveryConfigResponse {
+    /// 到 nextResetAt 后确认余额恢复时，是否自动恢复 QuotaExceeded 凭据。
+    pub enabled: bool,
+}
+
+/// 更新月度额度重置后自动恢复配置。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetQuotaResetRecoveryConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// 自愈治理配置响应

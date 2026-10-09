@@ -253,6 +253,7 @@ pub async fn post_responses(
     let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
 
     let status = inner.status();
+    let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
     if !status.is_success() {
         let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
             Ok(b) => b,
@@ -264,11 +265,15 @@ pub async fn post_responses(
                 );
             }
         };
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body_bytes))
             .unwrap();
+        if let Some(value) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
     }
 
     if want_stream {
@@ -1872,12 +1877,13 @@ fn responses_streaming_response(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
 }
 
-fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+pub(super) fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
     loop {
         let lf = buffer.windows(2).position(|window| window == b"\n\n");
@@ -1901,7 +1907,7 @@ fn take_sse_frames(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     frames
 }
 
-fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
+pub(super) fn parse_sse_frame(frame: &[u8]) -> Result<Option<(String, Value)>, String> {
     let text = std::str::from_utf8(frame)
         .map_err(|error| format!("upstream sent invalid UTF-8 SSE: {error}"))?;
     let mut event = None;

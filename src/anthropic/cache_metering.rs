@@ -1100,20 +1100,26 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
     Some(format!("key:{key_id}"))
 }
 
-/// 从 Claude Code 的 user_id 中提取 session 标识。
+/// 从客户端的 user_id 中提取 session 标识。
+///
+/// 支持两种形态：
+/// 1. JSON 对象：`{"device_id":"...","account_uuid":"...","session_id":"<uuid>"}`，取 `session_id`。
+/// 2. 字符串：Claude Code 的 `..._session_<uuid>` 或 OpenAI/Codex 的 `session_<uuid>`，
+///    取 `session_` 之后的部分。
 fn extract_session_id(user_id: &str) -> Option<String> {
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
-        && let Some(sid) = json
+    // JSON 形态优先。合法 JSON 缺少 session_id 时不能回退字符串匹配，否则会把
+    // `"session_id":""` 中的 `session_` 误判为会话标识。
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
+        return json
             .get("session_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-    {
-        return Some(sid.to_string());
+            .map(str::to_string);
     }
 
     user_id
-        .split_once("_session_")
+        .split_once("session_")
         .map(|(_, sid)| sid.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -2894,6 +2900,65 @@ mod tests {
         );
         assert_eq!(extract_session_id("no-session-here"), None);
         assert_eq!(extract_session_id("trailing_session_"), None);
+    }
+
+    /// OpenAI/Codex 的 user_id 形如 `session_<uuid>`，前面没有下划线。
+    #[test]
+    fn extract_session_id_parses_codex_format() {
+        assert_eq!(
+            extract_session_id("session_550e8400-e29b-41d4-a716-446655440000"),
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+    }
+
+    /// Codex 共享主 Key（key_id=0）时靠 session 隔离：不同 session 不命中，相同命中。
+    #[test]
+    fn codex_session_scopes_cache_with_master_key() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, Metadata};
+        let body = "conversation prefix that stays stable ".repeat(20);
+        let make = |session: &str| MessagesRequest {
+            model: "gpt-5.6-sol".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("session_{session}")),
+            }),
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        };
+
+        let cache = CacheMeter::new(None);
+        assert_eq!(compute_cache_usage_sync(&cache, &make("aaa"), 0).cache_read, 0);
+        assert_eq!(
+            compute_cache_usage_sync(&cache, &make("bbb"), 0).cache_read,
+            0,
+            "不同 session 不应命中"
+        );
+        assert!(
+            compute_cache_usage_sync(&cache, &make("aaa"), 0).cache_read > 0,
+            "相同 session 应命中"
+        );
     }
 
     #[test]
