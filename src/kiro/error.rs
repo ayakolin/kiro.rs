@@ -14,20 +14,6 @@ pub struct UpstreamRateLimitError {
 #[error("upstream context window exceeded")]
 pub struct UpstreamContextOverflowError;
 
-/// Model capacity is temporarily unavailable, independently of account health.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("upstream model temporarily unavailable")]
-pub struct UpstreamModelUnavailableError {
-    pub retry_after: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("upstream response deadline exceeded")]
-pub struct UpstreamTimeoutError {
-    #[source]
-    pub source: reqwest::Error,
-}
-
 impl UpstreamRateLimitError {
     pub(crate) fn new(retry_after: Option<String>) -> Self {
         Self {

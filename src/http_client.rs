@@ -49,29 +49,6 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    Ok(client_builder(proxy, timeout_secs, tls_backend)?.build()?)
-}
-
-/// API streams need separate connection and idle deadlines; active reads reset
-/// the idle timer, so long answers can still use the existing total budget.
-pub fn build_client_with_timeouts(
-    proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
-    tls_backend: TlsBackend,
-    connect_secs: u64,
-    read_secs: u64,
-) -> anyhow::Result<Client> {
-    Ok(client_builder(proxy, timeout_secs, tls_backend)?
-        .connect_timeout(Duration::from_secs(connect_secs.max(1)))
-        .read_timeout(Duration::from_secs(read_secs.max(1)))
-        .build()?)
-}
-
-fn client_builder(
-    proxy: Option<&ProxyConfig>,
-    timeout_secs: u64,
-    tls_backend: TlsBackend,
-) -> anyhow::Result<reqwest::ClientBuilder> {
     let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
 
     match tls_backend {
@@ -102,7 +79,7 @@ fn client_builder(
         tracing::debug!("HTTP Client 使用代理: {}", proxy_config.url);
     }
 
-    Ok(builder)
+    Ok(builder.build()?)
 }
 
 #[cfg(test)]

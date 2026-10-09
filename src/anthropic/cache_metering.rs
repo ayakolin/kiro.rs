@@ -681,6 +681,8 @@ struct PromptBlock {
     invalid_cache_control: bool,
     cacheable: bool,
     lookback_group: Option<LookbackGroup>,
+    /// 是否为当前轮次的最新用户提问（若是，在多轮对话中自动缓存不应打在其末尾，而应打在上一轮末尾）
+    is_current_turn_input: bool,
 }
 
 /// 识别出的断点
@@ -707,6 +709,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: true,
                 lookback_group: None,
+                is_current_turn_input: false,
             });
         }
     }
@@ -723,16 +726,25 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: !sys.text.trim().is_empty(),
                 lookback_group: None,
+                is_current_turn_input: false,
             });
         }
     }
 
     // 3. messages (按顺序遍历)
-    for msg in &req.messages {
+    let total_messages = req.messages.len();
+    for (m_idx, msg) in req.messages.iter().enumerate() {
+        let is_tool_result = match &msg.content {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_result")),
+            _ => false,
+        };
+        let is_current_turn_input =
+            (m_idx + 1 == total_messages) && msg.role == "user" && !is_tool_result;
         match &msg.content {
             serde_json::Value::String(s) => {
-                // 字符串是单个 text block 的简写，统一表示以复用同一前缀。
-                let content = serde_json::json!({"type": "text", "text": s});
+                let content = serde_json::Value::String(s.clone());
                 blocks.push(PromptBlock {
                     signature: prompt_block_signature("message", Some(&msg.role), &content),
                     tokens: estimate_tokens(s).max(0) as u32,
@@ -740,6 +752,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                     invalid_cache_control: false,
                     cacheable: !s.trim().is_empty(),
                     lookback_group: None,
+                    is_current_turn_input,
                 });
             }
             serde_json::Value::Array(arr) => {
@@ -765,6 +778,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                         invalid_cache_control,
                         cacheable: block_is_cacheable(&content),
                         lookback_group,
+                        is_current_turn_input,
                     });
                 }
             }
@@ -806,13 +820,20 @@ fn resolve_breakpoints(
         }
     }
 
-    // 2. 顶层自动缓存覆盖最后一个可缓存块，包括最新用户输入。
-    // 新输入首次算 creation，下一轮才可能算 read；不能为保持 input 非零而回退断点。
+    // 2. 顶层自动缓存：若有多轮对话且最后一条是当前 user 提问，断点优先挂在当前提问之前的上一轮会话末尾，
+    // 确保当前最新提问 100% 诚实作为未缓存 input_tokens，杜绝 input 归零。
     if let Some(top_cc) = top_cache_control {
         let Some(auto_ttl) = validated_ttl(top_cc) else {
             return Vec::new();
         };
-        let target_idx = blocks.iter().rposition(|block| block.cacheable);
+        let target_idx = if blocks.iter().any(|b| !b.is_current_turn_input && b.cacheable) {
+            blocks
+                .iter()
+                .enumerate()
+                .rposition(|(_idx, block)| block.cacheable && !block.is_current_turn_input)
+        } else {
+            blocks.iter().rposition(|block| block.cacheable)
+        };
         if let Some(last_idx) = target_idx {
             if let Some(existing) = breakpoints.iter().find(|bp| bp.block_idx == last_idx) {
                 if existing.ttl_secs != auto_ttl {
@@ -1079,26 +1100,20 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
     Some(format!("key:{key_id}"))
 }
 
-/// 从客户端的 user_id 中提取 session 标识。
-///
-/// 支持两种形态：
-/// 1. JSON 对象：`{"device_id":"...","account_uuid":"...","session_id":"<uuid>"}`，取 `session_id`。
-/// 2. 字符串：Claude Code 的 `..._session_<uuid>` 或 OpenAI/Codex 的 `session_<uuid>`，
-///    取 `session_` 之后的部分。
+/// 从 Claude Code 的 user_id 中提取 session 标识。
 fn extract_session_id(user_id: &str) -> Option<String> {
-    // JSON 形态优先。合法 JSON 缺少 session_id 时不能回退字符串匹配，否则会把
-    // `"session_id":""` 中的 `session_` 误判为会话标识。
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
-        return json
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id)
+        && let Some(sid) = json
             .get("session_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(str::to_string);
+    {
+        return Some(sid.to_string());
     }
 
     user_id
-        .split_once("session_")
+        .split_once("_session_")
         .map(|(_, sid)| sid.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -1414,89 +1429,6 @@ mod tests {
         assert_eq!(u2.cache_covered_est, 0);
         assert_eq!(u2.cache_read, 0);
         assert_eq!(cache.len(), 0);
-    }
-
-    #[test]
-    fn auto_cache_with_system_preserves_previous_user_input() {
-        let mut first = build_request_with_system_breakpoint();
-        first.system.as_mut().unwrap()[0].cache_control = None;
-        first.cache_control = Some(CacheControl {
-            cache_type: "ephemeral".to_string(),
-            ttl: None,
-        });
-        first.messages[0].content = serde_json::json!("Long source context. ".repeat(400));
-
-        let cache = CacheMeter::new(None);
-        let cold = compute_cache_usage_sync(&cache, &first, 1);
-        assert_eq!(cold.cache_read, 0);
-        assert_eq!(cold.cache_covered_est, cold.prompt_total_est);
-
-        let mut second = first;
-        second.messages.push(super::super::types::Message {
-            role: "assistant".to_string(),
-            content: serde_json::json!("Source reviewed."),
-        });
-        second.messages.push(super::super::types::Message {
-            role: "user".to_string(),
-            content: serde_json::json!("Now check the edge cases."),
-        });
-        let warm = compute_cache_usage_sync(&cache, &second, 1);
-        assert_eq!(warm.cache_read, cold.prompt_total_est);
-        let (input, creation, read) = warm.split_against_total(warm.prompt_total_est);
-        assert_eq!(input, 0);
-        assert_eq!(read, cold.prompt_total_est);
-        assert_eq!(creation, warm.prompt_total_est - cold.prompt_total_est);
-
-        let repeated = compute_cache_usage_sync(&cache, &second, 1);
-        assert_eq!(repeated.cache_read, repeated.prompt_total_est);
-    }
-
-    #[tokio::test]
-    async fn async_auto_cache_matches_sync_across_turns() {
-        let mut req = build_request_with_system_breakpoint();
-        req.cache_control = Some(CacheControl {
-            cache_type: "ephemeral".to_string(),
-            ttl: None,
-        });
-        let asynchronous = CacheMeter::new(None);
-        let synchronous = CacheMeter::new(None);
-        let cold = compute_cache_usage(&asynchronous, &req, 1).await;
-        let cold_sync = compute_cache_usage_sync(&synchronous, &req, 1);
-        assert_eq!(cold.cache_covered_est, cold.prompt_total_est);
-        assert_eq!(cold.cache_covered_est, cold_sync.cache_covered_est);
-
-        req.messages.push(super::super::types::Message {
-            role: "assistant".to_string(),
-            content: serde_json::json!("Hello!"),
-        });
-        req.messages.push(super::super::types::Message {
-            role: "user".to_string(),
-            content: serde_json::json!("Continue."),
-        });
-        let warm = compute_cache_usage(&asynchronous, &req, 1).await;
-        let warm_sync = compute_cache_usage_sync(&synchronous, &req, 1);
-        assert_eq!(warm.cache_read, cold.prompt_total_est);
-        assert_eq!(warm.cache_read, warm_sync.cache_read);
-        assert_eq!(warm.cache_covered_est, warm_sync.cache_covered_est);
-    }
-
-    #[test]
-    fn text_shorthand_and_text_block_share_cache_prefix() {
-        let mut req = build_request_with_system_breakpoint();
-        req.system = None;
-        req.cache_control = Some(CacheControl {
-            cache_type: "ephemeral".to_string(),
-            ttl: None,
-        });
-        let cache = CacheMeter::new(None);
-        let cold = compute_cache_usage_sync(&cache, &req, 1);
-        req.messages[0].content = serde_json::json!([{
-            "type": "text", "text": "Hello", "cache_control": {"type": "ephemeral"}
-        }]);
-        let warm = compute_cache_usage_sync(&cache, &req, 1);
-        assert_eq!(warm.cache_read, cold.cache_covered_est);
-        req.messages[0].content[0]["text"] = serde_json::json!("Different content");
-        assert_eq!(compute_cache_usage_sync(&cache, &req, 1).cache_read, 0);
     }
 
     #[test]
@@ -2962,65 +2894,6 @@ mod tests {
         );
         assert_eq!(extract_session_id("no-session-here"), None);
         assert_eq!(extract_session_id("trailing_session_"), None);
-    }
-
-    /// OpenAI/Codex 的 user_id 形如 `session_<uuid>`，前面没有下划线。
-    #[test]
-    fn extract_session_id_parses_codex_format() {
-        assert_eq!(
-            extract_session_id("session_550e8400-e29b-41d4-a716-446655440000"),
-            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
-        );
-    }
-
-    /// Codex 共享主 Key（key_id=0）时靠 session 隔离：不同 session 不命中，相同命中。
-    #[test]
-    fn codex_session_scopes_cache_with_master_key() {
-        use super::super::types::{CacheControl, Message, MessagesRequest, Metadata};
-        let body = "conversation prefix that stays stable ".repeat(20);
-        let make = |session: &str| MessagesRequest {
-            model: "gpt-5.6-sol".to_string(),
-            max_tokens: 64,
-            messages: vec![
-                Message {
-                    role: "user".into(),
-                    content: serde_json::json!([{"type":"text","text":body}]),
-                },
-                Message {
-                    role: "assistant".into(),
-                    content: serde_json::json!([{"type":"text","text":body}]),
-                },
-                Message {
-                    role: "user".into(),
-                    content: serde_json::json!([{"type":"text","text":body}]),
-                },
-            ],
-            stream: false,
-            system: None,
-            tools: None,
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: Some(Metadata {
-                user_id: Some(format!("session_{session}")),
-            }),
-            cache_control: Some(CacheControl {
-                cache_type: "ephemeral".to_string(),
-                ttl: None,
-            }),
-        };
-
-        let cache = CacheMeter::new(None);
-        assert_eq!(compute_cache_usage_sync(&cache, &make("aaa"), 0).cache_read, 0);
-        assert_eq!(
-            compute_cache_usage_sync(&cache, &make("bbb"), 0).cache_read,
-            0,
-            "不同 session 不应命中"
-        );
-        assert!(
-            compute_cache_usage_sync(&cache, &make("aaa"), 0).cache_read > 0,
-            "相同 session 应命中"
-        );
     }
 
     #[test]

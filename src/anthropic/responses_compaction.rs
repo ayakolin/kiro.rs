@@ -93,6 +93,8 @@ pub(super) async fn handle(
         .expect("remote compaction input must be an array")
         .pop();
     req.stream = false;
+    req.tools = None;
+    req.tool_choice = Some(json!("none"));
     let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
     let mut retry_req = req.clone();
     let anthropic_req = match prepare_request(req, metadata.clone()) {
@@ -102,19 +104,12 @@ pub(super) async fn handle(
         }
     };
 
-    let first_attempt = match run_attempt(
-        state.clone(),
-        key_ctx.clone(),
-        anthropic_req,
-        &model,
-        ConversionPurpose::Compact,
-    )
-    .await
-    {
-        Ok(parsed) => Some(parsed),
-        Err(AttemptError::ContextOverflow) => None,
-        Err(AttemptError::Response(response)) => return response,
-    };
+    let first_attempt =
+        match run_attempt(state.clone(), key_ctx.clone(), anthropic_req, &model).await {
+            Ok(parsed) => Some(parsed),
+            Err(AttemptError::ContextOverflow) => None,
+            Err(AttemptError::Response(response)) => return response,
+        };
     let mut accumulated_usage = CompactionUsage::default();
     if let Some(parsed) = &first_attempt {
         accumulated_usage.add(parsed);
@@ -135,7 +130,7 @@ pub(super) async fn handle(
                 retained_tool_output_bytes = stats.retained_bytes,
                 "Kiro compaction exceeded the context window; retrying with bounded tool outputs"
             );
-            let retry = match prepare_request(retry_req.clone(), metadata.clone()) {
+            let retry = match prepare_request(retry_req, metadata) {
                 Ok(value) => value,
                 Err(message) => {
                     return responses_error(
@@ -145,15 +140,7 @@ pub(super) async fn handle(
                     );
                 }
             };
-            final_parsed = match run_attempt(
-                state.clone(),
-                key_ctx.clone(),
-                retry,
-                &model,
-                ConversionPurpose::Compact,
-            )
-            .await
-            {
+            final_parsed = match run_attempt(state, key_ctx, retry, &model).await {
                 Ok(parsed) => {
                     accumulated_usage.add(&parsed);
                     Some(parsed)
@@ -167,35 +154,6 @@ pub(super) async fn handle(
                 "Kiro compaction exceeded the context window and had no oversized tool outputs to reduce"
             );
         }
-    }
-
-    if final_parsed
-        .as_ref()
-        .is_some_and(|parsed| !parsed.tool_calls.is_empty())
-    {
-        tracing::warn!(model = %model, "Kiro compaction returned a tool call; retrying with inert history tools");
-        let fallback = match prepare_fallback_request(retry_req, metadata) {
-            Ok(value) => value,
-            Err(message) => {
-                return responses_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
-            }
-        };
-        final_parsed = match run_attempt(
-            state,
-            key_ctx,
-            fallback,
-            &model,
-            ConversionPurpose::CompactFallback,
-        )
-        .await
-        {
-            Ok(parsed) => {
-                accumulated_usage.add(&parsed);
-                Some(parsed)
-            }
-            Err(AttemptError::ContextOverflow) => None,
-            Err(AttemptError::Response(response)) => return response,
-        };
     }
 
     let usage = accumulated_usage.into_json();
@@ -216,33 +174,9 @@ fn prepare_request(
 ) -> Result<MessagesRequest, String> {
     let (mut anthropic_req, _) = responses_to_anthropic(req, metadata)?;
     anthropic_req.stream = false;
-    prepare_summary_turn(&mut anthropic_req)?;
-    Ok(anthropic_req)
-}
-
-fn prepare_fallback_request(
-    mut req: ResponsesRequest,
-    metadata: Option<Metadata>,
-) -> Result<MessagesRequest, String> {
-    req.tools = None;
-    req.tool_choice = Some(json!("none"));
-    let (mut anthropic_req, _) = responses_to_anthropic(req, metadata)?;
-    anthropic_req.stream = false;
     anthropic_req.tools = None;
+    anthropic_req.tool_choice = None;
     prepare_summary_turn(&mut anthropic_req)?;
-
-    let tool_names = historical_tool_names(&anthropic_req.messages);
-    if !tool_names.is_empty() {
-        let mapping = serde_json::to_string(&tool_names)
-            .map_err(|error| format!("failed to serialize historical tool mapping: {error}"))?;
-        anthropic_req
-            .system
-            .get_or_insert_with(Vec::new)
-            .push(SystemMessage {
-                text: format!("Historical tool calls are represented by an inert placeholder in the upstream request. The original call_id to tool-name mapping is: {mapping}"),
-                cache_control: None,
-            });
-    }
     anthropic_req
         .system
         .get_or_insert_with(Vec::new)
@@ -263,7 +197,6 @@ async fn run_attempt(
     key_ctx: KeyContext,
     anthropic_req: MessagesRequest,
     model: &str,
-    purpose: ConversionPurpose,
 ) -> Result<ParsedResponse, AttemptError> {
     let provider = match &state.kiro_provider {
         Some(provider) => provider.clone(),
@@ -279,7 +212,7 @@ async fn run_attempt(
     let conversion = convert_request_with_purpose(
         &anthropic_req,
         state.tool_compatibility_mode,
-        purpose,
+        ConversionPurpose::Compact,
     )
     .map_err(|error| {
         AttemptError::Response(responses_error(
@@ -359,14 +292,14 @@ async fn run_attempt(
 /// user turn. Only assistant-ended history needs a synthetic user turn because
 /// Kiro cannot generate from an assistant prefill.
 fn prepare_summary_turn(req: &mut MessagesRequest) -> Result<(), String> {
-    let summary_request = format!("{SUMMARY_INSTRUCTION}\n\n{SUMMARY_REQUEST}");
+    let tool_names = historical_tool_names(&req.messages);
     let last = req
         .messages
         .last_mut()
         .ok_or_else(|| "compaction input must contain at least one message".to_string())?;
 
     match last.role.as_str() {
-        "user" => append_text_block(&mut last.content, &summary_request)?,
+        "user" => append_text_block(&mut last.content, SUMMARY_REQUEST)?,
         "assistant" => {
             let cancelled = terminal_tool_uses(&last.content)
                 .into_iter()
@@ -380,7 +313,7 @@ fn prepare_summary_turn(req: &mut MessagesRequest) -> Result<(), String> {
                 })
                 .chain(std::iter::once(json!({
                     "type": "text",
-                    "text": summary_request,
+                    "text": SUMMARY_REQUEST,
                 })))
                 .collect::<Vec<_>>();
             req.messages.push(Message {
@@ -391,6 +324,18 @@ fn prepare_summary_turn(req: &mut MessagesRequest) -> Result<(), String> {
         role => return Err(format!("unsupported final compaction message role: {role}")),
     }
 
+    if !tool_names.is_empty() {
+        let mapping = serde_json::to_string(&tool_names)
+            .map_err(|error| format!("failed to serialize historical tool mapping: {error}"))?;
+        req.system
+            .get_or_insert_with(Vec::new)
+            .push(SystemMessage {
+                text: format!(
+                    "Historical tool calls are represented by an inert placeholder in the upstream request. The original call_id to tool-name mapping is: {mapping}"
+                ),
+                cache_control: None,
+            });
+    }
     Ok(())
 }
 
@@ -768,7 +713,6 @@ fn render_stream(outcome: Outcome, model: &str) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from(body))
         .unwrap()
@@ -910,13 +854,13 @@ mod tests {
         prepare_summary_turn(&mut request).unwrap();
         let converted = convert_compact(&request).unwrap();
 
-        assert!(
+        assert_eq!(
             converted
                 .conversation_state
                 .current_message
                 .user_input_message
-                .content
-                .contains(SUMMARY_REQUEST)
+                .content,
+            SUMMARY_REQUEST
         );
         assert!(converted.conversation_state.history.iter().any(|message| {
             matches!(
@@ -1024,10 +968,14 @@ mod tests {
             })
             .and_then(|uses| uses.first())
             .unwrap();
-        assert_eq!(assistant_tool.name, "shell");
+        assert_eq!(assistant_tool.name, "kiro_compaction_history_tool");
         let tools = &current.user_input_message_context.tools;
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].tool_specification.name, "shell");
+        assert_eq!(
+            tools[0].tool_specification.name,
+            "kiro_compaction_history_tool"
+        );
+        assert_ne!(tools[0].tool_specification.name, "shell");
     }
 
     #[test]
@@ -1044,7 +992,14 @@ mod tests {
         ])));
 
         prepare_summary_turn(&mut request).unwrap();
-        assert!(request.system.is_none());
+        assert!(
+            request
+                .system
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|part| { part.text.contains("call_pending") && part.text.contains("exec") })
+        );
 
         let converted = convert_compact(&request).unwrap();
         let current = &converted
@@ -1077,123 +1032,9 @@ mod tests {
             .and_then(|uses| uses.first())
             .unwrap();
         assert_eq!(historical_use.tool_use_id, "call_pending");
-        assert_eq!(historical_use.name, "exec");
+        assert_eq!(historical_use.name, "kiro_compaction_history_tool");
         assert_eq!(historical_use.input["command"], "pwd");
         assert_eq!(historical_use.input["timeout"], 1000);
-    }
-
-    #[test]
-    fn compact_preserves_generate_history_and_tools() {
-        let mut request = compact_request(json!([
-            { "type": "message", "role": "developer", "content": "Keep the source context." },
-            { "type": "message", "role": "user", "content": "Inspect the parser." },
-            {
-                "type": "function_call", "call_id": "call_parser", "name": "inspect_module",
-                "arguments": "{\"path\":\"src/parser.rs\"}"
-            },
-            {
-                "type": "function_call_output", "call_id": "call_parser",
-                "output": "Parser returns Result."
-            },
-            { "type": "message", "role": "user", "content": "What did you find?" },
-            {
-                "type": "additional_tools",
-                "tools": [{
-                    "type": "function", "name": "inspect_module",
-                    "description": "Inspect one source module.",
-                    "parameters": {
-                        "type": "object", "properties": {"path": {"type": "string"}},
-                        "required": ["path"]
-                    }
-                }]
-            },
-            { "type": "compaction_trigger" }
-        ]));
-        request.instructions = Some("You are a coding assistant.".to_string());
-        let metadata = Some(Metadata {
-            user_id: Some("session_550e8400-e29b-41d4-a716-446655440000".to_string()),
-        });
-
-        request.input.as_array_mut().unwrap().pop();
-        let (generate, _) = responses_to_anthropic(request.clone(), metadata.clone()).unwrap();
-        let compact = prepare_request(request, metadata).unwrap();
-        assert_eq!(
-            serde_json::to_value(&generate.system).unwrap(),
-            serde_json::to_value(&compact.system).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&generate.tools).unwrap(),
-            serde_json::to_value(&compact.tools).unwrap()
-        );
-
-        let generated = super::super::super::converter::convert_request_with_mode(
-            &generate,
-            crate::model::config::ToolCompatibilityMode::ClaudeCode,
-        )
-        .unwrap();
-        let compacted = convert_compact(&compact).unwrap();
-        assert_eq!(
-            serde_json::to_value(&generated.conversation_state.history).unwrap(),
-            serde_json::to_value(&compacted.conversation_state.history).unwrap()
-        );
-        let generated_message = &generated.conversation_state.current_message.user_input_message;
-        let compacted_message = &compacted.conversation_state.current_message.user_input_message;
-        assert_eq!(
-            serde_json::to_value(&generated_message.user_input_message_context.tools).unwrap(),
-            serde_json::to_value(&compacted_message.user_input_message_context.tools).unwrap()
-        );
-        assert!(
-            compacted_message.content.starts_with(&generated_message.content)
-        );
-    }
-
-    #[test]
-    fn tool_call_fallback_keeps_history_paired_without_executable_tools() {
-        let mut request = compact_request(json!([
-            { "type": "message", "role": "user", "content": "Inspect the parser." },
-            {
-                "type": "function_call", "call_id": "call_parser", "name": "inspect_module",
-                "arguments": "{\"path\":\"src/parser.rs\"}"
-            },
-            {
-                "type": "function_call_output", "call_id": "call_parser",
-                "output": "Parser returns Result."
-            },
-            { "type": "compaction_trigger" }
-        ]));
-        request.tools = Some(vec![json!({
-            "type": "function", "name": "inspect_module",
-            "description": "Read a module.",
-            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
-        })]);
-        request.input.as_array_mut().unwrap().pop();
-        let fallback = prepare_fallback_request(request, None).unwrap();
-        assert!(fallback.tools.is_none());
-        let converted = convert_request_with_purpose(
-            &fallback,
-            crate::model::config::ToolCompatibilityMode::ClaudeCode,
-            ConversionPurpose::CompactFallback,
-        )
-        .unwrap();
-        let current = &converted.conversation_state.current_message.user_input_message;
-        assert_eq!(current.user_input_message_context.tools.len(), 1);
-        assert_eq!(
-            current.user_input_message_context.tools[0].tool_specification.name,
-            "kiro_compaction_history_tool"
-        );
-        assert_eq!(
-            current.user_input_message_context.tool_results[0].tool_use_id,
-            "call_parser"
-        );
-        assert!(converted.conversation_state.history.iter().any(|message| {
-            matches!(
-                message,
-                crate::kiro::model::requests::conversation::Message::Assistant(assistant)
-                    if assistant.assistant_response_message.tool_uses.as_ref().is_some_and(|uses|
-                        uses.iter().any(|tool| tool.tool_use_id == "call_parser"
-                            && tool.name == "kiro_compaction_history_tool"))
-            )
-        }));
     }
 
     #[test]
