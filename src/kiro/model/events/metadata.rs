@@ -122,6 +122,19 @@ impl MetadataEvent {
             (None, None) => CONTENT_FILTERED_STOP_REASON.to_string(),
         })
     }
+
+    /// 上游 `stopReason` 映射到 Anthropic `stop_reason`；无法映射（含 CONTENT_FILTERED，
+    /// 由 `content_filter_refusal` 单独处理）时返回 `None`。只有 thinking 的回复不代表触达输出上限。
+    pub fn anthropic_stop_reason(&self) -> Option<&'static str> {
+        match self.stop_reason.as_deref()?.to_ascii_lowercase().as_str() {
+            "end_turn" => Some("end_turn"),
+            "tool_use" => Some("tool_use"),
+            "max_tokens" => Some("max_tokens"),
+            "stop_sequence" => Some("stop_sequence"),
+            "model_context_window_exceeded" => Some("model_context_window_exceeded"),
+            _ => None,
+        }
+    }
 }
 
 impl EventPayload for MetadataEvent {
@@ -133,6 +146,27 @@ impl EventPayload for MetadataEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_provider_stop_reason_without_token_usage() {
+        for (raw, mapped) in [
+            ("END_TURN", "end_turn"),
+            ("MAX_TOKENS", "max_tokens"),
+            ("TOOL_USE", "tool_use"),
+        ] {
+            let event: MetadataEvent =
+                serde_json::from_value(serde_json::json!({"stopReason":raw})).unwrap();
+            assert_eq!(event.anthropic_stop_reason(), Some(mapped));
+            assert!(event.content_filter_refusal().is_none());
+            assert!(event.token_usage.is_none());
+        }
+        let filtered: MetadataEvent = serde_json::from_value(serde_json::json!({"stopReason":"CONTENT_FILTERED","stopDetails":{"private_provider_detail":"not forwarded"}})).unwrap();
+        assert_eq!(
+            filtered.content_filter_refusal().as_deref(),
+            Some(CONTENT_FILTERED_STOP_REASON)
+        );
+        assert_eq!(filtered.anthropic_stop_reason(), None);
+    }
 
     #[test]
     fn parses_official_token_usage_shape() {

@@ -1629,6 +1629,9 @@ pub(crate) async fn execute_non_stream_request(
                                 }
                             }
                             Event::Metadata(metadata) => {
+                                if let Some(reason) = metadata.anthropic_stop_reason() {
+                                    stop_reason = reason.to_string();
+                                }
                                 if let Some(usage) = metadata.token_usage {
                                     let usage = usage.sanitized();
                                     tracing::debug!(
