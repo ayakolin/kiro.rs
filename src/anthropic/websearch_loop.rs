@@ -312,6 +312,14 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::Metadata(metadata) => {
+                    if metadata.is_content_filtered() {
+                        stream_error = Some(super::handlers::CONTENT_FILTERED_ERROR_MESSAGE.to_string());
+                    }
+                    if let Some(reason) = metadata.anthropic_stop_reason() {
+                        if reason != "end_turn" {
+                            stop_reason_override = Some(reason.to_string());
+                        }
+                    }
                     if let Some(usage) = metadata.token_usage {
                         // 单条流内重复 metadata 是快照，取最后一份。
                         provider_token_usage = Some(usage.sanitized());
@@ -498,14 +506,18 @@ async fn run_round(
         return Err(RoundFailure {
             response: (
                 StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "upstream_error",
-                    "Upstream response stream ended unexpectedly during the web_search loop."
-                        .to_string(),
-                )),
+                Json(if error_message == super::handlers::CONTENT_FILTERED_ERROR_MESSAGE {
+                    ErrorResponse::new(super::handlers::CONTENT_FILTERED_ERROR_TYPE, &error_message)
+                } else {
+                    ErrorResponse::new("upstream_error", "Upstream response stream ended unexpectedly during the web_search loop.")
+                }),
             )
                 .into_response(),
-            error_type: outcome::STREAM_INTERRUPTED,
+            error_type: if error_message == super::handlers::CONTENT_FILTERED_ERROR_MESSAGE {
+                super::handlers::CONTENT_FILTERED_ERROR_TYPE
+            } else {
+                outcome::STREAM_INTERRUPTED
+            },
             error_message,
             credential_id,
             token_usage: Some(token_usage),

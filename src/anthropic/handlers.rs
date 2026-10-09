@@ -1167,6 +1167,8 @@ fn create_sse_stream(
                                         match Event::from_frame(frame) {
                                             Ok(event) => {
                                                 if let Some(error) = upstream_event_error(&event) {
+                                                    // Keep any final provider usage even when its stop reason is an error.
+                                                    ctx.process_kiro_event(&event);
                                                     let bytes = settlement.interrupt(&mut ctx, events, &error, sent_bytes);
                                                     return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, settlement, sent_bytes)));
                                                 }
@@ -1272,6 +1274,16 @@ impl StreamSettlement {
         error: &str,
         bytes: u64,
     ) -> Vec<Result<Bytes, Infallible>> {
+        if error == CONTENT_FILTERED_ERROR_MESSAGE {
+            events.extend(ctx.generate_error_events(CONTENT_FILTERED_ERROR_TYPE, error));
+            self.update(ctx, bytes);
+            self.finish(
+                "error", "error", Some(CONTENT_FILTERED_ERROR_TYPE), Some(error), None,
+            );
+            return events.into_iter()
+                .map(|event| Ok(Bytes::from(event.to_sse_string())))
+                .collect();
+        }
         tracing::error!(error, "Upstream response stream was interrupted");
         events.extend(
             ctx.generate_error_events("api_error", "Upstream response stream was interrupted"),
@@ -1436,8 +1448,15 @@ async fn handle_non_stream_request(
     }
 }
 
+pub(super) const CONTENT_FILTERED_ERROR_MESSAGE: &str =
+    "Kiro upstream stopped generation (CONTENT_FILTERED)";
+pub(super) const CONTENT_FILTERED_ERROR_TYPE: &str = "upstream_content_filtered";
+
 fn upstream_event_error(event: &Event) -> Option<String> {
     match event {
+        Event::Metadata(metadata) if metadata.is_content_filtered() => {
+            Some(CONTENT_FILTERED_ERROR_MESSAGE.to_string())
+        }
         Event::Error {
             error_code,
             error_message,
@@ -1461,8 +1480,12 @@ fn non_stream_read_failure(
 ) -> NonStreamExecutionError {
     hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
     tracer.finalize(
-        "interrupted",
-        Some(outcome::STREAM_INTERRUPTED),
+        if error == CONTENT_FILTERED_ERROR_MESSAGE { "error" } else { "interrupted" },
+        Some(if error == CONTENT_FILTERED_ERROR_MESSAGE {
+            CONTENT_FILTERED_ERROR_TYPE
+        } else {
+            outcome::STREAM_INTERRUPTED
+        }),
         Some(error),
         None,
         TraceUsage::zero(),
@@ -1470,10 +1493,11 @@ fn non_stream_read_failure(
     NonStreamExecutionError::Response(
         (
             StatusCode::BAD_GATEWAY,
-            Json(ErrorResponse::new(
-                "api_error",
-                "Invalid or interrupted upstream response stream",
-            )),
+            Json(if error == CONTENT_FILTERED_ERROR_MESSAGE {
+                ErrorResponse::new(CONTENT_FILTERED_ERROR_TYPE, error)
+            } else {
+                ErrorResponse::new("api_error", "Invalid or interrupted upstream response stream")
+            }),
         )
             .into_response(),
     )
@@ -1624,6 +1648,9 @@ pub(crate) async fn execute_non_stream_request(
                                 }
                             }
                             Event::Metadata(metadata) => {
+                                if let Some(reason) = metadata.anthropic_stop_reason() {
+                                    stop_reason = reason.to_string();
+                                }
                                 if let Some(usage) = metadata.token_usage {
                                     let usage = usage.sanitized();
                                     tracing::debug!(

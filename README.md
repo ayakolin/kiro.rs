@@ -623,6 +623,10 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
 
+结束原因优先采用上游 `metadataEvent.stopReason`。只有 thinking 的响应不会被自动改写成 `max_tokens`，也不会补造空格正文；真实的输出上限仍按上游事件报告。
+
+上游返回 `CONTENT_FILTERED` 时，流式响应返回 `upstream_content_filtered` 错误事件，非流式返回 HTTP 502。该错误表示 Kiro 上游终止了生成，不表示客户端用完了输出 Token；请求日志会记录为失败。
+
 ### Tool Use
 
 服务端会把 Anthropic tools 转成 Kiro 工具定义，并处理以下兼容逻辑：
