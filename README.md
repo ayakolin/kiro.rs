@@ -715,6 +715,8 @@ data/
 - `cache_read_input_tokens`
 - `output_tokens`
 
+顶层 `cache_control` 的自动断点覆盖最后一个可缓存块，包括本轮用户输入：新内容首次计入缓存创建，后续请求匹配已有前缀时计入缓存读取。字符串消息与等价的单个 `text` 块使用相同缓存键（Claude Code 会在这两种写法之间来回切换同一条消息）。
+
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI
 

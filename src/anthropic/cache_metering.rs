@@ -681,8 +681,6 @@ struct PromptBlock {
     invalid_cache_control: bool,
     cacheable: bool,
     lookback_group: Option<LookbackGroup>,
-    /// 是否为当前轮次的最新用户提问（若是，在多轮对话中自动缓存不应打在其末尾，而应打在上一轮末尾）
-    is_current_turn_input: bool,
 }
 
 /// 识别出的断点
@@ -709,7 +707,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: true,
                 lookback_group: None,
-                is_current_turn_input: false,
             });
         }
     }
@@ -726,22 +723,12 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: !sys.text.trim().is_empty(),
                 lookback_group: None,
-                is_current_turn_input: false,
             });
         }
     }
 
     // 3. messages (按顺序遍历)
-    let total_messages = req.messages.len();
-    for (m_idx, msg) in req.messages.iter().enumerate() {
-        let is_tool_result = match &msg.content {
-            serde_json::Value::Array(arr) => arr
-                .iter()
-                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("tool_result")),
-            _ => false,
-        };
-        let is_current_turn_input =
-            (m_idx + 1 == total_messages) && msg.role == "user" && !is_tool_result;
+    for msg in &req.messages {
         match &msg.content {
             serde_json::Value::String(s) => {
                 // 字符串是单个 text block 的简写。Claude Code 会在"带断点的最后一条"与"历史消息"
@@ -754,7 +741,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                     invalid_cache_control: false,
                     cacheable: !s.trim().is_empty(),
                     lookback_group: None,
-                    is_current_turn_input,
                 });
             }
             serde_json::Value::Array(arr) => {
@@ -780,7 +766,6 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                         invalid_cache_control,
                         cacheable: block_is_cacheable(&content),
                         lookback_group,
-                        is_current_turn_input,
                     });
                 }
             }
@@ -822,21 +807,13 @@ fn resolve_breakpoints(
         }
     }
 
-    // 2. 顶层自动缓存：若有多轮对话且最后一条是当前 user 提问，断点优先挂在当前提问之前的上一轮会话末尾，
-    // 确保当前最新提问 100% 诚实作为未缓存 input_tokens，杜绝 input 归零。
+    // 2. 顶层自动缓存覆盖最后一个可缓存块，包括本轮最新用户输入。
+    // 新输入首次算 creation，下一轮才可能算 read；不能为保持 input 非零而把断点回退到上一轮。
     if let Some(top_cc) = top_cache_control {
         let Some(auto_ttl) = validated_ttl(top_cc) else {
             return Vec::new();
         };
-        let target_idx = if blocks.iter().any(|b| !b.is_current_turn_input && b.cacheable) {
-            blocks
-                .iter()
-                .enumerate()
-                .rposition(|(_idx, block)| block.cacheable && !block.is_current_turn_input)
-        } else {
-            blocks.iter().rposition(|block| block.cacheable)
-        };
-        if let Some(last_idx) = target_idx {
+        if let Some(last_idx) = blocks.iter().rposition(|block| block.cacheable) {
             if let Some(existing) = breakpoints.iter().find(|bp| bp.block_idx == last_idx) {
                 if existing.ttl_secs != auto_ttl {
                     return Vec::new();
@@ -1516,6 +1493,70 @@ mod tests {
         );
         // 只有 User 1 和 User 2 两个断点被写入，Assistant 1 没有断点
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn auto_cache_with_system_preserves_previous_user_input() {
+        let mut first = build_request_with_system_breakpoint();
+        first.system.as_mut().unwrap()[0].cache_control = None;
+        first.cache_control = Some(CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: None,
+        });
+        first.messages[0].content = serde_json::json!("Long source context. ".repeat(400));
+
+        let cache = CacheMeter::new(None);
+        let cold = compute_cache_usage_sync(&cache, &first, 1);
+        assert_eq!(cold.cache_read, 0);
+        assert_eq!(cold.cache_covered_est, cold.prompt_total_est);
+
+        let mut second = first;
+        second.messages.push(super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("Source reviewed."),
+        });
+        second.messages.push(super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("Now check the edge cases."),
+        });
+        let warm = compute_cache_usage_sync(&cache, &second, 1);
+        assert_eq!(warm.cache_read, cold.prompt_total_est);
+        let (input, creation, read) = warm.split_against_total(warm.prompt_total_est);
+        assert_eq!(input, 0);
+        assert_eq!(read, cold.prompt_total_est);
+        assert_eq!(creation, warm.prompt_total_est - cold.prompt_total_est);
+
+        let repeated = compute_cache_usage_sync(&cache, &second, 1);
+        assert_eq!(repeated.cache_read, repeated.prompt_total_est);
+    }
+
+    #[tokio::test]
+    async fn async_auto_cache_matches_sync_across_turns() {
+        let mut req = build_request_with_system_breakpoint();
+        req.cache_control = Some(CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: None,
+        });
+        let asynchronous = CacheMeter::new(None);
+        let synchronous = CacheMeter::new(None);
+        let cold = compute_cache_usage(&asynchronous, &req, 1).await;
+        let cold_sync = compute_cache_usage_sync(&synchronous, &req, 1);
+        assert_eq!(cold.cache_covered_est, cold.prompt_total_est);
+        assert_eq!(cold.cache_covered_est, cold_sync.cache_covered_est);
+
+        req.messages.push(super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!("Hello!"),
+        });
+        req.messages.push(super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::json!("Continue."),
+        });
+        let warm = compute_cache_usage(&asynchronous, &req, 1).await;
+        let warm_sync = compute_cache_usage_sync(&synchronous, &req, 1);
+        assert_eq!(warm.cache_read, cold.prompt_total_est);
+        assert_eq!(warm.cache_read, warm_sync.cache_read);
+        assert_eq!(warm.cache_covered_est, warm_sync.cache_covered_est);
     }
 
     /// Claude Code 2.1.x 实测（Windows/Linux、`-p` 与交互式入口一致）：携带断点的最后一条
