@@ -6,9 +6,97 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Gateway reliability and latency
+
+- Stream CC and Chat Completions content immediately, preserving final usage and tool arguments.
+- Reuse upstream connections; add configurable connection and idle read deadlines.
+- Return model overloads with 503 and Retry-After without repeated internal attempts.
+- Decode non-streaming answers incrementally; report empty, corrupt, truncated, and interrupted responses as errors.
+- Record first-token latency from content rather than metadata.
+- Add TDD regressions and a repeatable before/after latency benchmark. See `docs/gateway-performance.md`.
+
 ### Fixes
 
 - Stop rejecting requests whose history contains a Claude Code `Read` call with `pages` (HTTP 400 `工具映射不支持: Claude Code Read.pages has no Kiro read_file equivalent`). The field has no Kiro `read_file` equivalent and only appears in replayed history the client cannot correct, so it is now dropped instead of failing the whole session.
+
+## [0.9.1] - 2026-10-08
+
+主题：**凭据调度与额度恢复、账号级 429 故障转移、Codex 压缩缓存复用，以及模型上下文、Token 计量和流式链路修复**。本版汇总 `v0.9.0` 之后合并的 9 个 PR；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。
+
+### ✨ 凭据调度与月度额度恢复
+
+> 来源：[PR #107](https://github.com/ZyphrZero/kiro.rs/pull/107) 与 [PR #109](https://github.com/ZyphrZero/kiro.rs/pull/109)。提交人：[@childe](https://github.com/childe)，感谢贡献。PR #107 的原始提交作者为 [@hyzhengdl](https://github.com/hyzhengdl)。
+
+- `balanced` 模式在可用凭据中均匀随机选号，修复未知模型缓存凭据长期得不到流量、新凭据追平历史成功次数期间独占流量，以及持续失败凭据反复困住请求的问题。
+- 会话粘性命中时仍沿用绑定凭据；未命中时才随机选号。`priority` 模式及禁用、冷却、RPM、分组和模型支持筛选规则保持原有行为。
+- 单条添加、批量导入和登录新增凭据后，后台立即拉取模型列表并更新缓存，不阻塞添加操作；复用单飞锁、并发上限与删除后的结果校验，减少新凭据被分配不支持模型的请求。
+- 新增 `quotaResetRecoveryEnabled` 与管理端「月度额度恢复」开关，默认关闭；支持 `GET` / `PUT /api/admin/config/quota-reset-recovery`，运行时修改会持久化，写盘失败时回滚内存状态。
+- 开启后按凭据自己的 `nextResetAt` 复查额度，仅在订阅剩余额度恢复为正数时重新启用 `QuotaExceeded` 凭据，并清零失败计数、限流冷却和自愈连续轮数；手动禁用、封禁和 Token 失效等状态不受影响。
+
+### 🔧 上游 429 处理与 Codex 压缩缓存复用
+
+> 来源：[PR #102](https://github.com/ZyphrZero/kiro.rs/pull/102)。提交人：[@lijmyeah](https://github.com/lijmyeah)，感谢贡献。
+
+- 区分账号级与容量类模型 API 429：`USER_REQUEST_RATE_EXCEEDED`、`CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED` 等账号级限流在故障转移开启时冷却当前凭据并尝试其他可用凭据。
+- `INSUFFICIENT_MODEL_CAPACITY`、`MODEL_TEMPORARILY_UNAVAILABLE` 等容量类 429 保持当前凭据退避重试；新增 `modelApi429RetryEnabled` 配置与管理端独立开关，默认开启，关闭后首次容量类 429 即返回客户端。
+- 账号级 429 仍由现有故障转移开关控制；无法转移时返回上游 `Retry-After` 或本地冷却时间，便于客户端安排重试。
+- Codex Responses compact 请求尽量保留普通请求的 system、工具定义和历史结构，把摘要指令放在末尾用户轮次，提高缓存前缀复用机会；实际命中与 credits 消耗仍取决于上游。
+- 仅在压缩响应意外返回工具调用时，使用不可执行的历史工具占位方案重试，保留工具调用与结果配对并累计尝试用量；保留上下文溢出时限量历史工具输出的重试路径。
+- 新增 `scripts/probe_compaction_cache.sh`，用于对照普通请求与 compact 请求的用量和缓存表现。
+
+### 📊 模型上下文与 Token 计量
+
+> 来源：[PR #102](https://github.com/ZyphrZero/kiro.rs/pull/102)，提交人：[@lijmyeah](https://github.com/lijmyeah)；[PR #105](https://github.com/ZyphrZero/kiro.rs/pull/105) 与 [PR #106](https://github.com/ZyphrZero/kiro.rs/pull/106)，提交人：[@childe](https://github.com/childe)。感谢贡献。
+
+- 将 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 的上下文窗口估算调整为 1M，其他 GPT 模型沿用原有估算。
+- 支持 Claude Opus 5.5 及其别名、后缀形式，纳入 1M 上下文模型族，修正上下文进度与自动压缩时机。
+- 修复 `contextUsageEvent` 回退计量把本轮输出重复计入 `input_tokens`：流式、非流式和多轮 WebSearch 在缓存分摊前逐轮扣除输出，极端情况下下限为零。
+- 没有上下文用量事件时保留原有输入估算；上游精确 Token 用量仍优先采用。Chat Completions、Responses、Admin 统计和 trace 同步获得修正后的用量，credits 计费继续使用上游 metering 数据。
+
+### 🔧 流式工具调用、反向代理与中断追踪
+
+> 来源：[PR #103](https://github.com/ZyphrZero/kiro.rs/pull/103)、[PR #104](https://github.com/ZyphrZero/kiro.rs/pull/104) 与 [PR #108](https://github.com/ZyphrZero/kiro.rs/pull/108)。提交人：[@childe](https://github.com/childe)，原始提交作者：[@hyzhengdl](https://github.com/hyzhengdl)。感谢贡献。
+
+- 上游结束时，参数缓冲为空的无参工具调用按 `{}` 还原，覆盖流式与非流式路径；非空但截断的 JSON 仍报错，避免把不完整调用误当成功。
+- 所有 SSE 响应增加 `x-accel-buffering: no`，提示支持该响应头的反向代理关闭缓冲，改善流式事件交付。
+- 记录上游响应头到达前被取消的请求，trace 状态为 `interrupted`、错误类型为 `abandoned_before_headers`；响应头已到达后的中断继续使用 `stream_interrupted`，管理端支持展示和筛选。
+- 请求 trace 收尾改为幂等；`/cc/v1/messages` 缓冲期间客户端断开时，按已观测的用量快照完成记账和追踪，避免漏记或重复入账。
+- 中断类型只描述响应头是否到达，不推断客户端超时、网关超时或用户取消的具体原因，排查时需结合耗时与下游日志。
+
+### 🔧 Enterprise / IdC 凭据区域兼容
+
+> 来源：[PR #95](https://github.com/ZyphrZero/kiro.rs/pull/95)。提交人：[@gujunxiang](https://github.com/gujunxiang)，感谢贡献。修复 [Issue #93](https://github.com/ZyphrZero/kiro.rs/issues/93)。
+
+- 未显式设置凭据 `apiRegion` 时，优先使用真实 CodeWhisperer `profileArn` 中的区域，避免 Enterprise / IdC 数据面请求访问错误端点。
+- API 区域优先级为 `credential.apiRegion → profileArn region → credential.region → config.apiRegion → config.region`；占位 ARN、缺失或格式异常的 ARN 不参与区域推断。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@childe](https://github.com/childe) | [#103](https://github.com/ZyphrZero/kiro.rs/pull/103)、[#104](https://github.com/ZyphrZero/kiro.rs/pull/104)、[#105](https://github.com/ZyphrZero/kiro.rs/pull/105)、[#106](https://github.com/ZyphrZero/kiro.rs/pull/106)、[#107](https://github.com/ZyphrZero/kiro.rs/pull/107)、[#108](https://github.com/ZyphrZero/kiro.rs/pull/108)、[#109](https://github.com/ZyphrZero/kiro.rs/pull/109) |
+| [@gujunxiang](https://github.com/gujunxiang) | [#95](https://github.com/ZyphrZero/kiro.rs/pull/95) |
+| [@lijmyeah](https://github.com/lijmyeah) | [#102](https://github.com/ZyphrZero/kiro.rs/pull/102) |
+
+以上按 GitHub PR 作者列出；另感谢 [@hyzhengdl](https://github.com/hyzhengdl) 的原始代码贡献。
+
+### 🤝 Collaborators — PR 合并与维护
+
+感谢协助合并本版 PR 的 Collaborators 开发者：
+
+- [@childe](https://github.com/childe)：合并本版 PR #102–#109，协助整合社区改动。
+- [@stormrise](https://github.com/stormrise)：合并 [PR #95](https://github.com/ZyphrZero/kiro.rs/pull/95)，推进凭据区域兼容修复。
+
+同时感谢仓库的其他 Collaborators [@bestK](https://github.com/bestK)、[@yeeyon](https://github.com/yeeyon)、[@zhuinfra](https://github.com/zhuinfra) 的支持。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.1`，无需手动转换现有配置、凭据、客户端 Key 或日志数据库。
+- `quotaResetRecoveryEnabled` 默认 `false`，需主动开启；`modelApi429RetryEnabled` 默认 `true`，延续容量类 429 自动重试行为。
+- `balanced` 的分配依据从历史成功次数调整为随机选择；会话粘性优先，短时间或少量请求的分布不保证完全均匀。
+- 新凭据的模型缓存预热完成前仍可能收到不支持模型的 400；预热失败时保持 Unknown，需通过模型发现、管理端刷新或重启再次触发。
+
+完整变更：[v0.9.0...v0.9.1](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.0...v0.9.1)。
 
 ## [0.9.0] - 2026-09-17
 

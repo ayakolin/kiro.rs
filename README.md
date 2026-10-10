@@ -47,7 +47,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
-- **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
+- **故障转移**：凭据失败、额度用尽、账号级 429 限流冷却、token 失效强制刷新。
 - **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
@@ -366,8 +366,9 @@ Admin API 鉴权同样支持：
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
-| `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
-| `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
+| `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
+| `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
+| `modelApi429RetryEnabled` | `true` | 无需换号的容量类模型 API 429 是否由中转自动重试 |
 | `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |
 | `selfHealMinIntervalSecs` | `300` | 两次自愈的最小冷却间隔（秒），打断持续 403 死循环的关键 |
@@ -529,8 +530,9 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 上下文窗口估算：
 
-- `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
+- `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`：`1_000_000`（静态模型声明最大输出为 `64_000`）
+- 其它 `gpt-5.*`：`272_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 ### 自定义模型
@@ -621,7 +623,9 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
 
-Claude Sonnet 5 系特例：上游移除了手动 extended thinking（仅保留 adaptive），既不回传原生 reasoning 文本，也不响应 `<thinking_mode>` 伪标签。对 `claude-sonnet-5*` 模型，请求启用 thinking（enabled / adaptive）时服务端改为注入显式自然语言指令，让模型把推理包进 `<thinking>` 标签，再走同一套标签提取路径转换为 thinking block（流式与非流式均生效）。
+结束原因优先采用上游 `metadataEvent.stopReason`。只有 thinking 的响应不会被自动改写成 `max_tokens`，也不会补造空格正文；真实的输出上限仍按上游事件报告。
+
+上游返回 `CONTENT_FILTERED` 时，流式响应返回 `upstream_content_filtered` 错误事件，非流式返回 HTTP 502。该错误表示 Kiro 上游终止了生成，不表示客户端用完了输出 Token；请求日志会记录为失败。
 
 ### Tool Use
 
@@ -726,7 +730,7 @@ Admin 还提供：
 - Social 登录和 IdC / Enterprise 登录流程。
 - 全局代理设置和代理池健康检查。
 - 负载均衡模式配置。
-- 账号级风控故障转移配置。
+- 账号级 429 限流故障转移配置。
 - 按请求作用域和凭据隔离的自愈治理（403 封禁识别 / 冷却 / 连续上限，状态跨重启保留）。
 - trace / usage log 保留策略。
 - 在线更新、自动更新和回退。
@@ -787,7 +791,8 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 单凭据连续 API 失败会增加失败计数，达到阈值后跳过。
 - 402 / quota exhausted 会禁用该凭据并切换。
 - 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
-- 429 + suspicious activity 可触发账号级冷却并切换凭据。
+- USER/CREDIT 请求限流和 suspicious activity 429 可触发账号级冷却并切换凭据。
+- `INSUFFICIENT_MODEL_CAPACITY` 等容量类 429 不切换凭据，可配置是否在当前凭据上退避重试。
 - 400 客户端请求错误不会切换凭据。
 - 网关超时和部分不可恢复错误会快速失败，避免一次请求内无限放大重试。
 

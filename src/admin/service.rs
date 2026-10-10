@@ -16,9 +16,10 @@ use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    CredentialMetadata, KiroCredentials, credential_metadata_schema, normalize_credential_metadata_schema,
-    normalize_import_auth_method, validate_credential_metadata,
-    validate_credential_metadata_schema, validate_external_idp_endpoint,
+    CredentialMetadata, KiroCredentials, credential_metadata_schema,
+    normalize_credential_metadata_schema, normalize_import_auth_method,
+    validate_credential_metadata, validate_credential_metadata_schema,
+    validate_external_idp_endpoint,
 };
 use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
 use crate::kiro::model::requests::conversation::{
@@ -43,17 +44,18 @@ use super::types::{
     CredentialsExportResponse, CredentialsStatusResponse, CustomModelsConfigResponse, CustomModelItem,
     EnableOverageAllResult, ExportedAccount,
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    ModelApiRetryConfigResponse,
     CredentialMetadataSchemaConfig,
     CacheMeteringConfigResponse, SetCacheMeteringConfigRequest,
     SessionAffinityConfigResponse, SetSessionAffinityConfigRequest,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
-    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest,
-    SetSelfHealConfigRequest, SetCustomModelsRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse, SelfHealConfigResponse,
+    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetCustomModelsRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
+    UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -92,9 +94,10 @@ fn credential_metadata_details(
     keys.into_iter()
         .filter_map(|key| {
             let field = properties.and_then(|fields| fields.get(&key));
-            let value = values.get(&key).cloned().or_else(|| {
-                field.and_then(|schema_field| schema_field.get("default").cloned())
-            })?;
+            let value = values
+                .get(&key)
+                .cloned()
+                .or_else(|| field.and_then(|schema_field| schema_field.get("default").cloned()))?;
             let title = field
                 .and_then(|schema_field| schema_field.get("title"))
                 .and_then(serde_json::Value::as_str)
@@ -641,26 +644,23 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
-        let credential_metadata_schema = match token_manager
-            .config()
-            .credential_metadata_schema
-            .clone()
-        {
-            Some(schema) => {
-                let schema = normalize_credential_metadata_schema(schema);
-                match validate_credential_metadata_schema(&schema) {
-                    Ok(()) => schema,
-                    Err(error) => {
-                        tracing::warn!(
-                            "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
-                            error
-                        );
-                        credential_metadata_schema()
+        let credential_metadata_schema =
+            match token_manager.config().credential_metadata_schema.clone() {
+                Some(schema) => {
+                    let schema = normalize_credential_metadata_schema(schema);
+                    match validate_credential_metadata_schema(&schema) {
+                        Ok(()) => schema,
+                        Err(error) => {
+                            tracing::warn!(
+                                "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
+                                error
+                            );
+                            credential_metadata_schema()
+                        }
                     }
                 }
-            }
-            None => credential_metadata_schema(),
-        };
+                None => credential_metadata_schema(),
+            };
 
         let svc = Self {
             token_manager,
@@ -1207,15 +1207,49 @@ impl AdminService {
     /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
     pub async fn refresh_all_balances(&self) -> (usize, usize) {
         let snapshot = self.token_manager.snapshot();
+        let now_ts = Utc::now().timestamp() as f64;
+        let quota_recovery_enabled = self.token_manager.quota_reset_recovery_enabled();
+        // 优先使用凭据自身缓存的上游 nextResetAt。极少数没有本地余额缓存的
+        // QuotaExceeded 凭据，才回退使用同一计费周期中其它凭据的 reset 时间。
+        // 这让到期探测按凭据进行，不会因为一个账号到期而查询全部禁用账号。
+        // 普通 UI/读取路径仍各自执行 5 分钟 TTL 校验。
+        let quota_reset_times: HashMap<u64, Option<f64>> = {
+            let cache = self.balance_cache.lock();
+            let fallback = cache.values().find_map(|cached| cached.data.next_reset_at);
+            snapshot
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disabled && entry.disabled_reason.as_deref() == Some("QuotaExceeded")
+                })
+                .map(|entry| {
+                    let reset_at = quota_recovery_reset_at(&cache, entry.id, fallback);
+                    (entry.id, reset_at)
+                })
+                .collect()
+        };
         let mut success = 0_usize;
         let mut failure = 0_usize;
 
         for entry in snapshot.entries.into_iter() {
-            if entry.disabled {
+            let quota_recovery_probe = quota_recovery_enabled
+                && entry.disabled
+                && entry.disabled_reason.as_deref() == Some("QuotaExceeded")
+                && quota_reset_times
+                    .get(&entry.id)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|reset_at| quota_reset_is_due(Some(reset_at), now_ts));
+            if entry.disabled && !quota_recovery_probe {
                 continue;
             }
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    // 此路径只恢复此前因额度耗尽而被禁用的账号。即使超额开关
+                    // 仍为开启，也不能证明超额额度尚未耗尽；只有订阅额度在新
+                    // 计费周期恢复为正数时才重新加入调度。
+                    let quota_recovered = quota_recovery_probe && balance.remaining > 0.0;
+                    let remaining = balance.remaining;
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -1225,6 +1259,24 @@ impl AdminService {
                                 data: balance,
                             },
                         );
+                    }
+                    if quota_recovered {
+                        match self.token_manager.recover_quota_exceeded(entry.id) {
+                            Ok(true) => tracing::info!(
+                                credential_id = entry.id,
+                                remaining,
+                                "上游计费周期已重置，QuotaExceeded 凭据已恢复可用"
+                            ),
+                            Ok(false) => tracing::debug!(
+                                credential_id = entry.id,
+                                "额度恢复探测期间凭据状态已变化，跳过自动恢复"
+                            ),
+                            Err(error) => tracing::warn!(
+                                credential_id = entry.id,
+                                error = %error,
+                                "额度恢复探测确认余额可用，但恢复凭据失败"
+                            ),
+                        }
                     }
                     success += 1;
                 }
@@ -1741,10 +1793,14 @@ impl AdminService {
                     i + 1,
                 )));
             }
-            if backend_id.is_empty() || backend_id.len() > 256 || backend_id.chars().any(char::is_control) {
+            if backend_id.is_empty()
+                || backend_id.len() > 256
+                || backend_id.chars().any(char::is_control)
+            {
                 return Err(AdminServiceError::InvalidCredential(format!(
                     "第 {} 条模型（{}）的 backend_id 必须是 1-256 个非控制字符",
-                    i + 1, id,
+                    i + 1,
+                    id,
                 )));
             }
             if let Some(value) = m.context_window {
@@ -2405,7 +2461,7 @@ impl AdminService {
         Ok(self.get_session_affinity_config())
     }
 
-    /// 获取账号级风控故障转移配置
+    /// 获取账号级 429 限流故障转移配置
     pub fn get_account_throttle_config(&self) -> AccountThrottleConfigResponse {
         AccountThrottleConfigResponse {
             failover: self.token_manager.get_account_throttle_failover(),
@@ -2413,7 +2469,7 @@ impl AdminService {
         }
     }
 
-    /// 更新账号级风控故障转移配置
+    /// 更新账号级 429 限流故障转移配置
     pub fn set_account_throttle_config(
         &self,
         req: SetAccountThrottleConfigRequest,
@@ -2429,6 +2485,25 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取普通模型 API 429 自动重试配置
+    pub fn get_model_api_retry_config(&self) -> ModelApiRetryConfigResponse {
+        ModelApiRetryConfigResponse {
+            enabled: self.token_manager.get_model_api_429_retry_enabled(),
+        }
+    }
+
+    /// 更新普通模型 API 429 自动重试配置
+    pub fn set_model_api_retry_config(
+        &self,
+        req: SetModelApiRetryConfigRequest,
+    ) -> Result<ModelApiRetryConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_model_api_429_retry_enabled(req.enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_model_api_retry_config())
     }
 
     /// 获取单账号 RPM 限流配置
@@ -2453,6 +2528,29 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_rpm_limit_config())
+    }
+
+    /// 获取月度额度重置后自动恢复配置。
+    pub fn get_quota_reset_recovery_config(&self) -> QuotaResetRecoveryConfigResponse {
+        QuotaResetRecoveryConfigResponse {
+            enabled: self.token_manager.quota_reset_recovery_enabled(),
+        }
+    }
+
+    /// 更新月度额度重置后自动恢复配置。
+    pub fn set_quota_reset_recovery_config(
+        &self,
+        req: SetQuotaResetRecoveryConfigRequest,
+    ) -> Result<QuotaResetRecoveryConfigResponse, AdminServiceError> {
+        let Some(enabled) = req.enabled else {
+            return Err(AdminServiceError::InvalidCredential(
+                "必须提供 enabled 字段".to_string(),
+            ));
+        };
+        self.token_manager
+            .set_quota_reset_recovery_enabled(enabled)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(self.get_quota_reset_recovery_config())
     }
 
     /// 获取自愈治理配置
@@ -2752,16 +2850,12 @@ impl AdminService {
             }
         };
 
-        let now = Utc::now().timestamp() as f64;
         map.into_iter()
             .filter_map(|(k, v)| {
                 let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
+                // 缓存的新鲜度仍由调用方按 TTL 判断。这里保留过期条目，以便
+                // 服务重启后还能在 nextResetAt 到达时复查 QuotaExceeded 凭据。
+                Some((id, v))
             })
             .collect()
     }
@@ -3002,7 +3096,16 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
+                .update_credential(
+                    *cred_id,
+                    None,
+                    Some(Some(url)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .is_ok()
             {
                 assigned += 1;
@@ -3726,6 +3829,25 @@ impl AdminService {
     }
 }
 
+/// `nextResetAt` 是上游 Usage Limits 响应的 Unix 秒时间戳。只有到期后才对
+/// QuotaExceeded 凭据发起一次恢复探测，避免把被禁用账号持续查询上游。
+fn quota_reset_is_due(reset_at: Option<f64>, now_ts: f64) -> bool {
+    reset_at.is_some_and(|reset_at| reset_at <= now_ts)
+}
+
+/// 返回某个 QuotaExceeded 凭据的恢复检查时间。优先取它自己的
+/// `nextResetAt`；只有完全没有时才使用调用方提供的同周期备用时间。
+fn quota_recovery_reset_at(
+    cache: &HashMap<u64, CachedBalance>,
+    credential_id: u64,
+    fallback: Option<f64>,
+) -> Option<f64> {
+    cache
+        .get(&credential_id)
+        .and_then(|cached| cached.data.next_reset_at)
+        .or(fallback)
+}
+
 fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
     error
         .downcast_ref::<UpstreamRateLimitError>()
@@ -3737,6 +3859,51 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_recovery_probe_waits_for_upstream_reset_time() {
+        let balance = |next_reset_at| BalanceResponse {
+            id: 1,
+            subscription_title: None,
+            current_usage: 100.0,
+            usage_limit: 100.0,
+            remaining: 0.0,
+            usage_percentage: 100.0,
+            next_reset_at,
+            overage_enabled: Some(false),
+            overage_capable: None,
+            overage_capability_raw: None,
+        };
+
+        assert!(quota_reset_is_due(balance(Some(100.0)).next_reset_at, 100.0));
+        assert!(quota_reset_is_due(balance(Some(99.0)).next_reset_at, 100.0));
+        assert!(!quota_reset_is_due(balance(Some(101.0)).next_reset_at, 100.0));
+        assert!(!quota_reset_is_due(balance(None).next_reset_at, 100.0));
+    }
+
+    #[test]
+    fn quota_recovery_uses_own_reset_time_before_fallback() {
+        let balance = |next_reset_at| CachedBalance {
+            cached_at: 1.0,
+            data: BalanceResponse {
+                id: 1,
+                subscription_title: None,
+                current_usage: 0.0,
+                usage_limit: 100.0,
+                remaining: 100.0,
+                usage_percentage: 0.0,
+                next_reset_at,
+                overage_enabled: None,
+                overage_capable: None,
+                overage_capability_raw: None,
+            },
+        };
+        let cache = HashMap::from([(1, balance(Some(200.0))), (2, balance(Some(100.0)))]);
+
+        assert_eq!(quota_recovery_reset_at(&cache, 1, Some(100.0)), Some(200.0));
+        assert_eq!(quota_recovery_reset_at(&cache, 3, Some(100.0)), Some(100.0));
+        assert_eq!(quota_recovery_reset_at(&cache, 3, None), None);
+    }
 
     #[test]
     fn available_models_response_preserves_both_token_limits() {

@@ -126,12 +126,16 @@ impl RoundOutcome {
                 .map(CompletedToolUse::to_anthropic_block),
         );
 
+        // contextUsage 覆盖生成结束后的整个上下文（含本轮输出）。这里逐轮
+        // saturating_add 累加，不扣的话 N 轮会把输出重复放大 N 次。
+        let output_tokens = token::estimate_output_tokens(&output);
         TokenUsage {
-            uncached_input_tokens: self
-                .context_input_tokens
-                .unwrap_or(fallback_input_tokens)
-                .max(0),
-            output_tokens: token::estimate_output_tokens(&output),
+            uncached_input_tokens: token::input_tokens_excluding_output(
+                self.context_input_tokens,
+                fallback_input_tokens,
+                output_tokens,
+            ),
+            output_tokens,
             cache_read_input_tokens: 0,
             cache_write_input_tokens: 0,
         }
@@ -308,6 +312,14 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::Metadata(metadata) => {
+                    if metadata.is_content_filtered() {
+                        stream_error = Some(super::handlers::CONTENT_FILTERED_ERROR_MESSAGE.to_string());
+                    }
+                    if let Some(reason) = metadata.anthropic_stop_reason() {
+                        if reason != "end_turn" {
+                            stop_reason_override = Some(reason.to_string());
+                        }
+                    }
                     if let Some(usage) = metadata.token_usage {
                         // 单条流内重复 metadata 是快照，取最后一份。
                         provider_token_usage = Some(usage.sanitized());
@@ -471,6 +483,9 @@ async fn run_round(
             });
         }
     };
+    // `call_api_stream` 成功返回即已收到上游 HTTP response headers；在 decode_round
+    // 读取 body 前标记，确保该窗口取消时不会被 RequestTracer::Drop 误归为等头中断。
+    tracer.mark_upstream_headers_received();
     let credential_id = call_result.credential_id;
     let mut outcome = decode_round(
         call_result.response,
@@ -491,14 +506,18 @@ async fn run_round(
         return Err(RoundFailure {
             response: (
                 StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "upstream_error",
-                    "Upstream response stream ended unexpectedly during the web_search loop."
-                        .to_string(),
-                )),
+                Json(if error_message == super::handlers::CONTENT_FILTERED_ERROR_MESSAGE {
+                    ErrorResponse::new(super::handlers::CONTENT_FILTERED_ERROR_TYPE, &error_message)
+                } else {
+                    ErrorResponse::new("upstream_error", "Upstream response stream ended unexpectedly during the web_search loop.")
+                }),
             )
                 .into_response(),
-            error_type: outcome::STREAM_INTERRUPTED,
+            error_type: if error_message == super::handlers::CONTENT_FILTERED_ERROR_MESSAGE {
+                super::handlers::CONTENT_FILTERED_ERROR_TYPE
+            } else {
+                outcome::STREAM_INTERRUPTED
+            },
             error_message,
             credential_id,
             token_usage: Some(token_usage),
@@ -1152,6 +1171,7 @@ fn render_channel_sse(initial_event: SseEvent, receiver: mpsc::Receiver<Bytes>) 
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(initial.chain(updates)))
         .unwrap()
@@ -3055,16 +3075,64 @@ mod tests {
         let mut fallback_round = round_outcome("fallback output", vec![]);
         fallback_round.context_input_tokens = Some(20);
         let fallback_usage = fallback_round.resolved_token_usage(500);
-        assert_eq!(fallback_usage.uncached_input_tokens, 20);
+        // "fallback output" = 15 个西文字符 → count_tokens 得 5 个输出 token。
+        assert_eq!(fallback_usage.output_tokens, 5);
+        // context 20 - output 5 = 15。
+        assert_eq!(fallback_usage.uncached_input_tokens, 15);
         assert_eq!(fallback_usage.cache_write_input_tokens, 0);
         assert_eq!(fallback_usage.cache_read_input_tokens, 0);
         assert!(fallback_usage.output_tokens > 0);
 
         let total = provider_usage.saturating_add(fallback_usage);
-        assert_eq!(total.uncached_input_tokens, 23);
+        // provider 轮 3（精确值不扣） + fallback 轮 15 = 18
+        assert_eq!(total.uncached_input_tokens, 18);
         assert_eq!(total.output_tokens, 5 + fallback_usage.output_tokens);
         assert_eq!(total.cache_write_input_tokens, 4);
         assert_eq!(total.cache_read_input_tokens, 7);
+    }
+
+    #[test]
+    fn round_usage_without_context_usage_does_not_subtract_output() {
+        let round = round_outcome("fallback output", vec![]);
+        // round_outcome 辅助函数默认不带 contextUsage。
+        assert_eq!(round.context_input_tokens, None);
+
+        let usage = round.resolved_token_usage(500);
+        // 回退值 500 来自 count_all_tokens 的 prompt 估算，本就不含输出，原样返回。
+        assert_eq!(usage.uncached_input_tokens, 500);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn multiple_fallback_rounds_each_subtract_their_own_output() {
+        // 两轮都走 contextUsage 回退分支，输出文本相同（"fallback output"
+        // = 15 个西文字符 → count_tokens 得 5 个输出 token），contextUsage 不同。
+        let mut round_a = round_outcome("fallback output", vec![]);
+        round_a.context_input_tokens = Some(20);
+        let mut round_b = round_outcome("fallback output", vec![]);
+        round_b.context_input_tokens = Some(30);
+
+        let usage_a = round_a.resolved_token_usage(500);
+        let usage_b = round_b.resolved_token_usage(500);
+        assert_eq!(usage_a.output_tokens, 5);
+        assert_eq!(usage_b.output_tokens, 5);
+        // 逐轮扣减：20-5=15，30-5=25。
+        assert_eq!(usage_a.uncached_input_tokens, 15);
+        assert_eq!(usage_b.uncached_input_tokens, 25);
+
+        let total = usage_a.saturating_add(usage_b);
+        // 累计必须等于两轮各自 (context - output) 之和 = 15 + 25 = 40。
+        // 若实现只在累加后扣一次输出，这里会得到 (20+30) - 5 = 45；
+        // 若完全不扣，会得到 50。两种错法都会在这条断言上失败。
+        assert_eq!(
+            usage_a.uncached_input_tokens + usage_b.uncached_input_tokens,
+            40
+        );
+        assert_eq!(total.uncached_input_tokens, 40);
+        assert_eq!(total.output_tokens, 10);
+        // 这条路不做 cache 分摊，两项恒为 0。
+        assert_eq!(total.cache_write_input_tokens, 0);
+        assert_eq!(total.cache_read_input_tokens, 0);
     }
 
     #[test]

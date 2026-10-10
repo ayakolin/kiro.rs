@@ -75,6 +75,29 @@ pub struct MetadataEvent {
     /// 有些 metadataEvent 只携带 stopReason，因此 tokenUsage 必须保持可选。
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    /// Actual provider termination reason; a thinking-only reply does not imply
+    /// that the output token limit was reached.
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+}
+
+impl MetadataEvent {
+    pub fn is_content_filtered(&self) -> bool {
+        self.stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.eq_ignore_ascii_case("content_filtered"))
+    }
+
+    pub fn anthropic_stop_reason(&self) -> Option<&'static str> {
+        match self.stop_reason.as_deref()?.to_ascii_lowercase().as_str() {
+            "end_turn" => Some("end_turn"),
+            "tool_use" => Some("tool_use"),
+            "max_tokens" => Some("max_tokens"),
+            "stop_sequence" => Some("stop_sequence"),
+            "model_context_window_exceeded" => Some("model_context_window_exceeded"),
+            _ => None,
+        }
+    }
 }
 
 impl EventPayload for MetadataEvent {
@@ -86,6 +109,24 @@ impl EventPayload for MetadataEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_provider_stop_reason_without_token_usage() {
+        for (raw, mapped) in [
+            ("END_TURN", "end_turn"),
+            ("MAX_TOKENS", "max_tokens"),
+            ("TOOL_USE", "tool_use"),
+        ] {
+            let event: MetadataEvent =
+                serde_json::from_value(serde_json::json!({"stopReason":raw})).unwrap();
+            assert_eq!(event.anthropic_stop_reason(), Some(mapped));
+            assert!(!event.is_content_filtered());
+            assert!(event.token_usage.is_none());
+        }
+        let filtered: MetadataEvent = serde_json::from_value(serde_json::json!({"stopReason":"CONTENT_FILTERED","stopDetails":{"private_provider_detail":"not forwarded"}})).unwrap();
+        assert!(filtered.is_content_filtered());
+        assert_eq!(filtered.anthropic_stop_reason(), None);
+    }
 
     #[test]
     fn parses_official_token_usage_shape() {
