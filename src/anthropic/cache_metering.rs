@@ -681,6 +681,9 @@ struct PromptBlock {
     invalid_cache_control: bool,
     cacheable: bool,
     lookback_group: Option<LookbackGroup>,
+    /// 每个请求都会变化、且不参与 Anthropic 缓存键的头部块（见 [`is_volatile_system_header`]）。
+    /// 它不进哈希链、不计入缓存覆盖量，只留在 `prompt_total` 分母里，按未缓存 input 计。
+    volatile: bool,
 }
 
 /// 识别出的断点
@@ -707,6 +710,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                 invalid_cache_control: false,
                 cacheable: true,
                 lookback_group: None,
+                volatile: false,
             });
         }
     }
@@ -716,13 +720,16 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
         for sys in systems {
             let value = serde_json::to_value(sys).unwrap_or(serde_json::Value::Null);
             let content = without_cache_control(&value);
+            let volatile = is_volatile_system_header(&sys.text);
             blocks.push(PromptBlock {
                 signature: prompt_block_signature("system", None, &content),
                 tokens: estimate_tokens(&sys.text).max(0) as u32,
-                cache_control: sys.cache_control.clone(),
+                // 易变头不能当断点：即便客户端给它标了 cache_control 也忽略
+                cache_control: if volatile { None } else { sys.cache_control.clone() },
                 invalid_cache_control: false,
-                cacheable: !sys.text.trim().is_empty(),
+                cacheable: !volatile && !sys.text.trim().is_empty(),
                 lookback_group: None,
+                volatile,
             });
         }
     }
@@ -741,6 +748,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                     invalid_cache_control: false,
                     cacheable: !s.trim().is_empty(),
                     lookback_group: None,
+                    volatile: false,
                 });
             }
             serde_json::Value::Array(arr) => {
@@ -766,6 +774,7 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
                         invalid_cache_control,
                         cacheable: block_is_cacheable(&content),
                         lookback_group,
+                        volatile: false,
                     });
                 }
             }
@@ -897,20 +906,7 @@ pub async fn compute_cache_usage(
     hash_frame(&mut hasher, seed.as_bytes());
     hash_frame(&mut hasher, &request_global_cache_context(req));
 
-    let mut cum_tokens = Vec::with_capacity(blocks.len());
-    let mut cum_hashes = Vec::with_capacity(blocks.len());
-    let mut current_cum: u32 = 0;
-
-    for b in &blocks {
-        hash_frame(&mut hasher, &b.signature);
-        current_cum = current_cum.saturating_add(b.tokens);
-        cum_tokens.push(current_cum);
-
-        let digest = hasher.clone().finalize();
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&digest[..8]);
-        cum_hashes.push(u64::from_be_bytes(buf));
-    }
+    let (cum_tokens, cum_hashes) = build_prefix_chain(&blocks, hasher);
 
     // Lookup: 从每个断点向后检查最多 20 个 block，寻找此前真正写入过的最长前缀
     let mut max_read_tokens: u32 = 0;
@@ -1011,20 +1007,7 @@ pub fn compute_cache_usage_sync(
     hash_frame(&mut hasher, seed.as_bytes());
     hash_frame(&mut hasher, &request_global_cache_context(req));
 
-    let mut cum_tokens = Vec::with_capacity(blocks.len());
-    let mut cum_hashes = Vec::with_capacity(blocks.len());
-    let mut current_cum: u32 = 0;
-
-    for b in &blocks {
-        hash_frame(&mut hasher, &b.signature);
-        current_cum = current_cum.saturating_add(b.tokens);
-        cum_tokens.push(current_cum);
-
-        let digest = hasher.clone().finalize();
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&digest[..8]);
-        cum_hashes.push(u64::from_be_bytes(buf));
-    }
+    let (cum_tokens, cum_hashes) = build_prefix_chain(&blocks, hasher);
 
     let mut max_read_tokens: u32 = 0;
 
@@ -1057,6 +1040,38 @@ pub fn compute_cache_usage_sync(
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
     }
+}
+
+/// 按 tools → system → messages 顺序累积前缀哈希链，返回每个 block 处的累计 token 与累计哈希。
+/// 易变头（`volatile`）原样延续上一个位置的累计值：不进哈希、不增加覆盖 token，
+/// 但仍占一个 block 位置，保证回溯窗口与下标和 `blocks` 一一对应。
+fn build_prefix_chain(blocks: &[PromptBlock], mut hasher: sha2::Sha256) -> (Vec<u32>, Vec<u64>) {
+    use sha2::Digest;
+    let mut cum_tokens = Vec::with_capacity(blocks.len());
+    let mut cum_hashes = Vec::with_capacity(blocks.len());
+    let mut current_cum: u32 = 0;
+
+    for b in blocks {
+        if !b.volatile {
+            hash_frame(&mut hasher, &b.signature);
+            current_cum = current_cum.saturating_add(b.tokens);
+        }
+        cum_tokens.push(current_cum);
+
+        let digest = hasher.clone().finalize();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&digest[..8]);
+        cum_hashes.push(u64::from_be_bytes(buf));
+    }
+    (cum_tokens, cum_hashes)
+}
+
+/// Claude Code 的计费归因头：`x-anthropic-billing-header: cc_version=..; cc_entrypoint=..; cch=<随请求变化>;`。
+/// 它是不带 `cache_control` 的 system 首块，`cch` 在 2.1.165 上每个请求都不同（线上实测）。
+/// 若把它算进累积哈希链，其后所有断点哈希逐请求变化，整段前缀永远命中不了。官方侧如何处理
+/// 该头无从观测，这里是本地计量的取舍：把它当作逐请求变化的动态头，排除出前缀。
+fn is_volatile_system_header(text: &str) -> bool {
+    text.trim_start().starts_with("x-anthropic-billing-header:")
 }
 
 /// 生成会话隔离种子，作为前缀哈希链的最前置输入。
@@ -1626,6 +1641,104 @@ mod tests {
         compute_cache_usage_sync(&fresh, &turn1, 1);
         let mut changed = turn2;
         changed.messages[0].content = serde_json::Value::String(format!("{u1_text}!"));
+        assert_eq!(compute_cache_usage_sync(&fresh, &changed, 1).cache_read, 0);
+    }
+
+    /// Claude Code 2.1.165（cc_entrypoint=cli）实测：`system[0]` 是不带 cache_control 的
+    /// `x-anthropic-billing-header: ...; cch=<每个请求都不同>;`，其后的 system 块与 agent 循环
+    /// 末尾的 tool_result 才带断点。其余内容逐字节稳定。这个头若进入累积哈希链，之后每个断点
+    /// 的哈希都逐请求变化，整段前缀永远命中不了（线上 Opus 会话 cache_read 恒为 0）。
+    /// 本地模拟把它当作动态头排除出前缀，只计入未缓存的 input。
+    fn claude_code_cli_request(cch: &str, tool_rounds: usize) -> MessagesRequest {
+        use super::super::types::{CacheControl, Message, SystemMessage};
+        let ephemeral = || CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: None,
+        };
+        let mut messages = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type": "text", "text": "List the files, then say ok."}]),
+        }];
+        for i in 1..=tool_rounds {
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{
+                    "type": "tool_use", "id": format!("toolu_{i:02}"), "name": "Bash",
+                    "input": {"command": format!("ls dir{i}")}
+                }]),
+            });
+            let mut result = serde_json::json!({
+                "type": "tool_result", "tool_use_id": format!("toolu_{i:02}"),
+                "content": format!("file{i}a\nfile{i}b\n").repeat(40)
+            });
+            if i == tool_rounds {
+                result["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+            messages.push(Message {
+                role: "user".to_string(),
+                content: serde_json::json!([result]),
+            });
+        }
+        MessagesRequest {
+            model: "claude-opus-5-5".to_string(),
+            max_tokens: 64,
+            messages,
+            stream: true,
+            system: Some(vec![
+                SystemMessage {
+                    text: format!(
+                        "x-anthropic-billing-header: cc_version=2.1.165.26c; cc_entrypoint=cli; cch={cch};"
+                    ),
+                    cache_control: None,
+                },
+                SystemMessage {
+                    text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+                    cache_control: Some(ephemeral()),
+                },
+                SystemMessage {
+                    text: "Stable instructions. ".repeat(200),
+                    cache_control: Some(ephemeral()),
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn per_request_billing_header_is_excluded_from_cache_prefix() {
+        let cache = CacheMeter::new(None);
+
+        let cold = compute_cache_usage_sync(&cache, &claude_code_cli_request("2cea5", 1), 1);
+        assert_eq!(cold.cache_read, 0, "冷启动无历史可读");
+        assert!(
+            cold.prompt_total_est > cold.cache_covered_est,
+            "billing 头只计入未缓存 input：total={} covered={}",
+            cold.prompt_total_est,
+            cold.cache_covered_est
+        );
+
+        // 下一轮：cch 变了，多了一轮工具调用；上一轮末尾 tool_result 处的断点必须命中
+        let warm = compute_cache_usage_sync(&cache, &claude_code_cli_request("63cf7", 2), 1);
+        assert_eq!(
+            warm.cache_read, cold.cache_covered_est,
+            "cch 逐请求变化不应让整段前缀 miss"
+        );
+        let (input, creation, read) = warm.split_against_total(warm.prompt_total_est);
+        assert!(read > 0 && creation < read / 4, "read={read} creation={creation}");
+        assert!(input < 100, "input 只应剩 billing 头等少量未缓存内容，实际 {input}");
+
+        // 反向对照：不是 billing 头的 system[0] 变了，就是真的变了，必须 miss
+        let mut changed = claude_code_cli_request("63cf7", 2);
+        changed.system.as_mut().unwrap()[0].text = "Some other dynamic note: v2".to_string();
+        let fresh = CacheMeter::new(None);
+        let mut original = claude_code_cli_request("63cf7", 1);
+        original.system.as_mut().unwrap()[0].text = "Some other dynamic note: v1".to_string();
+        compute_cache_usage_sync(&fresh, &original, 1);
         assert_eq!(compute_cache_usage_sync(&fresh, &changed, 1).cache_read, 0);
     }
 
