@@ -744,7 +744,9 @@ fn extract_blocks(req: &MessagesRequest) -> Vec<PromptBlock> {
             (m_idx + 1 == total_messages) && msg.role == "user" && !is_tool_result;
         match &msg.content {
             serde_json::Value::String(s) => {
-                let content = serde_json::Value::String(s.clone());
+                // 字符串是单个 text block 的简写。Claude Code 会在"带断点的最后一条"与"历史消息"
+                // 之间来回切换这两种写法，必须归一化，否则上一轮写入的断点下一轮永远对不上。
+                let content = serde_json::json!({"type": "text", "text": s});
                 blocks.push(PromptBlock {
                     signature: prompt_block_signature("message", Some(&msg.role), &content),
                     tokens: estimate_tokens(s).max(0) as u32,
@@ -1514,6 +1516,76 @@ mod tests {
         );
         // 只有 User 1 和 User 2 两个断点被写入，Assistant 1 没有断点
         assert_eq!(cache.len(), 2);
+    }
+
+    /// Claude Code 2.1.x 实测（Windows/Linux、`-p` 与交互式入口一致）：携带断点的最后一条
+    /// 消息序列化为 `[{"type":"text","text":..,"cache_control":..}]`；下一轮它不再是最后一条，
+    /// 同样的内容变回 `"content": "..."` 字符串简写。两种写法在 Anthropic 侧等价，
+    /// 本地前缀哈希也必须等价，否则上一轮写入的断点永远命中不了，每轮整段历史都被算作 creation。
+    #[test]
+    fn text_shorthand_and_text_block_share_prefix_across_turns() {
+        use super::super::types::{CacheControl, Message, MessagesRequest};
+        let cache = CacheMeter::new(None);
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let u1_text = "What is prompt caching? ".repeat(50);
+        let a1_text = "Prompt caching allows reusing prefixes. ".repeat(50);
+        let u2_text = "How does it advance across turns? ".repeat(20);
+
+        let request = |messages: Vec<Message>| MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 64,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None::<CacheControl>,
+        };
+
+        // Turn 1：最后一条消息是带断点的 text block 数组
+        let turn1 = request(vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {"type": "text", "text": u1_text, "cache_control": ephemeral}
+            ]),
+        }]);
+        let res1 = compute_cache_usage_sync(&cache, &turn1, 1);
+        assert!(res1.cache_covered_est > 0);
+        assert_eq!(res1.cache_read, 0, "Turn 1 无历史可读");
+
+        // Turn 2：同一条消息退化为字符串简写，新的最后一条消息带断点
+        let turn2 = request(vec![
+            Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(u1_text.clone()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(a1_text.clone()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": u2_text, "cache_control": ephemeral}
+                ]),
+            },
+        ]);
+        let res2 = compute_cache_usage_sync(&cache, &turn2, 1);
+        assert_eq!(
+            res2.cache_read, res1.cache_covered_est,
+            "字符串简写与 text block 等价，Turn 2 必须读到 Turn 1 写入的断点"
+        );
+        assert!(res2.cache_covered_est > res2.cache_read);
+
+        // 反向对照：文本真的变了就必须 miss，归一化不能放宽成"忽略内容"
+        let fresh = CacheMeter::new(None);
+        compute_cache_usage_sync(&fresh, &turn1, 1);
+        let mut changed = turn2;
+        changed.messages[0].content = serde_json::Value::String(format!("{u1_text}!"));
+        assert_eq!(compute_cache_usage_sync(&fresh, &changed, 1).cache_read, 0);
     }
 
     #[test]
