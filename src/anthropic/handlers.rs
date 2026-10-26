@@ -1028,12 +1028,7 @@ pub async fn post_messages(
         // global Anthropic compatibility flag is disabled; the Responses adapter
         // explicitly opted into it via `thinking`/`output_config`.
         let extract_thinking =
-            (state.extract_thinking
-                || payload
-                    .output_config
-                    .as_ref()
-                    .is_some_and(OutputConfig::requests_effort))
-                && thinking_enabled;
+            (state.extract_thinking || payload.output_config.is_some()) && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {

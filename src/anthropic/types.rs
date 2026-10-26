@@ -98,8 +98,8 @@ where
 /// OutputConfig 配置
 #[derive(Debug, Clone)]
 pub struct OutputConfig {
-    /// 思考强度。未给出 `effort` 且也没有 `format` 时为 `"high"`（与历史行为一致）；
-    /// 仅带 `format` 时为空串，表示客户端没有请求 effort。
+    /// 思考强度。未给出 `effort` 时恒为 `"high"`（与历史行为一致）：
+    /// 只要请求带了 `output_config`，无论是否只带 `format`，都按 `effort: "high"` 处理。
     pub effort: String,
     /// `output_config.format`（结构化输出）。Kiro 上游没有对应字段，不会透传。
     pub format: Option<OutputFormat>,
@@ -129,11 +129,6 @@ impl OutputConfig {
     pub fn json_schema(&self) -> Option<&serde_json::Value> {
         self.format.as_ref().and_then(OutputFormat::json_schema)
     }
-
-    /// 客户端是否请求了 effort（仅带 `format` 的 output_config 不算）。
-    pub fn requests_effort(&self) -> bool {
-        self.format.is_none() || !self.effort.is_empty()
-    }
 }
 
 impl<'de> Deserialize<'de> for OutputConfig {
@@ -153,11 +148,9 @@ impl<'de> Deserialize<'de> for OutputConfig {
             .format
             .take()
             .and_then(|value| serde_json::from_value::<OutputFormat>(value).ok());
-        let effort = match (raw.effort, format.is_some()) {
-            (Some(effort), _) => effort,
-            (None, true) => String::new(),
-            (None, false) => default_effort(),
-        };
+        // 与 master 的 `#[serde(default = "default_effort")]` 等价：缺省 effort 恒为 "high",
+        // 只带 `format` 的 output_config 也不会退化成空串（否则会改变 reasoning 行为）。
+        let effort = raw.effort.unwrap_or_else(default_effort);
         Ok(Self { effort, format })
     }
 }
@@ -427,8 +420,6 @@ mod tests {
         let effort_only = output_config(serde_json::json!({"effort": "low"}));
         assert!(effort_only.format.is_none());
         assert!(effort_only.json_schema().is_none());
-        assert!(effort_only.requests_effort());
-        assert!(output_config(serde_json::json!({})).requests_effort());
     }
 
     #[test]
@@ -440,15 +431,18 @@ mod tests {
         }));
         assert_eq!(config.effort, "low");
         assert_eq!(config.json_schema(), Some(&schema));
-        assert!(config.requests_effort());
 
-        // 仅 format：不算请求了 effort。
+        // 仅 format：effort 仍按 master 的默认值走 "high"。
         let format_only = output_config(serde_json::json!({
             "format": {"type": "json_schema", "schema": schema}
         }));
-        assert_eq!(format_only.effort, "");
-        assert!(!format_only.requests_effort());
+        assert_eq!(format_only.effort, "high");
         assert_eq!(format_only.json_schema(), Some(&schema));
+        // 未知字段（如只有 format 的真实请求）同样落到默认 effort。
+        assert_eq!(
+            output_config(serde_json::json!({"unknown": 1})).effort,
+            "high"
+        );
     }
 
     #[test]

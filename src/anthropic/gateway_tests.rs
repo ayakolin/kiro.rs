@@ -801,8 +801,20 @@ async fn goal_request(
     thinking: bool,
     output_config: Option<serde_json::Value>,
 ) -> Response {
+    goal_request_for_model(state, "claude-haiku-5-5", endpoint, streaming, thinking, output_config)
+        .await
+}
+
+async fn goal_request_for_model(
+    state: AppState,
+    model: &str,
+    endpoint: &str,
+    streaming: bool,
+    thinking: bool,
+    output_config: Option<serde_json::Value>,
+) -> Response {
     let mut req = json!({
-        "model": "claude-haiku-5-5",
+        "model": model,
         "max_tokens": 256,
         "stream": streaming,
         "system": "You judge whether a goal condition is met.",
@@ -1058,6 +1070,117 @@ async fn structured_output_injects_system_prompt_only_when_format_is_set_and_nev
     let mut effort_only = sent["effort_only"].clone();
     strip_instruction(&mut effort_only, &marker);
     assert_eq!(effort_and_format, effort_only, "effort must keep working next to format");
+}
+
+/// master 语义：只要请求带了 `output_config`（哪怕只有 `format`），effort 默认为 `"high"`
+/// 且非流式会提取 thinking 块。结构化输出改造不能改变这一点。
+#[tokio::test]
+async fn structured_output_format_only_keeps_master_effort_default() {
+    // 选一个 master 会下发 additionalModelRequestFields 的模型：claude-sonnet-4.6
+    // （model_supports_native_reasoning 命中，且非 opus 4.6 的 adaptive-only 限制）。
+    for thinking in [false, true] {
+        let mut sent = HashMap::new();
+        for (name, output_config) in [
+            ("format_only", Some(goal_output_config())),
+            ("no_output_config", None),
+            ("empty_object", Some(json!({}))),
+            ("explicit_high", Some(json!({"effort": "high"}))),
+            ("explicit_low", Some(json!({"effort": "low"}))),
+        ] {
+            let f = fixture(Mode::Reply(PURE_JSON)).await;
+            let response = goal_request_for_model(
+                f.state.clone(),
+                "claude-sonnet-4.6",
+                "messages",
+                false,
+                thinking,
+                output_config,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{name}/{thinking}");
+            let _ = body_string(response).await;
+            let bodies = f.bodies.lock();
+            assert_eq!(bodies.len(), 1, "{name}/{thinking}");
+            sent.insert(name, bodies[0].clone());
+        }
+
+        let extra = |name: &str| {
+            sent[name]
+                .get("additionalModelRequestFields")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        // format-only 与 master 的「空的 / 显式 high 的 output_config」完全一致。
+        assert_eq!(extra("format_only"), json!({"output_config": {"effort": "high"}}), "thinking={thinking}");
+        assert_eq!(extra("format_only"), extra("empty_object"), "thinking={thinking}");
+        assert_eq!(extra("format_only"), extra("explicit_high"), "thinking={thinking}");
+        // 不带 output_config 时不带 reasoning 字段（master 同；thinking 启用时由 budget 推导）。
+        if !thinking {
+            assert_eq!(extra("no_output_config"), serde_json::Value::Null);
+        }
+        // 显式 effort 仍然照旧优先。
+        assert_eq!(extra("explicit_low"), json!({"output_config": {"effort": "low"}}), "thinking={thinking}");
+
+        // format 绝不下发；注入的 system 指令是唯一差别。
+        let format_only = sent["format_only"].to_string();
+        assert!(!format_only.to_lowercase().contains("format"), "{format_only}");
+        assert!(!format_only.to_lowercase().contains("json_schema"), "{format_only}");
+        let marker = super::structured_output::system_instruction(&goal_schema());
+        let mut with_format = sent["format_only"].clone();
+        strip_instruction(&mut with_format, &marker);
+        let mut without = sent["explicit_high"].clone();
+        strip_instruction(&mut without, &marker);
+        assert_eq!(with_format, without, "thinking={thinking}");
+    }
+}
+
+/// 非流式 + state.extract_thinking=false + thinking enabled + 只有 format 的 output_config：
+/// 与 master 下 `output_config:{effort:"high"}` 的表现一致——因 payload 带 output_config，
+/// thinking 仍作为独立内容块返回，其后的 JSON 文本块再被提取改写。
+#[tokio::test]
+async fn structured_output_format_only_extracts_thinking_like_master() {
+    let f = fixture(Mode::ReplyWithReasoning(OPENING_CONDITION)).await;
+    let mut state = f.state.clone();
+    state.extract_thinking = false;
+
+    let mut thinking = HashMap::new();
+    for (name, output_config, bare_json) in [
+        ("format_only", Some(goal_output_config()), true),
+        ("explicit_high", Some(json!({"effort": "high"})), false),
+    ] {
+        let response = goal_request(state.clone(), "messages", false, true, output_config).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        let content = body["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "{name}: {body}");
+        assert_eq!(content[0]["type"], "thinking", "{name}: {body}");
+        assert_eq!(content[0]["thinking"], "Let me think about the goal.", "{name}");
+        assert_eq!(content[1]["type"], "text", "{name}: {body}");
+        if bare_json {
+            // format 存在：text 块被改写为纯 JSON。
+            assert_goal_json(
+                content[1]["text"].as_str().unwrap(),
+                json!({"ok": false, "reason": "file missing"}),
+            );
+        } else {
+            assert_eq!(
+                content[1]["text"],
+                OPENING_CONDITION.concat(),
+                "没有 format 时不改写回复"
+            );
+        }
+        thinking.insert(name, content[0].clone());
+    }
+    // 两种 output_config 的 thinking 块完全相同：format 不影响 reasoning 行为。
+    assert_eq!(thinking["format_only"], thinking["explicit_high"]);
+
+    // 对照组：extract_thinking=false 且无 output_config 时不拆 thinking 块（master 同）。
+    let f = fixture(Mode::ReplyWithReasoning(OPENING_CONDITION)).await;
+    let mut state = f.state.clone();
+    state.extract_thinking = false;
+    let response = goal_request(state, "messages", false, true, None).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["content"], json!([{"type": "text", "text": OPENING_CONDITION.concat()}]));
 }
 
 #[tokio::test]
