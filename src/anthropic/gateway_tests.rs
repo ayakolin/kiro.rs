@@ -63,6 +63,10 @@ enum Mode {
     RefusedWithInvalidTool,
     RefusedWithEmptyTool,
     RefusedBare,
+    /// 上游按给定片段依次返回 assistantResponseEvent，随后 metadataEvent（用量 13/17）。
+    Reply(&'static [&'static str]),
+    /// 同 `Reply`，但先返回一段原生 reasoning。
+    ReplyWithReasoning(&'static [&'static str]),
 }
 
 struct Fixture {
@@ -70,6 +74,8 @@ struct Fixture {
     calls: Arc<AtomicUsize>,
     connections: Arc<Mutex<HashSet<SocketAddr>>>,
     close_headers: Arc<AtomicUsize>,
+    /// 上游收到的 Kiro 请求体（JSON）。
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -136,12 +142,16 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     let calls = Arc::new(AtomicUsize::new(0));
     let connections = Arc::new(Mutex::new(HashSet::new()));
     let close_headers = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen_bodies = bodies.clone();
     let (seen_calls, seen_connections, seen_close) =
         (calls.clone(), connections.clone(), close_headers.clone());
-    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap| {
+    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes| {
         let (calls, connections, close) = (seen_calls.clone(), seen_connections.clone(), seen_close.clone());
+        let seen_bodies = seen_bodies.clone();
         async move {
             calls.fetch_add(1, Ordering::Relaxed);
+            if let Ok(value) = serde_json::from_slice(&body) { seen_bodies.lock().push(value); }
             connections.lock().insert(peer);
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
             if matches!(mode, Mode::Overloaded) {
@@ -160,6 +170,15 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 ] { bytes.extend_from_slice(&part); }
                 let chunks: Vec<_> = bytes.chunks(7).map(Bytes::copy_from_slice).collect();
                 return Response::new(Body::from_stream(stream::iter(chunks.into_iter().map(Ok::<_, Infallible>))));
+            }
+            if let Mode::Reply(pieces) | Mode::ReplyWithReasoning(pieces) = mode {
+                let mut bytes = Vec::new();
+                if matches!(mode, Mode::ReplyWithReasoning(_)) {
+                    bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"text":"Let me think about the goal."})));
+                }
+                for piece in pieces { bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content": piece}))); }
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                return Response::new(Body::from(bytes));
             }
             if matches!(mode, Mode::Large) {
                 let frames = (0..18000).map(|_| frame("assistantResponseEvent", json!({"content": "x".repeat(1024)})));
@@ -249,6 +268,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
         calls,
         connections,
         close_headers,
+        bodies,
         task,
     }
 }
@@ -730,4 +750,352 @@ async fn gateway_latency_measurement() {
             f.calls.load(Ordering::Relaxed)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// output_config.format = json_schema（Claude Code goal check 形态）
+// ---------------------------------------------------------------------------
+
+const OPENING_CONDITION: &[&str] = &[
+    "The condition is not met yet. ",
+    "{\"ok\":false,",
+    "\"reason\":\"file missing\"}",
+];
+const OPENING_CHECKING: &[&str] = &[
+    "I'm checking the repository state.\n\n",
+    "{\"ok\":true,\"reason\":\"all tests pass\",\"impossible\":false}",
+];
+const OPENING_CORE: &[&str] = &[
+    "The core con",
+    "dition holds.\n```json\n{\"ok\":true,",
+    "\"reason\":\"done\"}\n```\nDone.",
+];
+const PURE_JSON: &[&str] = &["{\"ok\":true,", "\"reason\":\"fine\"}"];
+const NO_JSON: &[&str] = &["I'm checking the files, ", "nothing to report {yet}."];
+const NONCONFORMING_THEN_OK: &[&str] = &[
+    "First attempt: {\"ok\":\"yes\",\"reason\":1} then ",
+    "{\"ok\":false,\"reason\":\"second\"} and {\"ok\":true,\"reason\":\"third\"}",
+];
+
+fn goal_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "impossible": {"type": "boolean"}
+        },
+        "required": ["ok", "reason"],
+        "additionalProperties": false
+    })
+}
+
+fn goal_output_config() -> serde_json::Value {
+    json!({"format": {"type": "json_schema", "schema": goal_schema()}})
+}
+
+async fn goal_request(
+    state: AppState,
+    endpoint: &str,
+    streaming: bool,
+    thinking: bool,
+    output_config: Option<serde_json::Value>,
+) -> Response {
+    let mut req = json!({
+        "model": "claude-haiku-5-5",
+        "max_tokens": 256,
+        "stream": streaming,
+        "system": "You judge whether a goal condition is met.",
+        "messages": [{"role": "user", "content": "Is the goal done?"}],
+    });
+    if let Some(output_config) = output_config {
+        req["output_config"] = output_config;
+    }
+    if thinking {
+        req["thinking"] = json!({"type": "enabled", "budget_tokens": 2000});
+    }
+    let payload = Json(serde_json::from_value(req).unwrap());
+    if endpoint == "cc" {
+        post_messages_cc(axum::extract::State(state), Extension(key()), payload).await
+    } else {
+        post_messages(axum::extract::State(state), Extension(key()), payload).await
+    }
+}
+
+async fn body_string(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn parse_sse(body: &str) -> Vec<(String, serde_json::Value)> {
+    body.split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| {
+            let event = block
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))
+                .unwrap()
+                .to_owned();
+            let data = block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            (event, serde_json::from_str(data).unwrap())
+        })
+        .collect()
+}
+
+/// 非 ping 事件的 (event, index) 序列；用于断言块结构。
+fn sse_shape(events: &[(String, serde_json::Value)]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|(event, _)| event != "ping")
+        .map(|(event, data)| match data.get("index") {
+            Some(index) => format!("{event}#{index}"),
+            None => event.clone(),
+        })
+        .collect()
+}
+
+fn sse_text(events: &[(String, serde_json::Value)]) -> String {
+    events
+        .iter()
+        .filter(|(event, data)| event == "content_block_delta" && data["delta"]["type"] == "text_delta")
+        .map(|(_, data)| data["delta"]["text"].as_str().unwrap())
+        .collect()
+}
+
+fn assert_goal_json(text: &str, expected: serde_json::Value) {
+    assert!(text.starts_with('{') && text.ends_with('}'), "not a bare JSON value: {text}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap(), expected);
+}
+
+fn goal_cases() -> Vec<(&'static [&'static str], serde_json::Value)> {
+    vec![
+        (OPENING_CONDITION, json!({"ok": false, "reason": "file missing"})),
+        (OPENING_CHECKING, json!({"ok": true, "reason": "all tests pass", "impossible": false})),
+        (OPENING_CORE, json!({"ok": true, "reason": "done"})),
+        (PURE_JSON, json!({"ok": true, "reason": "fine"})),
+        (NONCONFORMING_THEN_OK, json!({"ok": false, "reason": "second"})),
+    ]
+}
+
+#[tokio::test]
+async fn structured_output_non_stream_extracts_json_from_prose() {
+    for endpoint in ["messages", "cc"] {
+        for (reply, expected) in goal_cases() {
+            let f = fixture(Mode::Reply(reply)).await;
+            let response = goal_request(f.state.clone(), endpoint, false, false, Some(goal_output_config())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+            let content = body["content"].as_array().unwrap();
+            assert_eq!(content.len(), 1, "{endpoint}: {body}");
+            assert_eq!(content[0]["type"], "text");
+            assert_goal_json(content[0]["text"].as_str().unwrap(), expected);
+            assert_eq!(body["type"], "message");
+            assert!(body["id"].as_str().unwrap().starts_with("msg_"));
+            assert_eq!(body["model"], "claude-haiku-5-5");
+            assert_eq!(body["stop_reason"], "end_turn");
+            assert_eq!(body["usage"]["output_tokens"], 17);
+        }
+    }
+}
+
+#[tokio::test]
+async fn structured_output_stream_emits_one_compliant_json_text_block() {
+    for endpoint in ["messages", "cc"] {
+        for (reply, expected) in goal_cases() {
+            let f = fixture(Mode::Reply(reply)).await;
+            let response = goal_request(f.state.clone(), endpoint, true, false, Some(goal_output_config())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let events = parse_sse(&body_string(response).await);
+            assert_eq!(
+                sse_shape(&events),
+                [
+                    "message_start",
+                    "content_block_start#0",
+                    "content_block_delta#0",
+                    "content_block_stop#0",
+                    "message_delta",
+                    "message_stop"
+                ],
+                "{endpoint}: {events:?}"
+            );
+            assert_eq!(events[0].1["message"]["model"], "claude-haiku-5-5");
+            assert!(events[0].1["message"]["id"].as_str().unwrap().starts_with("msg_"));
+            assert_eq!(events[1].1["content_block"]["type"], "text");
+            assert_goal_json(&sse_text(&events), expected);
+            let delta = &events.iter().find(|(event, _)| event == "message_delta").unwrap().1;
+            assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+            assert_eq!(delta["usage"]["output_tokens"], 17);
+        }
+    }
+}
+
+#[tokio::test]
+async fn structured_output_without_conforming_json_is_returned_unchanged() {
+    let original: String = NO_JSON.concat();
+    let f = fixture(Mode::Reply(NO_JSON)).await;
+    let response = goal_request(f.state.clone(), "messages", false, false, Some(goal_output_config())).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["content"], json!([{"type": "text", "text": original}]));
+    assert_eq!(body["stop_reason"], "end_turn");
+
+    let response = goal_request(f.state.clone(), "messages", true, false, Some(goal_output_config())).await;
+    let events = parse_sse(&body_string(response).await);
+    assert_eq!(sse_text(&events), original);
+    let shape = sse_shape(&events);
+    assert_eq!(shape.first().map(String::as_str), Some("message_start"));
+    assert_eq!(shape.last().map(String::as_str), Some("message_stop"));
+    assert!(shape.contains(&"message_delta".to_owned()));
+
+    // 只有不符合 schema 的 JSON 同样原样返回。
+    let f = fixture(Mode::Reply(&["{\"ok\":\"yes\"} and {\"reason\":2}"])).await;
+    let response = goal_request(f.state.clone(), "messages", false, false, Some(goal_output_config())).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    assert_eq!(body["content"][0]["text"], "{\"ok\":\"yes\"} and {\"reason\":2}");
+}
+
+#[tokio::test]
+async fn structured_output_keeps_thinking_blocks_before_json_text() {
+    let f = fixture(Mode::ReplyWithReasoning(OPENING_CONDITION)).await;
+    // 非流式默认不返回 thinking 块；开启 extract_thinking 后才有。
+    let mut state = f.state.clone();
+    state.extract_thinking = true;
+    let response = goal_request(state, "messages", false, true, Some(goal_output_config())).await;
+    let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+    let content = body["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{body}");
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "Let me think about the goal.");
+    assert_eq!(content[1]["type"], "text");
+    assert_goal_json(content[1]["text"].as_str().unwrap(), json!({"ok": false, "reason": "file missing"}));
+
+    let response = goal_request(f.state.clone(), "messages", true, true, Some(goal_output_config())).await;
+    let events = parse_sse(&body_string(response).await);
+    assert_eq!(
+        sse_shape(&events),
+        [
+            "message_start",
+            "content_block_start#0",
+            "content_block_delta#0",
+            "content_block_delta#0",
+            "content_block_delta#0",
+            "content_block_stop#0",
+            "content_block_start#1",
+            "content_block_delta#1",
+            "content_block_stop#1",
+            "message_delta",
+            "message_stop"
+        ],
+        "{events:?}"
+    );
+    assert_eq!(events[1].1["content_block"]["type"], "thinking");
+    assert_eq!(events[6].1["content_block"]["type"], "text");
+    assert_goal_json(&sse_text(&events), json!({"ok": false, "reason": "file missing"}));
+}
+
+/// 去掉注入的指令、忽略空行与随机会话 id 后，便于比较“除注入外完全一致”。
+fn strip_instruction(value: &mut serde_json::Value, instruction: &str) {
+    match value {
+        serde_json::Value::String(text) => {
+            let stripped = text.replace(instruction, "");
+            *text = stripped.split('\n').filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n");
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| strip_instruction(v, instruction)),
+        serde_json::Value::Object(map) => {
+            // 每次请求都会随机生成的会话 id。
+            for key in ["conversationId", "agentContinuationId"] {
+                if let Some(id) = map.get_mut(key) { *id = json!("<id>"); }
+            }
+            map.values_mut().for_each(|v| strip_instruction(v, instruction));
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn structured_output_injects_system_prompt_only_when_format_is_set_and_never_forwards_it() {
+    let marker = super::structured_output::system_instruction(&goal_schema());
+    let marker_line = marker.lines().next().unwrap().to_owned();
+    let cases = [
+        ("none", None),
+        ("effort_only", Some(json!({"effort": "low"}))),
+        ("format_only", Some(goal_output_config())),
+        ("effort_and_format", Some(json!({"effort": "low", "format": goal_output_config()["format"].clone()}))),
+        ("non_json_schema_format", Some(json!({"format": {"type": "text"}}))),
+    ];
+    let mut sent = HashMap::new();
+    for (name, output_config) in cases {
+        let f = fixture(Mode::Reply(PURE_JSON)).await;
+        let response = goal_request(f.state.clone(), "messages", false, false, output_config).await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let _ = body_string(response).await;
+        let bodies = f.bodies.lock();
+        assert_eq!(bodies.len(), 1, "{name}");
+        sent.insert(name, bodies[0].clone());
+    }
+
+    for (name, body) in &sent {
+        // format / schema 不能出现在 Kiro 的额外字段里。
+        let extra = body.get("additionalModelRequestFields").map(|v| v.to_string()).unwrap_or_default();
+        assert!(!extra.contains("format") && !extra.contains("schema") && !extra.contains("json_schema"), "{name}: {extra}");
+    }
+    assert!(!sent["none"].to_string().contains(&marker_line));
+    assert!(!sent["effort_only"].to_string().contains(&marker_line));
+    assert!(!sent["non_json_schema_format"].to_string().contains(&marker_line));
+    assert!(sent["format_only"].to_string().contains(&marker_line));
+    assert!(sent["effort_and_format"].to_string().contains(&marker_line));
+
+    // 除注入的指令外，请求与不带 format 的版本逐字段一致（effort 照旧下发）。
+    let mut with_format = sent["format_only"].clone();
+    strip_instruction(&mut with_format, &marker);
+    let mut without = sent["none"].clone();
+    strip_instruction(&mut without, &marker);
+    assert_eq!(with_format, without, "format-only must not change anything but the system prompt");
+    let mut effort_and_format = sent["effort_and_format"].clone();
+    strip_instruction(&mut effort_and_format, &marker);
+    let mut effort_only = sent["effort_only"].clone();
+    strip_instruction(&mut effort_only, &marker);
+    assert_eq!(effort_and_format, effort_only, "effort must keep working next to format");
+}
+
+#[tokio::test]
+async fn structured_output_is_inert_without_format() {
+    // 没有 output_config / 只有 effort / 非 json_schema 的 format：响应和流都不被改写，
+    // 即使回复里恰好含有符合某个 schema 的 JSON。
+    let original: String = OPENING_CHECKING.concat();
+    for output_config in [
+        None,
+        Some(json!({"effort": "low"})),
+        Some(json!({"format": {"type": "text"}})),
+        Some(json!({"format": {"type": "json_schema"}})),
+    ] {
+        let f = fixture(Mode::Reply(OPENING_CHECKING)).await;
+        let response = goal_request(f.state.clone(), "messages", false, false, output_config.clone()).await;
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["content"], json!([{"type": "text", "text": original}]), "{output_config:?}");
+
+        let response = goal_request(f.state.clone(), "messages", true, false, output_config.clone()).await;
+        let events = parse_sse(&body_string(response).await);
+        assert_eq!(sse_text(&events), original, "{output_config:?}");
+        // 实时转发：文本按上游片段逐段下发，而不是合并成一个 delta。
+        let deltas = events
+            .iter()
+            .filter(|(event, data)| event == "content_block_delta" && data["delta"]["type"] == "text_delta")
+            .count();
+        assert!(deltas >= 2, "{output_config:?}: text was not streamed live: {events:?}");
+    }
+}
+
+#[tokio::test]
+async fn structured_output_stream_failure_keeps_buffered_events_in_order() {
+    let f = fixture(Mode::Interrupted).await;
+    let response = goal_request(f.state.clone(), "messages", true, false, Some(goal_output_config())).await;
+    let events = parse_sse(&body_string(response).await);
+    let shape = sse_shape(&events);
+    assert_eq!(shape.first().map(String::as_str), Some("message_start"));
+    assert!(shape.contains(&"content_block_delta#0".to_owned()), "{shape:?}");
+    assert_eq!(shape.last().map(String::as_str), Some("error"), "{shape:?}");
+    assert!(!shape.contains(&"message_stop".to_owned()));
 }

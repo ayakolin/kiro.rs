@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Features
+
+- Support `output_config.format = {"type":"json_schema","schema":{...}}` on `/v1/messages` and `/cc/v1/messages`. Kiro has no native structured-output field, so the schema is appended to the system prompt and the reply is rewritten to the first schema-conforming JSON value (non-stream: single text block; stream: buffered, then one compliant text block). Replies without conforming JSON are returned unchanged with a single warning. `format` is never forwarded upstream; requests without it behave as before.
+
 ## [0.9.2] - 2026-10-18
 
 主题：**流式首字延迟与上游超时、上游域名切换、Codex / WebSearch 缓存与费用计量，以及内容过滤拒答透传**。本版汇总 `v0.9.1` 之后合并的 8 个 PR；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。
