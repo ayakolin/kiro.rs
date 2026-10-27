@@ -1625,13 +1625,12 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::Metadata(metadata) => {
-                if let Some(reason) = metadata.anthropic_stop_reason() {
-                    let reason = if reason == "end_turn" && self.state_manager.has_tool_use {
-                        "tool_use"
-                    } else {
-                        reason
-                    };
-                    self.state_manager.set_stop_reason(reason);
+                // 只补充上游报告的截断原因，不覆盖网关已确定的结束原因
+                // （refusal / 上下文溢出 / ContentLengthExceededException）。
+                if let Some(reason) = metadata.truncation_stop_reason() {
+                    if self.state_manager.stop_reason.is_none() {
+                        self.state_manager.set_stop_reason(reason);
+                    }
                 }
                 if let Some(usage) = metadata.token_usage {
                     let usage = usage.sanitized();
@@ -4592,6 +4591,48 @@ mod tests {
         let events = ctx.generate_final_events();
         let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
         assert_eq!(terminal.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    fn final_stop_reason(ctx: &mut StreamContext) -> serde_json::Value {
+        let events = ctx.generate_final_events();
+        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
+        terminal.data["delta"]["stop_reason"].clone()
+    }
+
+    #[test]
+    fn metadata_end_turn_before_tool_use_still_reports_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"END_TURN"})).unwrap(),
+        ));
+        ctx.process_kiro_event(&Event::ToolUse(tool_evt("t1", "list_apps", "{}", true)));
+        assert_eq!(final_stop_reason(&mut ctx), "tool_use");
+    }
+
+    #[test]
+    fn metadata_tool_use_without_tool_block_reports_end_turn() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_assistant_response("No tool after all.");
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"TOOL_USE"})).unwrap(),
+        ));
+        assert_eq!(final_stop_reason(&mut ctx), "end_turn");
+    }
+
+    #[test]
+    fn metadata_stop_reason_does_not_override_context_window_exceeded() {
+        let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        ctx.process_assistant_response("A partial answer");
+        ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent { context_usage_percentage: 100.0 },
+        ));
+        ctx.process_kiro_event(&Event::Metadata(
+            serde_json::from_value(json!({"stopReason":"MAX_TOKENS"})).unwrap(),
+        ));
+        assert_eq!(final_stop_reason(&mut ctx), "model_context_window_exceeded");
     }
 
     #[test]

@@ -123,12 +123,12 @@ impl MetadataEvent {
         })
     }
 
-    /// 上游 `stopReason` 映射到 Anthropic `stop_reason`；无法映射（含 CONTENT_FILTERED，
-    /// 由 `content_filter_refusal` 单独处理）时返回 `None`。只有 thinking 的回复不代表触达输出上限。
-    pub fn anthropic_stop_reason(&self) -> Option<&'static str> {
+    /// 上游 `stopReason` 中表示生成被截断的部分，映射到 Anthropic `stop_reason`。
+    /// `END_TURN` / `TOOL_USE` 返回 `None`：是否为 `tool_use` 以网关实际产出的
+    /// tool_use 块为准（工具调用可能被过滤，也可能在流末才从文本中回收）。
+    /// CONTENT_FILTERED 由 `content_filter_refusal` 单独处理。
+    pub fn truncation_stop_reason(&self) -> Option<&'static str> {
         match self.stop_reason.as_deref()?.to_ascii_lowercase().as_str() {
-            "end_turn" => Some("end_turn"),
-            "tool_use" => Some("tool_use"),
             "max_tokens" => Some("max_tokens"),
             "stop_sequence" => Some("stop_sequence"),
             "model_context_window_exceeded" => Some("model_context_window_exceeded"),
@@ -150,13 +150,15 @@ mod tests {
     #[test]
     fn parses_provider_stop_reason_without_token_usage() {
         for (raw, mapped) in [
-            ("END_TURN", "end_turn"),
-            ("MAX_TOKENS", "max_tokens"),
-            ("TOOL_USE", "tool_use"),
+            ("END_TURN", None),
+            ("TOOL_USE", None),
+            ("MAX_TOKENS", Some("max_tokens")),
+            ("STOP_SEQUENCE", Some("stop_sequence")),
+            ("MODEL_CONTEXT_WINDOW_EXCEEDED", Some("model_context_window_exceeded")),
         ] {
             let event: MetadataEvent =
                 serde_json::from_value(serde_json::json!({"stopReason":raw})).unwrap();
-            assert_eq!(event.anthropic_stop_reason(), Some(mapped));
+            assert_eq!(event.truncation_stop_reason(), mapped, "{raw}");
             assert!(event.content_filter_refusal().is_none());
             assert!(event.token_usage.is_none());
         }
@@ -165,7 +167,7 @@ mod tests {
             filtered.content_filter_refusal().as_deref(),
             Some(CONTENT_FILTERED_STOP_REASON)
         );
-        assert_eq!(filtered.anthropic_stop_reason(), None);
+        assert_eq!(filtered.truncation_stop_reason(), None);
     }
 
     #[test]
