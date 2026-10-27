@@ -540,7 +540,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 - `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`：`1_000_000`（静态模型声明最大输出为 `64_000`）
 - 其它 `gpt-5.*`：`272_000`
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5.5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-fable-5`：`1_000_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5.5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-haiku-5.5`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 ### 自定义模型
@@ -905,7 +905,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.7.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.3)。
+当前稳定版：[v0.9.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.3)。
 
 Docker 镜像：
 

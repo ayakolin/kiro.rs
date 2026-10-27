@@ -10,6 +10,49 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - Support `output_config.format = {"type":"json_schema","schema":{...}}` on `/v1/messages` and `/cc/v1/messages`. Kiro has no native structured-output field, so the schema is appended to the system prompt and the reply is rewritten to the first schema-conforming JSON value (non-stream: single text block; stream: buffered, then one compliant text block). Replies without conforming JSON are returned unchanged with a single warning. `format` is never forwarded upstream; requests without it behave as before.
 
+## [0.9.3] - 2026-10-26
+
+主题：**全局代理热更新、模型过载隔离与 Sonnet 5.5 上下文计量修复**。本版汇总 `v0.9.2` 之后合并的 3 个 PR；没有新增配置项，现有配置、凭据与请求日志无需手动迁移。
+
+### 🌐 全局代理热更新
+
+> 来源：[PR #120](https://github.com/ZyphrZero/kiro.rs/pull/120)。提交人：[@cyx0215](https://github.com/cyx0215)，感谢贡献。
+
+- 修复管理端修改全局代理后，模型生成和 MCP（WebSearch）请求仍使用启动时代理的问题；代理地址、用户名或密码的修改，以及启用、清除代理，均在下一次请求或重试时生效，无需重启服务。
+- 切换代理时释放旧全局代理的连接池缓存引用，保留缓存容量上限；已开始的响应继续完成，账号专属代理与显式直连仍优先于全局代理。
+- 热更新范围为模型生成和 MCP 请求；后台版本刷新与外部 `count_tokens` 仍使用启动时代理，修改后需要重启才能对这两条路径生效。
+
+### 🔧 模型过载仅影响当前请求
+
+> 来源：[PR #125](https://github.com/ZyphrZero/kiro.rs/pull/125)。提交人：[@childe](https://github.com/childe)，感谢贡献。
+
+- 移除跨请求的模型级冷却，修复单次上游 `MODEL_TEMPORARILY_UNAVAILABLE` 导致冷却期内同模型的其他请求未经上游便直接返回 503 的问题；后续请求正常尝试上游。
+- 保留单次请求的快速失败行为：模型过载时返回 503 `overloaded_error` 与 `Retry-After`，不在网关内连续重试三次；客户端仍应遵循 `Retry-After` 重试。
+
+### 📊 Sonnet 5.5 上下文计量
+
+> 来源：[PR #126](https://github.com/ZyphrZero/kiro.rs/pull/126)。提交人：[@d0zingcat](https://github.com/d0zingcat)，感谢贡献。
+
+- 将 `claude-sonnet-5.5` 及映射到该模型的 `claude-sonnet-5-5` 等别名纳入 1M 上下文窗口估算，修复此前回退到 200K、按上游上下文占比换算时将输入 Token 低估约 5 倍的问题。
+- 上下文进度、自动压缩判断与基于 Token 的用量统计使用修正后的估算；1M 取值来自本项目测试推断，后续以上游公布的窗口为准。
+
+### 🙏 本版 PR 贡献者
+
+| 贡献者 | 已合并 PR |
+| --- | --- |
+| [@cyx0215](https://github.com/cyx0215) | [#120](https://github.com/ZyphrZero/kiro.rs/pull/120) |
+| [@childe](https://github.com/childe) | [#125](https://github.com/ZyphrZero/kiro.rs/pull/125) |
+| [@d0zingcat](https://github.com/d0zingcat) | [#126](https://github.com/ZyphrZero/kiro.rs/pull/126) |
+
+以上按 GitHub PR 作者列出。感谢 [@childe](https://github.com/childe) 合并 PR #120、#125，以及 [@ZyphrZero](https://github.com/ZyphrZero) 合并 PR #126。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.3`，无需手动转换现有配置、凭据、客户端 Key 或日志数据库。
+- 模型级过载冷却已移除，客户端可能更快再次访问上游；请继续按服务端返回的 `Retry-After` 安排重试。
+
+完整变更：[v0.9.2...v0.9.3](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.2...v0.9.3)。
+
 ## [0.9.2] - 2026-10-18
 
 主题：**流式首字延迟与上游超时、上游域名切换、Codex / WebSearch 缓存与费用计量，以及内容过滤拒答透传**。本版汇总 `v0.9.1` 之后合并的 8 个 PR；新增配置均有默认值，现有配置、凭据与请求日志无需手动迁移。
