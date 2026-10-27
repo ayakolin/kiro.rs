@@ -1034,6 +1034,7 @@ async fn structured_output_injects_system_prompt_only_when_format_is_set_and_nev
         ("none", None),
         ("effort_only", Some(json!({"effort": "low"}))),
         ("format_only", Some(goal_output_config())),
+        ("empty_object", Some(json!({}))),
         ("effort_and_format", Some(json!({"effort": "low", "format": goal_output_config()["format"].clone()}))),
         ("non_json_schema_format", Some(json!({"format": {"type": "text"}}))),
     ];
@@ -1059,10 +1060,11 @@ async fn structured_output_injects_system_prompt_only_when_format_is_set_and_nev
     assert!(sent["format_only"].to_string().contains(&marker_line));
     assert!(sent["effort_and_format"].to_string().contains(&marker_line));
 
-    // 除注入的指令外，请求与不带 format 的版本逐字段一致（effort 照旧下发）。
+    // 除注入的指令外，只带 format 的请求与空 `output_config`（缺省 effort=high）逐字段一致。
+    // 默认模型 haiku-5.5 支持原生 reasoning（#128），带 output_config 即下发 effort。
     let mut with_format = sent["format_only"].clone();
     strip_instruction(&mut with_format, &marker);
-    let mut without = sent["none"].clone();
+    let mut without = sent["empty_object"].clone();
     strip_instruction(&mut without, &marker);
     assert_eq!(with_format, without, "format-only must not change anything but the system prompt");
     let mut effort_and_format = sent["effort_and_format"].clone();
@@ -1070,6 +1072,83 @@ async fn structured_output_injects_system_prompt_only_when_format_is_set_and_nev
     let mut effort_only = sent["effort_only"].clone();
     strip_instruction(&mut effort_only, &marker);
     assert_eq!(effort_and_format, effort_only, "effort must keep working next to format");
+}
+
+/// #128 x 结构化输出：claude-haiku-5.5 原生 reasoning 下，
+/// - 只带 format：与 `{}` / `{effort:"high"}` 一致，缺省 effort=high 下发，format 绝不下发；
+/// - format + effort：显式 effort（含 xhigh / max）原样透传；
+/// - 不带 format / output_config：不下发 additionalModelRequestFields，回复不被改写。
+#[tokio::test]
+async fn structured_output_on_haiku_5_5_keeps_native_reasoning_effort() {
+    let marker = super::structured_output::system_instruction(&goal_schema());
+    let schema_format = goal_output_config()["format"].clone();
+    let mut sent = HashMap::new();
+    for (name, output_config) in [
+        ("none", None),
+        ("empty_object", Some(json!({}))),
+        ("format_only", Some(goal_output_config())),
+        ("effort_only_max", Some(json!({"effort": "max"}))),
+        ("format_low", Some(json!({"effort": "low", "format": schema_format.clone()}))),
+        ("format_medium", Some(json!({"effort": "medium", "format": schema_format.clone()}))),
+        ("format_xhigh", Some(json!({"effort": "xhigh", "format": schema_format.clone()}))),
+        ("format_max", Some(json!({"effort": "max", "format": schema_format.clone()}))),
+    ] {
+        let f = fixture(Mode::Reply(PURE_JSON)).await;
+        let response = goal_request_for_model(
+            f.state.clone(),
+            "claude-haiku-5.5",
+            "messages",
+            false,
+            false,
+            output_config,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        let _ = body_string(response).await;
+        let bodies = f.bodies.lock();
+        assert_eq!(bodies.len(), 1, "{name}");
+        sent.insert(name, bodies[0].clone());
+    }
+    let extra = |name: &str| {
+        sent[name]
+            .get("additionalModelRequestFields")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let high = json!({"output_config": {"effort": "high"}});
+    assert_eq!(extra("none"), serde_json::Value::Null);
+    assert_eq!(extra("empty_object"), high);
+    assert_eq!(extra("format_only"), high);
+    for (name, effort) in [
+        ("effort_only_max", "max"),
+        ("format_low", "low"),
+        ("format_medium", "medium"),
+        ("format_xhigh", "xhigh"),
+        ("format_max", "max"),
+    ] {
+        assert_eq!(extra(name), json!({"output_config": {"effort": effort}}), "{name}");
+    }
+    // format / json_schema 绝不出现在上游请求的任何字段里（注入的 system 指令除外）。
+    for (name, body) in &sent {
+        let mut stripped = body.clone();
+        strip_instruction(&mut stripped, &marker);
+        let text = stripped.to_string().to_lowercase();
+        assert!(!text.contains("json_schema") && !text.contains("\"format\""), "{name}: {text}");
+    }
+    // 只带 format 与空 output_config 除注入指令外完全一致。
+    let mut a = sent["format_only"].clone();
+    strip_instruction(&mut a, &marker);
+    let mut b = sent["empty_object"].clone();
+    strip_instruction(&mut b, &marker);
+    assert_eq!(a, b);
+    // 注入仅发生在带 json_schema format 的请求上。
+    let marker_line = marker.lines().next().unwrap();
+    for name in ["none", "empty_object", "effort_only_max"] {
+        assert!(!sent[name].to_string().contains(marker_line), "{name}");
+    }
+    for name in ["format_only", "format_low", "format_medium", "format_xhigh", "format_max"] {
+        assert!(sent[name].to_string().contains(marker_line), "{name}");
+    }
 }
 
 /// master 语义：只要请求带了 `output_config`（哪怕只有 `format`），effort 默认为 `"high"`
