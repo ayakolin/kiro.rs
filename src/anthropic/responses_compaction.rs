@@ -257,6 +257,7 @@ async fn run_attempt(
         input_tokens,
         false,
         conversion.tool_name_map,
+        conversion.known_tool_names,
         hook,
         cache_usage,
         tracer,

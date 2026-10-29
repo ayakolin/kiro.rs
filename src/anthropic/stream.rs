@@ -777,10 +777,14 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
 ///
 /// `tool_name_map`（短名 → 原始名）用于把捞回的工具名还原成客户端可识别的原始名，
 /// 经统一入口 `CompletedToolUse::from_kiro`；映射为空或命中失败时按原名返回。
+/// `known_tool_names` 是捞回护栏（可被调用方过滤，如 web_search loop 剔除 `web_search`）；
+/// `declared_tool_names` 是本次请求声明的客户端工具名，只用于非法名还原
+/// （`bash -c` → `Bash`），不参与护栏判定。
 pub(crate) fn extract_invoke_content_blocks(
     text: &str,
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
+    declared_tool_names: &std::collections::HashSet<String>,
 ) -> Vec<serde_json::Value> {
     // 🛑 块级复读熔断：先把 Opus 退化的「同一 stray token 连续复读」截断，
     // 再做 invoke 嗅探。覆盖 web_search loop（99.9% 真实流量）这条非流式路径。
@@ -840,7 +844,13 @@ pub(crate) fn extract_invoke_content_blocks(
                 serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({}));
             // 统一还原（名字 + 入参）并统一拼块，与结构化 / websearch 路径同口径。
             let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
-            let completed = CompletedToolUse::from_kiro(tool_use_id, &name, input, tool_name_map);
+            let completed = CompletedToolUse::from_kiro(
+                tool_use_id,
+                &name,
+                input,
+                tool_name_map,
+                declared_tool_names,
+            );
             blocks.push(completed.to_anthropic_block());
         } else {
             // 不捞（句中 / 围栏内 / 工具名未知 / 解析失败）→ 整块（含 before）当文本，推进围栏。
@@ -874,9 +884,14 @@ impl CompletedToolUse {
         kiro_name: &str,
         input: serde_json::Value,
         tool_name_map: &HashMap<String, String>,
+        declared_tool_names: &std::collections::HashSet<String>,
     ) -> Self {
-        let (name, input) =
-            super::converter::restore_tool_use_for_client(kiro_name, input, tool_name_map);
+        let (name, input) = super::converter::restore_tool_use_for_client(
+            kiro_name,
+            input,
+            tool_name_map,
+            declared_tool_names,
+        );
         Self { id, name, input }
     }
 
@@ -974,11 +989,13 @@ impl ToolJsonAccumulator {
     /// - 未收到 `stop` 时返回 `Ok(None)`（继续缓冲，不发出任何事件）。
     /// - 收到 `stop` 时把累积的 JSON 整体解析：成功返回 `Ok(Some(CompletedToolUse))`，
     ///   失败返回 `Err(InvalidJson)`。空参数按 `{}` 处理。
-    /// - 工具名按 `tool_name_map` 还原为客户端原始名（短名 → 原名）。
+    /// - 工具名走 `converter::restore_tool_use_for_client` 的统一规则：已知名还原为客户端
+    ///   原始名（短名 → 原名），非法/未知名按声明表捞回或确定性清洗。
     pub fn push(
         &mut self,
         tool_use: &crate::kiro::model::events::ToolUseEvent,
         tool_name_map: &HashMap<String, String>,
+        declared_tool_names: &std::collections::HashSet<String>,
     ) -> Result<Option<CompletedToolUse>, ToolJsonAccumulatorError> {
         let entry = self
             .buffers
@@ -1015,6 +1032,7 @@ impl ToolJsonAccumulator {
             &kiro_name,
             input,
             tool_name_map,
+            declared_tool_names,
         )))
     }
 
@@ -1390,6 +1408,9 @@ pub struct StreamContext {
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
+    /// 本次请求声明的客户端工具名（与 `known_tool_names` 同一份集合，语义不同：
+    /// 这里用于把 Kiro 回吐的非法工具名（`bash -c`）还原成声明的 `Bash`）。
+    pub declared_tool_names: std::collections::HashSet<String>,
     /// 本次请求声明的所有工具名（原始 client 名）。`<invoke>` 文本容错的灾难兜底：
     /// 只有合成名在此集合里才允许捞回成结构化 tool_use，否则当文本吐出。
     /// 为空（请求未带 tools）时不捞回任何 invoke——宁可漏捞，不可误执行。
@@ -1488,6 +1509,9 @@ impl StreamContext {
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
+        // 声明名集合与 `known_tool_names` 同源（后者 = 声明名 + 超长名缩短后的短名，
+        // 两者都是客户端可识别的名字），故由它派生，避免多一份构造参数。
+        let declared_tool_names = known_tool_names.clone();
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
@@ -1499,6 +1523,7 @@ impl StreamContext {
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
+            declared_tool_names,
             code_fence_open: false,
             fence_scan_partial: String::new(),
             thinking_enabled,
@@ -1917,6 +1942,7 @@ impl StreamContext {
                                     &name,
                                     input,
                                     &self.tool_name_map,
+                                    &self.declared_tool_names,
                                 );
                                 events.extend(self.emit_completed_tool_use(completed));
                             } else {
@@ -2421,10 +2447,11 @@ impl StreamContext {
         // 通过累积器缓冲工具参数 JSON 分片：只有收到 stop=true 且解析成功时才
         // 发出完整的工具调用；半截 / 非法 JSON 记为错误，交由收尾（generate_final_events）
         // 统一补发 error 事件，避免把无法解析的参数当成完整调用转发给客户端。
-        let completed = match self
-            .tool_json_accumulator
-            .push(tool_use, &self.tool_name_map)
-        {
+        let completed = match self.tool_json_accumulator.push(
+            tool_use,
+            &self.tool_name_map,
+            &self.declared_tool_names,
+        ) {
             Ok(Some(completed)) => completed,
             Ok(None) => return events,
             Err(e) => {
@@ -2771,17 +2798,29 @@ mod tests {
         // 用非内置工具名，专注验证分片重组本身（内置名的双向映射另有专项测试）。
         // JSON 被切成三片（切在 token 中间），只有最后一片带 stop。
         assert!(
-            acc.push(&tool_evt("t1", "custom_tool", "{\"pa", false), &map)
-                .unwrap()
-                .is_none()
+            acc.push(
+                &tool_evt("t1", "custom_tool", "{\"pa", false),
+                &map,
+                &no_declared(),
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            acc.push(&tool_evt("t1", "custom_tool", "th\":\"/a", false), &map)
-                .unwrap()
-                .is_none()
+            acc.push(
+                &tool_evt("t1", "custom_tool", "th\":\"/a", false),
+                &map,
+                &no_declared(),
+            )
+            .unwrap()
+            .is_none()
         );
         let completed = acc
-            .push(&tool_evt("t1", "custom_tool", ".txt\"}", true), &map)
+            .push(
+                &tool_evt("t1", "custom_tool", ".txt\"}", true),
+                &map,
+                &no_declared(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(completed.id, "t1");
@@ -2793,7 +2832,11 @@ mod tests {
     fn tool_json_accumulator_empty_input_is_empty_object() {
         let mut acc = ToolJsonAccumulator::new();
         let completed = acc
-            .push(&tool_evt("t1", "noop", "", true), &HashMap::new())
+            .push(
+                &tool_evt("t1", "noop", "", true),
+                &HashMap::new(),
+                &no_declared(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(completed.input, serde_json::json!({}));
@@ -2806,6 +2849,7 @@ mod tests {
             .push(
                 &tool_evt("t1", "read_file", "{not json", true),
                 &HashMap::new(),
+                &no_declared(),
             )
             .unwrap_err();
         assert_eq!(err.error_type(), "upstream_tool_json_error");
@@ -2819,7 +2863,8 @@ mod tests {
         assert!(
             acc.push(
                 &tool_evt("t1", "read_file", "{\"path\":\"/a", false),
-                &HashMap::new()
+                &HashMap::new(),
+                &no_declared(),
             )
             .unwrap()
             .is_none()
@@ -2873,7 +2918,11 @@ mod tests {
             "the_original_very_long_tool_name".to_string(),
         );
         let completed = acc
-            .push(&tool_evt("t1", "short_abc123", "{}", true), &map)
+            .push(
+                &tool_evt("t1", "short_abc123", "{}", true),
+                &map,
+                &no_declared(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(completed.name, "the_original_very_long_tool_name");
@@ -3003,6 +3052,11 @@ mod tests {
 
     /// 测试用的「已知工具表」：包含 invoke 测试里会合成的工具名，
     /// 让 🅳 工具表校验放行这些名字，从而能验证捞回逻辑本身。
+    /// 空声明表：多数测试只关心名字映射，不涉及非法名还原。
+    fn no_declared() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     fn test_known_tools() -> std::collections::HashSet<String> {
         [
             "exec_command",
@@ -3026,6 +3080,7 @@ mod tests {
             text,
             &test_known_tools(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let tu = blocks
             .iter()
@@ -3061,7 +3116,7 @@ mod tests {
         known.insert(short.to_string());
         let mut map = std::collections::HashMap::new();
         map.insert(short.to_string(), original.to_string());
-        let blocks = extract_invoke_content_blocks(&text, &known, &map);
+        let blocks = extract_invoke_content_blocks(&text, &known, &map, &known);
         let tu = blocks
             .iter()
             .find(|b| b["type"] == "tool_use")
@@ -3080,6 +3135,7 @@ mod tests {
             fenced,
             &test_known_tools(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         assert!(
             !b1.iter().any(|b| b["type"] == "tool_use"),
@@ -3091,6 +3147,7 @@ mod tests {
             unknown,
             &test_known_tools(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         assert!(
             !b2.iter().any(|b| b["type"] == "tool_use"),
@@ -3104,6 +3161,7 @@ mod tests {
             "just a normal answer with no tool calls",
             &test_known_tools(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "text");
@@ -5075,6 +5133,7 @@ mod tests {
             &text,
             &test_known_tools(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let joined: String = blocks
             .iter()
@@ -5098,6 +5157,7 @@ mod tests {
             text,
             &test_known_tools(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         assert!(
             blocks
@@ -5516,5 +5576,200 @@ mod tests {
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
+    }
+}
+
+#[cfg(test)]
+mod illegal_tool_name_tests {
+    use super::*;
+
+    fn declared(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn tool_evt(
+        id: &str,
+        name: &str,
+        input: &str,
+        stop: bool,
+    ) -> crate::kiro::model::events::ToolUseEvent {
+        crate::kiro::model::events::ToolUseEvent {
+            name: name.to_string(),
+            tool_use_id: id.to_string(),
+            input: input.to_string(),
+            stop,
+        }
+    }
+
+    /// 响应方向（非流式块）：`bash -c` + 声明 Bash → `Bash`，入参 command 保留。
+    #[test]
+    fn non_stream_block_restores_illegal_name_to_declared() {
+        let mut acc = ToolJsonAccumulator::new();
+        let completed = acc
+            .push(
+                &tool_evt("toolu_x", "bash -c", r#"{"command":"echo hi"}"#, true),
+                &HashMap::new(),
+                &declared(&["Bash"]),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.name, "Bash");
+        assert_eq!(completed.input["command"], "echo hi");
+
+        let block = completed.to_anthropic_block();
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["name"], "Bash");
+        assert_eq!(block["input"]["command"], "echo hi");
+    }
+
+    /// 响应方向（流式 SSE）：content_block_start 的 name 必须是 Bash。
+    #[test]
+    fn streaming_content_block_start_uses_declared_name() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            declared(&["Bash"]),
+        );
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "toolu_x",
+            "bash -c",
+            r#"{"command":"echo hi"}"#,
+            true,
+        )));
+
+        let start = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("应有 tool_use content_block_start");
+        assert_eq!(start.data["content_block"]["name"], "Bash");
+        assert_eq!(start.data["content_block"]["id"], "toolu_x");
+
+        let delta = events
+            .iter()
+            .find(|e| e.event == "content_block_delta")
+            .expect("应有 input_json_delta");
+        let partial = delta.data["delta"]["partial_json"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(partial).unwrap();
+        assert_eq!(parsed["command"], "echo hi", "command 入参必须保留");
+    }
+
+    /// 流式路径：ClaudeCode 模式（map 有 execute_bash→Bash，声明表也可能为空）
+    /// 也能把 `bash -c` 还原成 Bash。
+    #[test]
+    fn streaming_restores_illegal_name_via_kiro_side_map() {
+        let mut map = HashMap::new();
+        map.insert("execute_bash".to_string(), "Bash".to_string());
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            map,
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "toolu_y",
+            "bash -c",
+            r#"{"command":"ls"}"#,
+            true,
+        )));
+        let start = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("应有 tool_use content_block_start");
+        assert_eq!(start.data["content_block"]["name"], "Bash");
+    }
+
+    /// 无法匹配的非法名：两条路径都清洗成同一个合法名。
+    #[test]
+    fn unmatched_illegal_name_is_sanitized_on_both_paths() {
+        let d = declared(&["Bash"]);
+
+        // 非流式块
+        let mut acc = ToolJsonAccumulator::new();
+        let completed = acc
+            .push(
+                &tool_evt("toolu_z", "foo bar!", r#"{"a":1}"#, true),
+                &HashMap::new(),
+                &d,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.name, "foo_bar");
+        assert!(super::super::converter::is_legal_tool_name(&completed.name));
+
+        // 流式
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new(), d.clone());
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "toolu_z",
+            "foo bar!",
+            r#"{"a":1}"#,
+            true,
+        )));
+        let start = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("应有 tool_use content_block_start");
+        assert_eq!(start.data["content_block"]["name"], "foo_bar");
+    }
+
+    /// `<invoke>` 文本捞回路径同样经过统一还原。
+    ///
+    /// `known_tool_names` 是捞回护栏（客户端历史里就是 `bash -c`，故含它），
+    /// `declared_tool_names` 是真实声明表（`Bash`），还原必须落在后者上。
+    #[test]
+    fn invoke_salvage_restores_illegal_name() {
+        let text = "call\n<invoke name=\"bash -c\">\n<parameter name=\"command\">echo hi</parameter>\n</invoke>";
+        let known = declared(&["bash -c"]);
+        let blocks =
+            extract_invoke_content_blocks(text, &known, &HashMap::new(), &declared(&["Bash"]));
+        let tu = blocks
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("必须捞回 tool_use");
+        assert_eq!(tu["name"], "Bash", "捞回的名字同样要还原成声明名");
+        assert_eq!(tu["input"]["command"], "echo hi");
+    }
+
+    /// 合法但未声明（历史占位工具）在两条路径上都不改名。
+    #[test]
+    fn legal_undeclared_name_unchanged_on_both_paths() {
+        let d = declared(&["Bash"]);
+        let mut acc = ToolJsonAccumulator::new();
+        let completed = acc
+            .push(
+                &tool_evt("toolu_legacy", "legacy_tool", "{}", true),
+                &HashMap::new(),
+                &d,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.name, "legacy_tool");
+
+        let mut ctx = StreamContext::new_with_thinking("m", 1, false, HashMap::new(), d);
+        let _ = ctx.generate_initial_events();
+        let events = ctx.process_kiro_event(&Event::ToolUse(tool_evt(
+            "toolu_legacy",
+            "legacy_tool",
+            "{}",
+            true,
+        )));
+        let start = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("应有 tool_use content_block_start");
+        assert_eq!(start.data["content_block"]["name"], "legacy_tool");
     }
 }

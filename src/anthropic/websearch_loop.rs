@@ -104,6 +104,10 @@ struct RoundOutcome {
     /// `ConversionResult::tool_name_map`. Used to restore the original tool name when a
     /// leaked `<invoke>` carries a shortened (>63 char) tool name.
     tool_name_map: std::collections::HashMap<String, String>,
+    /// Declared client tool names for this round. Unlike `known_tool_names` it is NOT
+    /// filtered before `<invoke>` reclamation: an illegal upstream name (`bash -c`) is
+    /// resolved against it to the declared `Bash`.
+    declared_tool_names: std::collections::HashSet<String>,
 }
 
 impl RoundOutcome {
@@ -244,6 +248,7 @@ async fn decode_round(
     response: reqwest::Response,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
+    declared_tool_names: &std::collections::HashSet<String>,
     tracer: &RequestTracer,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
@@ -347,7 +352,13 @@ async fn decode_round(
                 })
             };
             // 统一还原入口（名字 + 入参），与流式 / 非流式路径同口径。
-            tool_uses.push(CompletedToolUse::from_kiro(id, &name, input, tool_name_map));
+            tool_uses.push(CompletedToolUse::from_kiro(
+                id,
+                &name,
+                input,
+                tool_name_map,
+                declared_tool_names,
+            ));
         }
     }
 
@@ -368,6 +379,8 @@ async fn decode_round(
         known_tool_names: std::collections::HashSet::new(),
         // Populated by the caller (run_round), which holds ConversionResult::tool_name_map.
         tool_name_map: std::collections::HashMap::new(),
+        // Populated by the caller (run_round): ConversionResult::known_tool_names.
+        declared_tool_names: std::collections::HashSet::new(),
     }
 }
 
@@ -476,14 +489,17 @@ async fn run_round(
         call_result.response,
         &payload.model,
         &conversion.tool_name_map,
+        &conversion.known_tool_names,
         tracer,
     )
     .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
     // shared `<invoke>` text-leak fault tolerance with a correct tool-table guard.
-    outcome.known_tool_names = conversion.known_tool_names;
+    outcome.known_tool_names = conversion.known_tool_names.clone();
     // Carry the short->original tool name map so reclaimed <invoke> names get restored.
     outcome.tool_name_map = conversion.tool_name_map;
+    // Declared client names (unfiltered) so illegal upstream names resolve to them.
+    outcome.declared_tool_names = conversion.known_tool_names;
     if let Some(error_message) = outcome.stream_error.take() {
         // The stream is partial and cannot re-enter the search loop, but any final metadata
         // snapshot/credits observed before the cut still belong to this real provider call.
@@ -674,6 +690,7 @@ fn build_flush_content(
     tool_uses: &[CompletedToolUse],
     searched: &[Option<WebSearchResults>],
     known_tool_names: &std::collections::HashSet<String>,
+    declared_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<Value> {
     let mut content: Vec<Value> = presentation;
@@ -706,9 +723,15 @@ fn build_flush_content(
             .filter(|t| t.name != "web_search")
             .map(|t| (t.name.clone(), canonical_input_key(&t.input)))
             .collect();
-        for block in
-            super::stream::extract_invoke_content_blocks(text, &reclaim_tools, tool_name_map)
-        {
+        // `declared_tool_names` is passed UNFILTERED: it only drives illegal-name
+        // resolution (never the reclamation gate), and stripping web_search from it would
+        // stop `web search ...` style garbage from resolving to the declared `WebSearch`.
+        for block in super::stream::extract_invoke_content_blocks(
+            text,
+            &reclaim_tools,
+            tool_name_map,
+            declared_tool_names,
+        ) {
             if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let key = (
@@ -1562,6 +1585,7 @@ async fn run_web_search_loop_inner(
             &round.tool_uses,
             &searched,
             &round.known_tool_names,
+            &round.declared_tool_names,
             &round.tool_name_map,
         );
         // stop_reason must be computed from the FINAL flushed content, not just
@@ -2253,6 +2277,7 @@ mod tests {
             stream_error: None,
             known_tool_names: std::collections::HashSet::new(),
             tool_name_map: std::collections::HashMap::new(),
+            declared_tool_names: std::collections::HashSet::new(),
         }
     }
 
@@ -2517,6 +2542,7 @@ mod tests {
             &tool_uses,
             &searched,
             &names(&["exec"]),
+            &names(&["exec"]),
             &nomap(),
         );
 
@@ -2565,6 +2591,7 @@ mod tests {
             &tool_uses,
             &searched,
             &names(&["exec"]),
+            &names(&["exec"]),
             &nomap(),
         );
         assert!(
@@ -2601,6 +2628,7 @@ mod tests {
             leaked,
             &[],
             &[],
+            &names(&["exec_command"]),
             &names(&["exec_command"]),
             &nomap(),
         );
@@ -2641,6 +2669,7 @@ mod tests {
             &[],
             &[],
             &names(&["exec_command"]),
+            &names(&["exec_command"]),
             &nomap(),
         );
         assert!(!leaks_literal_invoke(&content));
@@ -2673,6 +2702,7 @@ mod tests {
             &[],
             &[],
             &names(&["exec_command"]),
+            &names(&["exec_command"]),
             &nomap(),
         );
         assert!(
@@ -2691,6 +2721,7 @@ mod tests {
             text,
             &[],
             &[],
+            &names(&["exec_command"]),
             &names(&["exec_command"]),
             &nomap(),
         );
@@ -2711,6 +2742,7 @@ mod tests {
             leaked,
             &[],
             &[],
+            &names(&["exec_command"]),
             &names(&["exec_command"]),
             &nomap(),
         );
@@ -2735,6 +2767,7 @@ mod tests {
             &[],
             &[],
             // known_tool_names DELIBERATELY contains web_search (mirrors the real request).
+            &names(&["web_search", "exec_command"]),
             &names(&["web_search", "exec_command"]),
             &nomap(),
         );
@@ -2767,6 +2800,7 @@ mod tests {
             &[],
             &[],
             &names(&["web_search", "exec_command"]),
+            &names(&["web_search", "exec_command"]),
             &nomap(),
         );
         assert!(
@@ -2794,6 +2828,7 @@ mod tests {
             &[],
             &[],
             &names(&["exec_command"]),
+            &names(&["exec_command"]),
             &nomap(),
         );
         assert_eq!(content.len(), 1);
@@ -2810,6 +2845,7 @@ mod tests {
             leaked,
             &[],
             &[],
+            &names(&["exec_command", "get_time"]),
             &names(&["exec_command", "get_time"]),
             &nomap(),
         );
@@ -2837,6 +2873,7 @@ mod tests {
             &[],
             &[],
             &names(&["exec_command"]),
+            &names(&["exec_command"]),
             &nomap(),
         );
         assert!(
@@ -2859,7 +2896,15 @@ mod tests {
         );
         let mut map = std::collections::HashMap::new();
         map.insert(short.to_string(), original.to_string());
-        let content = build_flush_content(Vec::new(), &leaked, &[], &[], &names(&[short]), &map);
+        let content = build_flush_content(
+            Vec::new(),
+            &leaked,
+            &[],
+            &[],
+            &names(&[short]),
+            &names(&[short]),
+            &map,
+        );
         let tu = content
             .iter()
             .find(|c| c["type"] == "tool_use")
@@ -2884,6 +2929,7 @@ mod tests {
             leaked,
             &[],
             &[],
+            &names(&["exec_command"]),
             &names(&["exec_command"]),
             &nomap(),
         );
@@ -2957,8 +3003,15 @@ mod tests {
         // the search and emit NO raw tool_use at all -> the caller derives end_turn.
         let tool_uses = vec![tu("web_search")];
         let searched = vec![fake_results("q")];
-        let content =
-            build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
+        let content = build_flush_content(
+            Vec::new(),
+            "",
+            &tool_uses,
+            &searched,
+            &names(&[]),
+            &names(&[]),
+            &nomap(),
+        );
         assert!(!content.iter().any(|c| c["type"] == "tool_use"));
         assert!(
             content
@@ -2989,6 +3042,7 @@ mod tests {
             &structured,
             &[],
             &names(&["exec_command"]),
+            &names(&["exec_command"]),
             &nomap(),
         );
         let exec_calls = content
@@ -3017,6 +3071,7 @@ mod tests {
             leaked,
             &structured,
             &[],
+            &names(&["exec_command"]),
             &names(&["exec_command"]),
             &nomap(),
         );
