@@ -666,6 +666,27 @@ fn derive_agent_continuation_id(conversation_id: &str) -> String {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
 }
 
+/// 历史 `tool_use` 的名字修复 + client→Kiro 映射 + 入参重写。
+///
+/// 历史里的客户端名可能是非法的（已中毒会话的 `bash -c`）：先按统一规则修复成声明的
+/// `Bash`，再走原路径的 client→Kiro 映射与入参重写（`command` 原样保留）。
+/// CompactFallback 走惰性占位工具，不映射名字也不改入参。
+fn map_history_tool_use(
+    purpose: ConversionPurpose,
+    name: &str,
+    input: serde_json::Value,
+    tool_name_map: &mut HashMap<String, String>,
+    declared_tool_names: &std::collections::HashSet<String>,
+    mode: ToolCompatibilityMode,
+) -> Result<(String, serde_json::Value), ConversionError> {
+    if purpose == ConversionPurpose::CompactFallback {
+        return Ok((COMPACTION_HISTORY_TOOL_NAME.to_string(), input));
+    }
+    let repaired = repair_client_tool_name(name, declared_tool_names);
+    let mapped = map_client_tool_name_to_kiro(&repaired, tool_name_map, mode);
+    Ok((mapped, map_tool_input_to_kiro(&repaired, input, mode)?))
+}
+
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
@@ -674,8 +695,9 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
         if let Message::Assistant(assistant_msg) = msg {
             if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 for tool_use in tool_uses {
-                    if !tool_names.contains(&tool_use.name) {
-                        tool_names.push(tool_use.name.clone());
+                    let name = legalize_tool_name(&tool_use.name);
+                    if !tool_names.contains(&name) {
+                        tool_names.push(name);
                     }
                 }
             }
@@ -690,7 +712,10 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 fn create_placeholder_tool(name: &str) -> Tool {
     Tool {
         tool_specification: ToolSpecification {
-            name: name.to_string(),
+            // 占位符同样要落在这个规则里：历史里的工具名可能非法（`bash -c`），
+            // 而 Kiro 要求 history 里的 toolUse 名与 tools[] 中的声明逐字一致，
+            // 两边都必须被同一确定性规则处理过。
+            name: legalize_tool_name(name),
             description: "Tool used in conversation history".to_string(),
             input_schema: InputSchema::from_json(serde_json::json!({
                 "$schema": "http://json-schema.org/draft-07/schema#",
@@ -789,23 +814,31 @@ pub(crate) fn convert_request_with_purpose(
     let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
-    // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
-    let mut tool_name_map = HashMap::new();
+    // 6. 收集本次请求声明的工具名（client 名），供 `<invoke>` 容错的工具表校验，
+    // 同时充当「声明名集合」：历史回放与响应里的非法名靠它捞回声明名。
+    // 声明名先过统一规则合法化——客户端自己声明了 `bash -c` 时，Kiro 侧只能看到
+    // 清洗后的 `bash_c`，声明集合必须与之一致，否则两边名字对不上。
     let fallback = purpose == ConversionPurpose::CompactFallback;
-    let mut tools = if fallback {
-        Vec::new()
-    } else {
-        convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?
-    };
-
-    // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
     let mut known_tool_names: std::collections::HashSet<String> = if fallback {
         std::collections::HashSet::new()
     } else {
         req.tools
             .as_ref()
-            .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+            .map(|ts| ts.iter().map(|t| legalize_tool_name(&t.name)).collect())
             .unwrap_or_default()
+    };
+
+    // 6.1 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
+    let mut tool_name_map = HashMap::new();
+    let mut tools = if fallback {
+        Vec::new()
+    } else {
+        convert_tools(
+            &req.tools,
+            &known_tool_names,
+            &mut tool_name_map,
+            tool_compatibility_mode,
+        )?
     };
     // 建议3 修复：超长工具名（>63）会被 shorten 成短名发给上游，模型回吐的也是短名。
     // tool_name_map 的 key 正是这些短名，一并加入，避免「超长名工具的合法 invoke 被漏捞」。
@@ -814,11 +847,14 @@ pub(crate) fn convert_request_with_purpose(
     }
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
+    // `known_tool_names` 同时充当「本次声明的客户端工具名」集合：历史回放里出现的
+    // 非法名（`bash -c`）靠它捞回声明名，也是响应方向还原时的同一份声明表。
     let mut history = build_history(
         req,
         messages,
         &model_id,
         &mut tool_name_map,
+        &known_tool_names,
         tool_compatibility_mode,
         purpose,
     )?;
@@ -1263,6 +1299,225 @@ fn remove_orphaned_tool_uses(
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
 
+/// 客户端可接受的工具名上限（`^[a-zA-Z0-9_-]{1,64}$`）。与 [`TOOL_NAME_MAX_LEN`] 分开：
+/// 后者是「发给 Kiro 的长度上限」，这里是「客户端协议允许的字符集与长度上限」。
+const CLIENT_TOOL_NAME_MAX_LEN: usize = 64;
+
+/// 非法名清洗后为空时的保底名（永远是合法工具名）。
+const FALLBACK_TOOL_NAME: &str = "unknown_tool";
+
+/// 工具名是否合法：`^[a-zA-Z0-9_-]{1,64}$`。
+///
+/// 这是客户端（Claude Code 等）与 Kiro 都接受的公共字符集，也是本模块所有名字出口的
+/// 唯一判据。注意按 **char** 判定而非字节：合法字符全是 ASCII，所以合法名的字节数等于字符数。
+pub(crate) fn is_legal_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= CLIENT_TOOL_NAME_MAX_LEN
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 把任意字符串确定性地清洗成合法工具名。
+///
+/// 规则：非法字符 → `_`；连续 `_` 折叠；去掉首尾 `_`；截断到 [`CLIENT_TOOL_NAME_MAX_LEN`]；
+/// 结果为空时用 [`FALLBACK_TOOL_NAME`]。**纯函数**——同一输入永远得到同一输出，这是
+/// 「请求内同一个输入名必须映射到同一个输出名」的前提。
+pub(crate) fn sanitize_tool_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(CLIENT_TOOL_NAME_MAX_LEN));
+    let mut last_underscore = false;
+    for ch in name.chars() {
+        // 合法字符全是 ASCII，非法字符统一折叠成一个 ASCII `_`，故 out.len() == out 的字符数。
+        if out.len() >= CLIENT_TOOL_NAME_MAX_LEN {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+            last_underscore = ch == '_';
+        } else if !last_underscore {
+            out.push('_');
+            last_underscore = true;
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        FALLBACK_TOOL_NAME.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 含非法字符的名字走 [`sanitize_tool_name`]，其余原样保留。
+///
+/// **只按字符集判定，不看长度**：超长但字符合法的名字由 [`map_tool_name`] 负责缩短，
+/// 且响应方向必须逐字还原，任何截断都会改变客户端看到的工具名。
+pub(crate) fn legalize_tool_name(name: &str) -> String {
+    if has_illegal_tool_name_chars(name) {
+        sanitize_tool_name(name)
+    } else {
+        name.to_string()
+    }
+}
+
+/// 名字是否含非法字符（空名也算）。**不看长度**：超长但字符合法的名字由
+/// [`map_tool_name`] 的缩短逻辑处理，`TOOL_NAME_MAX_LEN` 只约束发给 Kiro 的名字长度。
+fn has_illegal_tool_name_chars(name: &str) -> bool {
+    name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 取名字开头的「连续合法字符段」：`"bash -c"` → `"bash"`，`"foo bar!"` → `"foo"`。
+///
+/// Kiro 把工具调用写成一段命令行（`bash -c ...`）时，前面的单token 往往就是真实工具名；
+/// 这里只做提取，匹配交给调用方。
+fn leading_legal_run(name: &str) -> &str {
+    let end = name
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+        .map(|(idx, _)| idx)
+        .unwrap_or(name.len());
+    &name[..end]
+}
+
+/// 在 `candidates` 里找与 `token` 大小写不敏感相等的名字，返回值。
+/// 多个候选同时命中时取字典序最小者，保证确定性（`HashSet`/`HashMap` 迭代序不稳定）。
+fn find_ci_match<'a, I>(token: &str, candidates: I) -> Option<String>
+where
+    I: Iterator<Item = (&'a String, Option<&'a String>)>,
+{
+    if token.is_empty() {
+        return None;
+    }
+    let lower = token.to_ascii_lowercase();
+    let mut best: Option<(String, String)> = None;
+    for (name, value) in candidates {
+        if name.to_ascii_lowercase() != lower {
+            continue;
+        }
+        let value = value.cloned().unwrap_or_else(|| name.clone());
+        // 先比名字（决定胜者），再比值（仅用于元组排序的确定性）。
+        if best
+            .as_ref()
+            .is_none_or(|(best_name, _)| *name < *best_name)
+        {
+            best = Some((name.clone(), value));
+        }
+    }
+    best.map(|(_, value)| value)
+}
+
+/// 在 `tool_name_map`（Kiro 名 → 客户端名）里按「Kiro 名」找 `token`。
+///
+/// 先精确（大小写不敏感）匹配；再退一步容忍 Kiro 内置工具名的动词前缀——
+/// `bash -c` 的 token 是 `bash`，而 ClaudeCode 模式把 `Bash` 发成 `execute_bash`，
+/// 故允许「key 以 `<下划线><token>` 结尾」。命中后返回**映射的客户端名**。
+fn find_kiro_side_match(token: &str, tool_name_map: &HashMap<String, String>) -> Option<String> {
+    if token.is_empty() {
+        return None;
+    }
+    if let Some(exact) = find_ci_match(token, tool_name_map.iter().map(|(k, v)| (k, Some(v)))) {
+        return Some(exact);
+    }
+    let suffix = format!("_{}", token.to_ascii_lowercase());
+    let mut best: Option<(&String, &String)> = None;
+    for (key, value) in tool_name_map {
+        if !key.to_ascii_lowercase().ends_with(&suffix) {
+            continue;
+        }
+        if best.is_none_or(|(best_key, _)| key < best_key) {
+            best = Some((key, value));
+        }
+    }
+    best.map(|(_, value)| value.clone())
+}
+
+/// **唯一的工具名归一化规则**（响应方向：Kiro 名 → 客户端名）。
+///
+/// Kiro 偶尔会回吐不合法的工具名（实测 `bash -c`），直接透传给客户端后，客户端下一轮
+/// 会把 `bash -c` 当历史 tool_use 回放，Kiro 随即 400 `Invalid tool use format`，
+/// 整个会话永久损坏。所以客户端可见的工具名都必须过这里：
+///
+/// a. 已知名（`tool_name_map` 的 key，或恰好是本次声明的客户端工具名）→ 原样/按映射还原，
+///    行为与修复前完全一致（超长名还原、ClaudeCode 内置名还原都在这一支）。
+/// b. 未知名：取开头的连续合法字符段，与「已声明的客户端工具名」大小写不敏感匹配 → 用声明名
+///    （`bash -c` → `Bash`）；再退一步与 `tool_name_map` 的 key（Kiro 名）大小写不敏感匹配 →
+///    用其映射的客户端名（`Execute_Bash` → `Bash`）。
+/// c. 仍然非法 → [`sanitize_tool_name`] 确定性清洗。
+///
+/// 返回值**永远**是合法工具名（`^[a-zA-Z0-9_-]{1,64}$`）：合法但未声明的名字
+/// （例如客户端已不再声明、只存在于历史里的占位工具）原样返回——这类名字本来就能正常工作，
+/// 改名反而会破坏历史回放；非法名无论如何都不会泄漏出去。
+pub(crate) fn resolve_client_tool_name(
+    kiro_name: &str,
+    tool_name_map: &HashMap<String, String>,
+    declared_tool_names: &std::collections::HashSet<String>,
+) -> String {
+    let candidate = if let Some(client_name) = tool_name_map.get(kiro_name) {
+        // (a) 已知映射（超长名还原 / ClaudeCode 内置名还原）。
+        client_name.clone()
+    } else if declared_tool_names.contains(kiro_name) {
+        // (a) 恰是已声明的客户端工具名。
+        kiro_name.to_string()
+    } else if let Some(declared) = find_ci_match(
+        leading_legal_run(kiro_name),
+        declared_tool_names.iter().map(|name| (name, None)),
+    ) {
+        // (b) 从非法名里捞回已声明的客户端工具名。
+        //
+        // 声明集合里可能混入 Kiro 侧别名：ClaudeCode 模式下 `known_tool_names` 会并入
+        // `tool_name_map` 的 key（`execute_bash`），以便 `<invoke>` 捞回。此时命中的
+        // `execute_bash` 只是别名，客户端要的是它映射的 `Bash`——所以命中别名时再跟一次
+        // 映射，否则 `execute_bash -c` 会停在合法但客户端并不认识的 `execute_bash`。
+        match tool_name_map.get(&declared) {
+            Some(client) if client != &declared => client.clone(),
+            _ => declared,
+        }
+    } else if let Some(mapped) = find_kiro_side_match(leading_legal_run(kiro_name), tool_name_map) {
+        // (b) 从非法名里捞回 Kiro 侧名，再取它映射的客户端名。
+        mapped
+    } else {
+        // 合法未声明 → 保持现状；非法 → 下面清洗。
+        kiro_name.to_string()
+    };
+
+    // 已声明的客户端名逐字回吐（含超长名：客户端就是这么声明的，改动会让下一轮
+    // 历史回放对不上同一个工具）。这是 (a) 的行为，与修复前完全一致——但「绝不发出
+    // 非法名」优先：客户端自己声明了非法名（`bash -c`）时，回吐它只会再次毒化会话。
+    if declared_tool_names.contains(&candidate) && !has_illegal_tool_name_chars(&candidate) {
+        return candidate;
+    }
+    if is_legal_tool_name(&candidate) {
+        candidate
+    } else {
+        // (c) 兜底：确定性清洗，绝不把非法名发出去。
+        sanitize_tool_name(&candidate)
+    }
+}
+
+/// 客户端名对应的 Kiro 侧名字（决定入参按哪套键重写）。
+///
+/// 名字被还原后，入参也必须跟着换命名空间：`bash -c` 还原成 `Bash` 后，入参应按
+/// `execute_bash` 的口径还原（`command` 保留），否则客户端会拿到 Kiro 形态的键。
+fn kiro_side_name_for_client(
+    client_name: &str,
+    kiro_name: &str,
+    tool_name_map: &HashMap<String, String>,
+) -> String {
+    if client_name == kiro_name {
+        return kiro_name.to_string();
+    }
+    tool_name_map
+        .iter()
+        .filter(|(_, value)| value.as_str() == client_name)
+        // 多个 key 映射到同一客户端名时取字典序最小者，保证确定性。
+        .map(|(key, _)| key)
+        .min()
+        .cloned()
+        .unwrap_or_else(|| kiro_name.to_string())
+}
+
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
 fn shorten_tool_name(name: &str) -> String {
     let mut hasher = Sha256::new();
@@ -1286,6 +1541,28 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     let short = shorten_tool_name(name);
     tool_name_map.insert(short.clone(), name.to_string());
     short
+}
+
+/// 出站修复（客户端名 → 修复后的客户端名）：把已中毒历史里的非法名（如 `bash -c`）
+/// 按**响应方向同一套规则**捞回声明的工具名，捞不到则确定性清洗。
+///
+/// 只修名字、不做 client→Kiro 映射，也不改写 `tool_name_map`——调用方随后仍走原路径
+/// （`map_client_tool_name_to_kiro` + `map_tool_input_to_kiro`），入参重写才不会被跳过。
+/// 合法名的行为完全不变。
+///
+/// 不查 `tool_name_map`：出站时 map 是**响应方向**（Kiro 名 → 客户端名），用它查客户端名
+/// 会让「客户端恰好声明了 `execute_bash`」被误还原成 `Bash`。
+fn repair_client_tool_name(
+    client_name: &str,
+    declared_tool_names: &std::collections::HashSet<String>,
+) -> String {
+    // 只修「字符非法」的名字；超长但字符合法的名字必须原样往下走，
+    // 否则会改变 `shorten_tool_name` 的哈希输入，破坏已有映射。
+    if !has_illegal_tool_name_chars(client_name) {
+        return client_name.to_string();
+    }
+    // `HashMap::new()` 不分配；规则退化成「声明名大小写不敏感匹配 → 否则清洗」。
+    resolve_client_tool_name(client_name, &HashMap::new(), declared_tool_names)
 }
 
 /// 转换工具定义
@@ -1524,18 +1801,19 @@ fn map_tool_input_from_kiro(kiro_name: &str, input: serde_json::Value) -> serde_
     serde_json::Value::Object(out)
 }
 
-/// 入站还原工具名 + 入参给客户端。名字从 `tool_name_map`（kiro名→客户端名）还原；
-/// 入参按 kiro_name 反向重写（对非内置 / 长名缩短是 no-op）。
+/// 入站还原工具名 + 入参给客户端。名字走统一规则
+/// [`resolve_client_tool_name`]（已知名还原、非法名捞回声明名、兜底清洗）；
+/// 入参按**还原后对应的 Kiro 名**反向重写，保证 `bash -c` 还原成 `Bash` 时入参仍按
+/// `execute_bash` 口径处理（`command` 原样保留）。
 pub fn restore_tool_use_for_client(
     kiro_name: &str,
     input: serde_json::Value,
     tool_name_map: &HashMap<String, String>,
+    declared_tool_names: &std::collections::HashSet<String>,
 ) -> (String, serde_json::Value) {
-    let client_name = tool_name_map
-        .get(kiro_name)
-        .cloned()
-        .unwrap_or_else(|| kiro_name.to_string());
-    let client_input = map_tool_input_from_kiro(kiro_name, input);
+    let client_name = resolve_client_tool_name(kiro_name, tool_name_map, declared_tool_names);
+    let input_name = kiro_side_name_for_client(&client_name, kiro_name, tool_name_map);
+    let client_input = map_tool_input_from_kiro(&input_name, input);
     (client_name, client_input)
 }
 
@@ -1657,6 +1935,7 @@ fn kiro_builtin_tool_schema(kiro_name: &str) -> Option<serde_json::Value> {
 
 fn convert_tools(
     tools: &Option<Vec<super::types::Tool>>,
+    declared_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
 ) -> Result<Vec<Tool>, ConversionError> {
@@ -1674,7 +1953,10 @@ fn convert_tools(
             continue;
         }
 
-        let mapped_name = map_client_tool_name_to_kiro(&t.name, tool_name_map, mode);
+        // 客户端声明的名字本身也可能非法（`bash -c`）：先按统一规则修复，
+        // 保证 tools[] 里不会出现非法名（Kiro 会 400）。
+        let client_name = repair_client_tool_name(&t.name, declared_tool_names);
+        let mapped_name = map_client_tool_name_to_kiro(&client_name, tool_name_map, mode);
         // 按小写名去重（Kiro 工具名大小写不敏感），首个出现者胜出。
         if !seen.insert(mapped_name.to_lowercase()) {
             tracing::debug!("跳过重复的映射工具名: {}", mapped_name);
@@ -1682,7 +1964,7 @@ fn convert_tools(
         }
 
         let is_builtin =
-            is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&t.name).is_some();
+            is_claude_code_mode(mode) && claude_code_tool_name_to_kiro(&client_name).is_some();
 
         let description = if is_builtin {
             kiro_builtin_tool_description(&mapped_name, &t.description)
@@ -1777,6 +2059,7 @@ fn build_history(
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
+    declared_tool_names: &std::collections::HashSet<String>,
     mode: ToolCompatibilityMode,
     purpose: ConversionPurpose,
 ) -> Result<Vec<Message>, ConversionError> {
@@ -1841,8 +2124,13 @@ fn build_history(
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged =
-                    merge_assistant_messages(&assistant_buffer, tool_name_map, mode, purpose)?;
+                let merged = merge_assistant_messages(
+                    &assistant_buffer,
+                    tool_name_map,
+                    declared_tool_names,
+                    mode,
+                    purpose,
+                )?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -1861,7 +2149,13 @@ fn build_history(
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, mode, purpose)?;
+        let merged = merge_assistant_messages(
+            &assistant_buffer,
+            tool_name_map,
+            declared_tool_names,
+            mode,
+            purpose,
+        )?;
         history.push(Message::Assistant(merged));
     }
 
@@ -1926,6 +2220,7 @@ fn merge_user_messages(
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
+    declared_tool_names: &std::collections::HashSet<String>,
     mode: ToolCompatibilityMode,
     purpose: ConversionPurpose,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
@@ -1954,20 +2249,14 @@ fn convert_assistant_message(
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
-                                let (mapped_name, input) = if purpose
-                                    == ConversionPurpose::CompactFallback
-                                {
-                                    (COMPACTION_HISTORY_TOOL_NAME.to_string(), input)
-                                } else {
-                                    (
-                                        map_client_tool_name_to_kiro(
-                                            &name,
-                                            tool_name_map,
-                                            mode,
-                                        ),
-                                        map_tool_input_to_kiro(&name, input, mode)?,
-                                    )
-                                };
+                                let (mapped_name, input) = map_history_tool_use(
+                                    purpose,
+                                    &name,
+                                    input,
+                                    tool_name_map,
+                                    declared_tool_names,
+                                    mode,
+                                )?;
                                 tool_uses
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
@@ -2013,19 +2302,27 @@ fn convert_assistant_message(
 fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
+    declared_tool_names: &std::collections::HashSet<String>,
     mode: ToolCompatibilityMode,
     purpose: ConversionPurpose,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map, mode, purpose);
+        return convert_assistant_message(
+            messages[0],
+            tool_name_map,
+            declared_tool_names,
+            mode,
+            purpose,
+        );
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map, mode, purpose)?;
+        let converted =
+            convert_assistant_message(msg, tool_name_map, declared_tool_names, mode, purpose)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
@@ -2921,7 +3218,13 @@ mod tests {
             cc_tool("fs_append"),
             cc_tool("fs_write"),
         ]);
-        let out = convert_tools(&tools, &mut map, ToolCompatibilityMode::ClaudeCode).unwrap();
+        let out = convert_tools(
+            &tools,
+            &std::collections::HashSet::new(),
+            &mut map,
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .unwrap();
         let names: Vec<&str> = out
             .iter()
             .map(|t| t.tool_specification.name.as_str())
@@ -2942,6 +3245,7 @@ mod tests {
         let mut map = HashMap::new();
         let out = convert_tools(
             &Some(vec![cc_tool("Write")]),
+            &std::collections::HashSet::new(),
             &mut map,
             ToolCompatibilityMode::ClaudeCode,
         )
@@ -2957,6 +3261,7 @@ mod tests {
         let mut map = HashMap::new();
         let out = convert_tools(
             &Some(vec![cc_tool("Write")]),
+            &std::collections::HashSet::new(),
             &mut map,
             ToolCompatibilityMode::Raw,
         )
@@ -3018,6 +3323,7 @@ mod tests {
             let result = convert_assistant_message(
                 &msg,
                 &mut map,
+                &std::collections::HashSet::new(),
                 ToolCompatibilityMode::ClaudeCode,
                 ConversionPurpose::Generate,
             )
@@ -3052,7 +3358,8 @@ mod tests {
         assert_eq!(kiro, serde_json::json!({"path": "/a.txt", "text": "hello"}));
         let mut map = HashMap::new();
         map.insert("fs_write".to_string(), "Write".to_string());
-        let (name, restored) = restore_tool_use_for_client("fs_write", kiro, &map);
+        let (name, restored) =
+            restore_tool_use_for_client("fs_write", kiro, &map, &std::collections::HashSet::new());
         assert_eq!(name, "Write");
         assert_eq!(restored, client, "出入站往返应还原客户端入参");
     }
@@ -3065,6 +3372,7 @@ mod tests {
             "read_file",
             serde_json::json!({"path": "/a", "start_line": 10, "end_line": 14}),
             &map,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(name, "Read");
         assert_eq!(restored["file_path"], serde_json::json!("/a"));
@@ -3078,7 +3386,12 @@ mod tests {
     fn cc_inbound_restore_keyed_on_kiro_name_not_client_name() {
         let map = HashMap::new();
         let input = serde_json::json!({"offset": 3, "custom_field": true});
-        let (name, restored) = restore_tool_use_for_client("Read", input.clone(), &map);
+        let (name, restored) = restore_tool_use_for_client(
+            "Read",
+            input.clone(),
+            &map,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(name, "Read");
         assert_eq!(
             restored, input,
@@ -3637,6 +3950,7 @@ mod tests {
         let result = convert_assistant_message(
             &msg,
             &mut HashMap::new(),
+            &std::collections::HashSet::new(),
             ToolCompatibilityMode::Raw,
             ConversionPurpose::Generate,
         )
@@ -3678,6 +3992,7 @@ mod tests {
         let result = convert_assistant_message(
             &msg,
             &mut HashMap::new(),
+            &std::collections::HashSet::new(),
             ToolCompatibilityMode::Raw,
             ConversionPurpose::Generate,
         )
@@ -3797,6 +4112,7 @@ mod tests {
         let result = merge_assistant_messages(
             &messages,
             &mut HashMap::new(),
+            &std::collections::HashSet::new(),
             ToolCompatibilityMode::Raw,
             ConversionPurpose::Generate,
         )
@@ -3981,5 +4297,503 @@ mod tests {
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
         );
+    }
+}
+
+#[cfg(test)]
+mod illegal_tool_name_tests {
+    use super::*;
+    use crate::kiro::model::requests::kiro::KiroRequest;
+    use crate::model::config::ToolCompatibilityMode;
+
+    fn declared(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn no_map() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    fn cc_tool(name: &str) -> super::super::types::Tool {
+        let mut schema = std::collections::BTreeMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+        super::super::types::Tool {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: schema,
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        }
+    }
+
+    /// 回归：合法名（声明过的、未声明的、超长的）一律不被改动。
+    #[test]
+    fn legal_names_pass_through_unchanged() {
+        // 已声明
+        let d = declared(&["Bash", "read_file", "mcp__srv__tool"]);
+        for name in ["Bash", "read_file", "mcp__srv__tool"] {
+            assert_eq!(
+                resolve_client_tool_name(name, &no_map(), &d),
+                name,
+                "已声明的合法名不得改动"
+            );
+        }
+        // 未声明（历史占位工具）
+        for name in ["legacy_tool", "SomeTool-2", "a"] {
+            assert_eq!(
+                resolve_client_tool_name(name, &no_map(), &declared(&["Bash"])),
+                name,
+                "合法但未声明的名字必须保持原样"
+            );
+        }
+        // 超长的**已声明**名：客户端就是这么声明的，必须逐字还原
+        // （出站由 shorten_tool_name 缩短，入站由 tool_name_map 还原回原名）。
+        let long = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63_chars";
+        let d_long = declared(&[long]);
+        assert_eq!(
+            resolve_client_tool_name(long, &no_map(), &d_long),
+            long,
+            "已声明的超长名必须逐字还原"
+        );
+        // 缩短名经 map 还原成原始长名（既有行为）。
+        let mut long_map = HashMap::new();
+        long_map.insert(shorten_tool_name(long), long.to_string());
+        assert_eq!(
+            resolve_client_tool_name(&shorten_tool_name(long), &long_map, &d_long),
+            long,
+            "缩短名必须还原为原始长名"
+        );
+        // 64 字符正好是客户端上限，原样保留。
+        let sixty_four = "a".repeat(64);
+        assert_eq!(
+            resolve_client_tool_name(&sixty_four, &no_map(), &declared(&[sixty_four.as_str()])),
+            sixty_four
+        );
+    }
+
+    /// 超过 64 字符且**未声明**的名字属于非法名（客户端协议上限），按清洗规则截断。
+    #[test]
+    fn undeclared_overlong_name_is_truncated_to_legal() {
+        let sixty_five = "a".repeat(65);
+        let got = resolve_client_tool_name(&sixty_five, &no_map(), &declared(&["Bash"]));
+        assert_eq!(got.len(), CLIENT_TOOL_NAME_MAX_LEN);
+        assert!(is_legal_tool_name(&got));
+    }
+
+    #[test]
+    fn known_mapping_still_wins() {
+        // tool_name_map 命中：既有行为（还原客户端名）不变
+        let mut map = HashMap::new();
+        map.insert("execute_bash".to_string(), "Bash".to_string());
+        map.insert(
+            "short_abc12345".to_string(),
+            "very_long_original".to_string(),
+        );
+        let d = declared(&["Bash"]);
+        assert_eq!(resolve_client_tool_name("execute_bash", &map, &d), "Bash");
+        assert_eq!(
+            resolve_client_tool_name("short_abc12345", &map, &d),
+            "very_long_original"
+        );
+    }
+
+    /// 核心修复：`bash -c` → 声明的 `Bash`。
+    #[test]
+    fn illegal_name_resolves_to_declared_tool() {
+        let d = declared(&["Bash", "Read"]);
+        assert_eq!(resolve_client_tool_name("bash -c", &no_map(), &d), "Bash");
+        assert_eq!(resolve_client_tool_name("Bash -c", &no_map(), &d), "Bash");
+        assert_eq!(
+            resolve_client_tool_name("BASH -lc foo", &no_map(), &d),
+            "Bash"
+        );
+        assert_eq!(resolve_client_tool_name("read file", &no_map(), &d), "Read");
+    }
+
+    /// 大小写不敏感地命中 Kiro 侧名，再取其映射的客户端名。
+    #[test]
+    fn illegal_name_resolves_via_kiro_side_map() {
+        let mut map = HashMap::new();
+        map.insert("execute_bash".to_string(), "Bash".to_string());
+        // 客户端声明里没有 Bash（例如声明表被过滤过），仍能从 Kiro 名捞回。
+        assert_eq!(
+            resolve_client_tool_name("Execute_Bash -c x", &map, &declared(&[])),
+            "Bash"
+        );
+    }
+
+    /// 完全无法匹配的非法名 → 确定性清洗成合法名。
+    #[test]
+    fn unmatched_illegal_name_is_sanitized() {
+        let d = declared(&["Bash"]);
+        let got = resolve_client_tool_name("foo bar!", &no_map(), &d);
+        assert_eq!(got, "foo_bar");
+        assert!(is_legal_tool_name(&got));
+        // 纯非法字符
+        let got = resolve_client_tool_name("!!! ???", &no_map(), &d);
+        assert!(is_legal_tool_name(&got), "{}", got);
+        assert_eq!(got, FALLBACK_TOOL_NAME);
+        // 空名
+        assert_eq!(
+            resolve_client_tool_name("", &no_map(), &d),
+            FALLBACK_TOOL_NAME
+        );
+        // 确定性：同一输入永远同一输出
+        assert_eq!(
+            sanitize_tool_name("foo bar!"),
+            sanitize_tool_name("foo bar!")
+        );
+        // 截断到 64
+        let long_illegal = format!("{} {}", "a".repeat(80), "b");
+        let got = sanitize_tool_name(&long_illegal);
+        assert!(got.len() <= CLIENT_TOOL_NAME_MAX_LEN, "len={}", got.len());
+        assert!(is_legal_tool_name(&got));
+    }
+
+    /// QA（原 PR 观察点）：ClaudeCode 模式下上行名是 Kiro 侧名 `execute_bash ...`，
+    /// 必须还原成客户端声明名 `Bash`，而不是停在合法的 `execute_bash`。
+    #[test]
+    fn claude_code_kiro_side_illegal_name_resolves_to_client_name() {
+        let mut map = HashMap::new();
+        map.insert("execute_bash".to_string(), "Bash".to_string());
+        // 声明表在 CC 模式下混入了 Kiro 侧名（`known_tool_names` 会并入缩短/映射短名）。
+        let d = declared(&["Bash", "execute_bash"]);
+        assert_eq!(
+            resolve_client_tool_name("execute_bash -c", &map, &d),
+            "Bash",
+            "CC 模式下 `execute_bash -c` 必须还原成客户端声明名"
+        );
+    }
+
+    #[test]
+    fn sanitize_collapses_and_trims_underscores() {
+        assert_eq!(sanitize_tool_name("a  b"), "a_b");
+        assert_eq!(sanitize_tool_name("  abc  "), "abc");
+        assert_eq!(sanitize_tool_name("a!@#b"), "a_b");
+        assert_eq!(sanitize_tool_name("a--b"), "a--b");
+    }
+
+    // ---- 请求路径：历史 tool_use / 占位符 ----
+
+    fn req_with_poisoned_history(tools: Option<Vec<super::super::types::Tool>>) -> MessagesRequest {
+        use super::super::types::Message as AnthropicMessage;
+        MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("run it"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "running"},
+                        {"type": "tool_use", "id": "toolu_x", "name": "bash -c",
+                         "input": {"command": "echo hi"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_x", "content": "hi"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            cache_control: None,
+        }
+    }
+
+    fn body_of(result: &ConversionResult) -> serde_json::Value {
+        let request = KiroRequest {
+            conversation_state: result.conversation_state.clone(),
+            profile_arn: None,
+            additional_model_request_fields: None,
+        };
+        serde_json::to_value(&request).expect("序列化 Kiro 请求")
+    }
+
+    /// 收集 body 里所有「工具名」字段值（tools[].toolSpecification.name 与
+    /// history toolUses[].name），用于统一断言合法性。
+    fn all_tool_names(body: &serde_json::Value) -> Vec<String> {
+        let mut names = Vec::new();
+        let state = &body["conversationState"];
+        for tool in state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            names.push(
+                tool["toolSpecification"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        for msg in state["history"].as_array().into_iter().flatten() {
+            for tu in msg["assistantResponseMessage"]["toolUses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                names.push(tu["name"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        names
+    }
+
+    /// 便于在 `--nocapture` 输出里直接引用的紧凑摘要：工具名 + 历史 toolUse + tool_result。
+    fn compact_digest(body: &serde_json::Value) -> String {
+        let state = &body["conversationState"];
+        let tool_names: Vec<String> =
+            state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| t["toolSpecification"]["name"].as_str().unwrap().to_string())
+                .collect();
+        let mut history = Vec::new();
+        for msg in state["history"].as_array().into_iter().flatten() {
+            for tu in msg["assistantResponseMessage"]["toolUses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                history.push(format!(
+                    "{}={} input={}",
+                    tu["toolUseId"].as_str().unwrap_or(""),
+                    tu["name"].as_str().unwrap_or(""),
+                    tu["input"]
+                ));
+            }
+        }
+        format!(
+            "tools[]={:?} historyToolUses=[{}] toolResults={:?}",
+            tool_names,
+            history.join(", "),
+            all_tool_result_ids(body)
+        )
+    }
+
+    /// 收集 tool_result 的 toolUseId，验证配对没被破坏。
+    fn all_tool_result_ids(body: &serde_json::Value) -> Vec<String> {
+        let state = &body["conversationState"];
+        let mut ids = Vec::new();
+        for src in
+            [&state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["toolResults"]]
+        {
+            for r in src.as_array().into_iter().flatten() {
+                ids.push(r["toolUseId"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        for msg in state["history"].as_array().into_iter().flatten() {
+            for r in msg["userInputMessage"]["userInputMessageContext"]["toolResults"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                ids.push(r["toolUseId"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        ids
+    }
+
+    fn assert_body_has_no_illegal_names(body: &serde_json::Value) {
+        let names = all_tool_names(body);
+        assert!(!names.is_empty(), "测试应至少包含一个工具名: {body}");
+        for name in &names {
+            assert!(
+                is_legal_tool_name(name),
+                "序列化后的请求体出现非法工具名 {:?}; body={}",
+                name,
+                body
+            );
+            assert!(name.len() <= TOOL_NAME_MAX_LEN, "超过 Kiro 上限: {}", name);
+            assert_ne!(name, "bash -c", "非法名不得原样出现在请求体里");
+        }
+    }
+
+    /// 请求路径（ClaudeCode 兼容模式）：历史 `bash -c` → `execute_bash`，配对保持。
+    #[test]
+    fn poisoned_history_is_repaired_in_claude_code_mode() {
+        let req = req_with_poisoned_history(Some(vec![cc_tool("Bash")]));
+        let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
+        let body = body_of(&result);
+
+        // tools[] 里有 execute_bash（Bash 的 Kiro 侧名）
+        let tool_names: Vec<String> = body["conversationState"]["currentMessage"]
+            ["userInputMessage"]["userInputMessageContext"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["toolSpecification"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            tool_names.iter().any(|n| n == "execute_bash"),
+            "Bash 应映射为 execute_bash: {tool_names:?}"
+        );
+
+        // 历史 toolUse 名必须是 execute_bash，且 input 保留 command
+        let mut found = false;
+        for msg in body["conversationState"]["history"].as_array().unwrap() {
+            for tu in msg["assistantResponseMessage"]["toolUses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if tu["toolUseId"] == "toolu_x" {
+                    assert_eq!(tu["name"], "execute_bash");
+                    assert_eq!(tu["input"]["command"], "echo hi", "入参必须保留 command");
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "历史里应保留 toolu_x 的 toolUse");
+
+        // 配对未破坏
+        assert!(
+            all_tool_result_ids(&body).iter().any(|id| id == "toolu_x"),
+            "tool_result 必须仍然存在: {}",
+            body
+        );
+        assert_body_has_no_illegal_names(&body);
+        eprintln!(
+            "claude-code upstream body digest: {}",
+            compact_digest(&body)
+        );
+        eprintln!(
+            "claude-code mode body: {}",
+            serde_json::to_string(&body).unwrap()
+        );
+    }
+
+    /// 请求路径（默认 Raw 模式）：同样修复，且不做内置改名。
+    #[test]
+    fn poisoned_history_is_repaired_in_raw_mode() {
+        let req = req_with_poisoned_history(Some(vec![cc_tool("Bash")]));
+        let result = convert_request_with_mode(&req, ToolCompatibilityMode::Raw).unwrap();
+        let body = body_of(&result);
+
+        assert!(
+            all_tool_result_ids(&body).iter().any(|id| id == "toolu_x"),
+            "tool_result 必须仍然存在"
+        );
+        let mut found = false;
+        for msg in body["conversationState"]["history"].as_array().unwrap() {
+            for tu in msg["assistantResponseMessage"]["toolUses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if tu["toolUseId"] == "toolu_x" {
+                    assert_eq!(tu["name"], "Bash", "Raw 模式应还原为声明的 Bash");
+                    assert_eq!(tu["input"]["command"], "echo hi");
+                    found = true;
+                }
+            }
+        }
+        assert!(found);
+        assert_body_has_no_illegal_names(&body);
+        eprintln!("raw upstream body digest: {}", compact_digest(&body));
+        eprintln!("raw mode body: {}", serde_json::to_string(&body).unwrap());
+    }
+
+    /// 无声明工具（占位符路径）：占位符名合法，且与历史 toolUse 名逐字一致。
+    #[test]
+    fn placeholder_name_is_legal_and_matches_history() {
+        let req = req_with_poisoned_history(None);
+        let result = convert_request_with_mode(&req, ToolCompatibilityMode::Raw).unwrap();
+        let body = body_of(&result);
+
+        let placeholder_names: Vec<String> = body["conversationState"]["currentMessage"]
+            ["userInputMessage"]["userInputMessageContext"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["toolSpecification"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(placeholder_names.len(), 1, "应有一个占位符工具");
+
+        let history_names: Vec<String> = body["conversationState"]["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| {
+                m["assistantResponseMessage"]["toolUses"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .map(|tu| tu["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            placeholder_names, history_names,
+            "占位符名必须与历史 toolUse 名一致（Kiro 要求逐字匹配）"
+        );
+        assert!(is_legal_tool_name(&placeholder_names[0]));
+        assert!(
+            all_tool_result_ids(&body).iter().any(|id| id == "toolu_x"),
+            "tool_result 必须仍然存在"
+        );
+        assert_body_has_no_illegal_names(&body);
+        eprintln!(
+            "no-tools placeholder upstream body digest: {}",
+            compact_digest(&body)
+        );
+        eprintln!(
+            "no-tools placeholder body: {}",
+            serde_json::to_string(&body).unwrap()
+        );
+    }
+
+    /// 同一请求内，同一输入名必须映射到同一输出名（确定性）。
+    #[test]
+    fn same_input_name_maps_to_same_output_name() {
+        let mut map = HashMap::new();
+        let d = declared(&["Bash"]);
+        let a =
+            restore_tool_use_for_client("bash -c", serde_json::json!({"command": "x"}), &map, &d);
+        let b =
+            restore_tool_use_for_client("bash -c", serde_json::json!({"command": "y"}), &map, &d);
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.0, "Bash");
+
+        // 也验证出站方向确定性
+        let m1 = repair_client_tool_name("bash -c", &d);
+        let m2 = repair_client_tool_name("bash -c", &d);
+        assert_eq!(m1, m2);
+        assert_eq!(m1, "Bash");
+        map.insert("execute_bash".to_string(), "Bash".to_string());
+        assert_eq!(repo_map(&map), 1);
+    }
+
+    fn repo_map(map: &HashMap<String, String>) -> usize {
+        map.len()
+    }
+
+    /// 响应方向：`bash -c` 还原成 Bash 时，入参按 execute_bash 口径重写（command 保留）。
+    #[test]
+    fn restore_maps_input_through_resolved_kiro_name() {
+        let mut map = HashMap::new();
+        map.insert("execute_bash".to_string(), "Bash".to_string());
+        let (name, input) = restore_tool_use_for_client(
+            "bash -c",
+            serde_json::json!({"command": "echo hi", "timeout": 5}),
+            &map,
+            &declared(&["Bash"]),
+        );
+        assert_eq!(name, "Bash");
+        assert_eq!(input["command"], "echo hi");
+        assert_eq!(input["timeout"], 5);
+        assert_eq!(input.as_object().unwrap().len(), 2);
     }
 }

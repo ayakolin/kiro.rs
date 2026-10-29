@@ -1473,9 +1473,9 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
-    // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
-    _known_tool_names: std::collections::HashSet<String>,
+    // 非流式路径直接处理结构化 Event::ToolUse，不经过 `<invoke>` 文本嗅探，故此处不用它
+    // 做工具表校验；但工具名还原需要它（非法名 `bash -c` → 声明的 `Bash`）。
+    known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -1489,6 +1489,7 @@ async fn handle_non_stream_request(
         input_tokens,
         thinking_enabled,
         tool_name_map,
+        known_tool_names,
         hook,
         cache_usage,
         tracer,
@@ -1557,6 +1558,9 @@ pub(crate) async fn execute_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    // `known_tool_names` 同时是本请求声明的客户端工具名集合：非流式路径不跑 `<invoke>`
+    // 文本嗅探，故这里只把它用于工具名还原（非法名 `bash -c` → 声明的 `Bash`）。
+    declared_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
@@ -1686,7 +1690,11 @@ pub(crate) async fn execute_non_stream_request(
                             }
                             Event::ToolUse(tool_use) => {
                                 has_tool_use = true;
-                                match tool_accumulator.push(&tool_use, &tool_name_map) {
+                                match tool_accumulator.push(
+                                    &tool_use,
+                                    &tool_name_map,
+                                    &declared_tool_names,
+                                ) {
                                     Ok(Some(completed)) => {
                                         tool_uses.push(completed.to_anthropic_block());
                                     }
@@ -1789,7 +1797,7 @@ pub(crate) async fn execute_non_stream_request(
         // calls or replace the authoritative refusal with their JSON errors.
         tool_json_error = None;
     } else if tool_json_error.is_none() {
-        match tool_accumulator.finish(&tool_name_map) {
+        match tool_accumulator.finish(&tool_name_map, &declared_tool_names) {
             Ok(recovered) => {
                 for completed in recovered {
                     tool_uses.push(completed.to_anthropic_block());
@@ -3173,5 +3181,365 @@ mod tests {
             missing.is_empty(),
             "以下 SSE 响应缺少 `x-accel-buffering: no`：{missing:?}"
         );
+    }
+}
+
+/// 端到端：真实 `post_messages` handler → 真实 `KiroProvider` → 本地 mock 上游端点。
+///
+/// 不需要真实凭据、不访问 AWS：`KiroProvider::new` 接受自定义 `KiroEndpoint`
+/// 注册表，mock 端点把 `api_url` 指到进程内的本地 HTTP 服务，并把收到的请求体交回
+/// 测试断言。这是纯测试侧注入，生产配置未做任何改动。
+#[cfg(test)]
+mod illegal_tool_name_e2e {
+    use super::*;
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::provider::KiroProvider;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
+    use axum::http::StatusCode;
+    use std::sync::{Arc, Mutex};
+
+    /// 捕获到的上游请求体（以及上游应答序列）。
+    #[derive(Default)]
+    struct Captured {
+        bodies: Mutex<Vec<String>>,
+    }
+
+    struct MockEndpoint {
+        base_url: String,
+        captured: Arc<Captured>,
+    }
+
+    impl KiroEndpoint for MockEndpoint {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn api_url(&self, _ctx: &RequestContext<'_>) -> String {
+            format!("{}/generateAssistantResponse", self.base_url)
+        }
+        fn mcp_url(&self, _ctx: &RequestContext<'_>) -> String {
+            format!("{}/mcp", self.base_url)
+        }
+        fn decorate_api(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+        fn decorate_mcp(
+            &self,
+            req: reqwest::RequestBuilder,
+            _ctx: &RequestContext<'_>,
+        ) -> reqwest::RequestBuilder {
+            req
+        }
+        fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
+            // 记录「真正会 POST 出去」的请求体：这是 provider 链路的最后一道加工。
+            self.captured.bodies.lock().unwrap().push(body.to_string());
+            body.to_string()
+        }
+    }
+
+    /// 构造一个最小合法的 AWS Event Stream 帧（event 类型），payload 为 JSON。
+    fn frame(event_type: &str, payload: &str) -> Vec<u8> {
+        use crate::kiro::parser::crc::crc32;
+
+        let mut headers = Vec::new();
+        for (name, value) in [
+            (":message-type", "event"),
+            (":event-type", event_type),
+            (":content-type", "application/json"),
+        ] {
+            headers.push(name.len() as u8);
+            headers.extend_from_slice(name.as_bytes());
+            headers.push(7u8); // string type
+            headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            headers.extend_from_slice(value.as_bytes());
+        }
+
+        let total = 12 + headers.len() + payload.len() + 4;
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(&(total as u32).to_be_bytes());
+        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        out.extend_from_slice(&crc32(&out[..8]).to_be_bytes());
+        out.extend_from_slice(&headers);
+        out.extend_from_slice(payload.as_bytes());
+        let crc = crc32(&out);
+        out.extend_from_slice(&crc.to_be_bytes());
+        out
+    }
+
+    /// 上游应答：一个 `name` 的 toolUse 事件。默认传 `bash -c`（非法工具名，
+    /// 正是线上观测到的形态）；ClaudeCode 模式下传 Kiro 侧名 `execute_bash -c`。
+    fn upstream_bytes(name: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(frame(
+            "toolUseEvent",
+            &serde_json::json!({
+                "name": name,
+                "toolUseId": "toolu_x",
+                "input": "{\"command\":\"echo hi\"}",
+                "stop": true,
+            })
+            .to_string(),
+        ));
+        body
+    }
+
+    /// 启动本地 mock 上游（返回 (base_url, captured, handle)）。
+    async fn start_mock(
+        upstream_name: &str,
+    ) -> (String, Arc<Captured>, tokio::task::JoinHandle<()>) {
+        use axum::routing::post;
+
+        let captured = Arc::new(Captured::default());
+        let inner = captured.clone();
+        let upstream_name = upstream_name.to_string();
+        let app = axum::Router::new().route(
+            "/generateAssistantResponse",
+            post(move || {
+                let captured = inner.clone();
+                let upstream_name = upstream_name.clone();
+                async move {
+                    // 每次被调用都回同一段事件流；请求体由 transform_api_body 捕获。
+                    let _ = &captured;
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/vnd.amazon.eventstream")],
+                        upstream_bytes(&upstream_name),
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), captured, handle)
+    }
+
+    fn provider(captured: Arc<Captured>, base_url: String) -> Arc<KiroProvider> {
+        // API Key 凭据：无需刷新，直接作为 Bearer 使用（纯合成内容）。
+        let credentials = KiroCredentials {
+            kiro_api_key: Some("ksk_synthetic_test_key".to_string()),
+            auth_method: Some("api_key".to_string()),
+            ..KiroCredentials::default()
+        };
+        let token_manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credentials], None, None, false)
+                .unwrap(),
+        );
+        let _ = &captured;
+        let endpoints: std::collections::HashMap<String, Arc<dyn KiroEndpoint>> =
+            std::collections::HashMap::from([(
+                "mock".to_string(),
+                Arc::new(MockEndpoint { base_url, captured }) as Arc<dyn KiroEndpoint>,
+            )]);
+        Arc::new(KiroProvider::new(
+            token_manager,
+            endpoints,
+            "mock".to_string(),
+        ))
+    }
+
+    fn synthetic_request_body() -> serde_json::Value {
+        serde_json::json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 1024,
+            "stream": false,
+            "tools": [{
+                "name": "Bash",
+                "description": "run a command",
+                "input_schema": {"type": "object", "properties": {}}
+            }],
+            "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_x", "name": "bash -c",
+                     "input": {"command": "echo hi"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_x", "content": "hi"},
+                    {"type": "text", "text": "go on"}
+                ]}
+            ]
+        })
+    }
+
+    fn assert_no_illegal_names(body: &str) {
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let state = &json["conversationState"];
+        let mut names = Vec::new();
+        for tool in state["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            names.push(
+                tool["toolSpecification"]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        for msg in state["history"].as_array().into_iter().flatten() {
+            for tu in msg["assistantResponseMessage"]["toolUses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                names.push(tu["name"].as_str().unwrap().to_string());
+            }
+        }
+        assert!(!names.is_empty(), "上游请求体应包含工具名: {body}");
+        for name in &names {
+            assert!(
+                crate::anthropic::converter::is_legal_tool_name(name),
+                "上游请求体出现非法工具名 {:?}: {}",
+                name,
+                body
+            );
+            assert!(!name.contains(' '), "工具名不得含空格: {}", name);
+        }
+        assert!(
+            !body.contains("\"bash -c\""),
+            "非法名不得原样出现在上游请求体: {body}"
+        );
+    }
+
+    async fn run_through_handler(
+        mode: crate::model::config::ToolCompatibilityMode,
+        upstream_name: &str,
+    ) -> (String, serde_json::Value) {
+        let (base_url, captured, handle) = start_mock(upstream_name).await;
+        let provider = provider(captured.clone(), base_url);
+
+        let keys: crate::admin::client_keys::SharedClientKeyManager =
+            Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+        keys.create_with_key(
+            "test".to_string(),
+            None,
+            None,
+            "sk-synthetic-test-key".to_string(),
+        );
+
+        let state = AppState::new(false, mode).with_shared_kiro_provider(provider.clone());
+        let state = state.with_usage(Some(keys), None, None);
+
+        let app = axum::Router::new()
+            .route("/v1/messages", axum::routing::post(post_messages))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::anthropic::middleware::auth_middleware,
+            ))
+            .with_state(state);
+
+        // 用真实 TCP 监听把 handler 挂起来（不引入新的 dev-dependency），
+        // 再用普通 HTTP 客户端发请求，走完整的 axum 路由 + 中间件 + handler 链路。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .header("x-api-key", "sk-synthetic-test-key")
+            .json(&synthetic_request_body())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.bytes().await.unwrap();
+        app_handle.abort();
+        handle.abort();
+
+        assert_eq!(status, StatusCode::OK, "handler 应成功返回");
+        let bodies = captured.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "应恰好向上游发送一次请求");
+        (bodies[0].clone(), serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Raw 模式端到端：上游请求体无非法名；客户端拿到声明的 `Bash`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handler_sends_no_illegal_tool_names_raw_mode() {
+        let (body, response) =
+            run_through_handler(crate::model::config::ToolCompatibilityMode::Raw, "bash -c").await;
+        println!("--- upstream body (raw) ---\n{}", body);
+        assert_no_illegal_names(&body);
+
+        // 响应里的 tool_use 名必须是 Bash，input 里 command 保留
+        let tool = response["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("响应应含 tool_use");
+        assert_eq!(tool["name"], "Bash");
+        assert_eq!(tool["input"]["command"], "echo hi");
+    }
+
+    /// ClaudeCode 兼容模式端到端：上游看到 `execute_bash`，客户端看到 `Bash`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handler_sends_no_illegal_tool_names_claude_code_mode() {
+        let (body, response) = run_through_handler(
+            crate::model::config::ToolCompatibilityMode::ClaudeCode,
+            "bash -c",
+        )
+        .await;
+        println!("--- upstream body (claude-code) ---\n{}", body);
+        assert_no_illegal_names(&body);
+        assert!(
+            body.contains("\"execute_bash\""),
+            "ClaudeCode 模式下 Bash 应映射为 execute_bash: {body}"
+        );
+
+        let tool = response["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("响应应含 tool_use");
+        assert_eq!(tool["name"], "Bash");
+        assert_eq!(tool["input"]["command"], "echo hi");
+    }
+
+    /// ClaudeCode 兼容模式端到端（原 PR 的 QA 观察点）：上游回吐的是 **Kiro 侧名**
+    /// `execute_bash -c`（不是客户端的 `Bash`）。它字符合法，若不跟一次 Kiro→客户端
+    /// 映射就会停在 `execute_bash` —— 合法但客户端不认识，下一轮历史回放仍会对不上。
+    /// 期望：客户端看到声明的 `Bash`，入参仍是 `command`。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handler_resolves_kiro_side_illegal_name_to_client_tool() {
+        let (body, response) = run_through_handler(
+            crate::model::config::ToolCompatibilityMode::ClaudeCode,
+            "execute_bash -c",
+        )
+        .await;
+        println!("--- upstream body (claude-code, alias upstream name) ---\n{body}");
+        assert_no_illegal_names(&body);
+        assert!(
+            body.contains("\"execute_bash\""),
+            "上游 tools[] 仍应是 execute_bash: {body}"
+        );
+        assert!(
+            !body.contains("execute_bash -c"),
+            "非法名不得进入上游请求体: {body}"
+        );
+
+        let tool = response["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("响应应含 tool_use");
+        assert_eq!(
+            tool["name"], "Bash",
+            "Kiro 侧别名必须还原成客户端声明名，不能停在 execute_bash"
+        );
+        assert_eq!(tool["input"]["command"], "echo hi");
     }
 }
