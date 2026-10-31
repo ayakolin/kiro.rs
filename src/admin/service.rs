@@ -38,11 +38,10 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
-    AvailableModelItem,
-    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
-    CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
-    CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
+    AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
+    BatchImportEvent, CacheMeteringConfigResponse, CacheMeteringStatsResponse,
+    CheckRateLimitRequest, CredentialMetadataDetail, CredentialMetadataSchemaConfig,
+    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
     CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
@@ -2585,6 +2584,51 @@ impl AdminService {
 
         Ok(self.get_model_api_429_infinite_retry_config())
     }
+    /// 获取账号级 429 无限重试配置
+    pub fn get_account_rate_limit_infinite_retry_config(
+        &self,
+    ) -> super::types::AccountRateLimitInfiniteRetryConfigResponse {
+        super::types::AccountRateLimitInfiniteRetryConfigResponse {
+            enabled: self
+                .token_manager
+                .get_account_rate_limit_infinite_retry_enabled(),
+        }
+    }
+
+    /// 更新账号级 429 无限重试配置
+    pub fn set_account_rate_limit_infinite_retry_config(
+        &self,
+        req: super::types::SetAccountRateLimitInfiniteRetryConfigRequest,
+    ) -> Result<super::types::AccountRateLimitInfiniteRetryConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_account_rate_limit_infinite_retry_enabled(req.enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_account_rate_limit_infinite_retry_config())
+    }
+
+    /// 获取全凭据冷却重试间隔配置
+    pub fn get_all_creds_cooldown_retry_interval_config(
+        &self,
+    ) -> super::types::AllCredsCooldownRetryIntervalConfigResponse {
+        super::types::AllCredsCooldownRetryIntervalConfigResponse {
+            interval_ms: self
+                .token_manager
+                .get_all_creds_cooldown_retry_interval_ms(),
+        }
+    }
+
+    /// 更新全凭据冷却重试间隔配置
+    pub fn set_all_creds_cooldown_retry_interval_config(
+        &self,
+        req: super::types::SetAllCredsCooldownRetryIntervalConfigRequest,
+    ) -> Result<super::types::AllCredsCooldownRetryIntervalConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_all_creds_cooldown_retry_interval_ms(req.interval_ms)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_all_creds_cooldown_retry_interval_config())
+    }
 
     /// 获取单账号 RPM 限流配置
     pub fn get_account_rpm_limit_config(&self) -> AccountRpmLimitConfigResponse {
@@ -4346,6 +4390,57 @@ mod cache_metering_config_tests {
                 .unwrap()
                 .model_api_429_infinite_retry
         );
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+    #[tokio::test]
+    async fn account_rate_limit_infinite_retry_and_interval_round_trip_through_admin_api() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-admin-account-rate-limit-infinite-retry-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+
+        assert!(
+            !service
+                .get_account_rate_limit_infinite_retry_config()
+                .enabled
+        );
+        assert_eq!(
+            service
+                .get_all_creds_cooldown_retry_interval_config()
+                .interval_ms,
+            0
+        );
+
+        let response = service
+            .set_account_rate_limit_infinite_retry_config(
+                crate::admin::types::SetAccountRateLimitInfiniteRetryConfigRequest {
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        assert!(response.enabled);
+
+        let int_response = service
+            .set_all_creds_cooldown_retry_interval_config(
+                crate::admin::types::SetAllCredsCooldownRetryIntervalConfigRequest {
+                    interval_ms: 250,
+                },
+            )
+            .unwrap();
+        assert_eq!(int_response.interval_ms, 250);
+
+        let reloaded = Config::load(&config_path).unwrap();
+        assert!(reloaded.account_rate_limit_infinite_retry);
+        assert_eq!(reloaded.all_creds_cooldown_retry_interval_ms, 250);
 
         std::fs::remove_file(&config_path).unwrap();
     }

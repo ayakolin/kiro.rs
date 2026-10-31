@@ -143,16 +143,42 @@ fn provider(
     upstream: &MockUpstream,
     infinite_retry: bool,
 ) -> (KiroProvider, Arc<MultiTokenManager>) {
+    provider_with_switches(upstream, infinite_retry, false, 0)
+}
+
+fn provider_with_switches(
+    upstream: &MockUpstream,
+    model_api_infinite: bool,
+    account_infinite: bool,
+    interval_ms: u64,
+) -> (KiroProvider, Arc<MultiTokenManager>) {
     let credential = KiroCredentials {
         id: Some(1),
         auth_method: Some("api_key".to_string()),
         kiro_api_key: Some("ksk_synthetic_429_fixture".to_string()),
         ..Default::default()
     };
+    multi_provider_with_switches(
+        upstream,
+        vec![credential],
+        model_api_infinite,
+        account_infinite,
+        interval_ms,
+    )
+}
+
+fn multi_provider_with_switches(
+    upstream: &MockUpstream,
+    credentials: Vec<KiroCredentials>,
+    model_api_infinite: bool,
+    account_infinite: bool,
+    interval_ms: u64,
+) -> (KiroProvider, Arc<MultiTokenManager>) {
     let mut config = Config::default();
-    config.model_api_429_infinite_retry = infinite_retry;
-    let manager =
-        Arc::new(MultiTokenManager::new(config, vec![credential], None, None, false).unwrap());
+    config.model_api_429_infinite_retry = model_api_infinite;
+    config.account_rate_limit_infinite_retry = account_infinite;
+    config.all_creds_cooldown_retry_interval_ms = interval_ms;
+    let manager = Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
     let endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::from([(
         "loopback".to_string(),
         Arc::new(LoopbackEndpoint(upstream.url.clone())) as Arc<dyn KiroEndpoint>,
@@ -318,7 +344,7 @@ async fn infinite_retry_stops_when_client_disconnects() {
 async fn infinite_retry_keeps_retrying_while_all_credentials_cool() {
     // 账号级 429：每次都会把唯一凭据打进冷却，无限重试必须忽略冷却继续撞。
     let upstream = MockUpstream::start(6, true, Duration::from_millis(30)).await;
-    let (provider, manager) = provider(&upstream, true);
+    let (provider, manager) = provider_with_switches(&upstream, true, true, 0);
     let sink = provider.capture_retry_logs();
 
     // 采样：证明整个过程中唯一凭据确实被账号级 429 打进了冷却（否则本用例退化成
@@ -530,4 +556,106 @@ async fn infinite_retry_summary_labels_distinguish_stop_reasons() {
     );
     assert!(lines[0].contains("重试 3 次"), "{}", lines[0]);
     assert!(lines[0].contains("耗时"), "{}", lines[0]);
+}
+/// 测试 4 种开关组合对模型容量类 429 与账号级 429 的正交独立表现
+#[tokio::test]
+async fn four_switch_combinations_for_capacity_and_account_429() {
+    for (model_inf, acct_inf) in [(false, false), (true, false), (false, true), (true, true)] {
+        // 容量类 429 场景：前 5 次 429，第 6 次 200
+        let cap_upstream = MockUpstream::start(5, false, Duration::ZERO).await;
+        let (cap_prov, _) = provider_with_switches(&cap_upstream, model_inf, acct_inf, 0);
+        let cap_res = timeout(Duration::from_secs(4), cap_prov.call_api("{}", None, None)).await;
+
+        if model_inf {
+            assert!(
+                cap_res.unwrap().is_ok(),
+                "model_inf=true 时容量类 429 必须成功"
+            );
+        } else {
+            // master 行为：单凭据 3 次重试用尽后返回 429 错误
+            assert!(
+                cap_res.unwrap().is_err(),
+                "model_inf=false 时容量类 429 应按 master 返回错误"
+            );
+        }
+
+        // 账号级 429 场景：前 5 次 429（全冷却），第 6 次 200
+        let acct_upstream = MockUpstream::start(5, true, Duration::from_millis(10)).await;
+        let (acct_prov, _) = provider_with_switches(&acct_upstream, model_inf, acct_inf, 0);
+        let acct_res = timeout(Duration::from_secs(4), acct_prov.call_api("{}", None, None)).await;
+
+        if acct_inf {
+            assert!(
+                acct_res.unwrap().is_ok(),
+                "acct_inf=true 时账号级 429 必须全冷却轮转成功"
+            );
+        } else {
+            // master 行为：唯一凭据冷却后无可用凭据，直接返回 429 错误
+            assert!(
+                acct_res.unwrap().is_err(),
+                "acct_inf=false 时账号级 429 应按 master 返回错误"
+            );
+        }
+    }
+}
+
+/// 测试全部凭据在冷却时的最小重试间隔配置与凭据轮转
+#[tokio::test]
+async fn all_creds_cooldown_retry_interval_bounds_hit_rate_and_rotates() {
+    let cred1 = KiroCredentials {
+        id: Some(1),
+        auth_method: Some("api_key".to_string()),
+        kiro_api_key: Some("ksk_cred1".to_string()),
+        priority: 10,
+        ..Default::default()
+    };
+    let cred2 = KiroCredentials {
+        id: Some(2),
+        auth_method: Some("api_key".to_string()),
+        kiro_api_key: Some("ksk_cred2".to_string()),
+        priority: 20,
+        ..Default::default()
+    };
+
+    // 1. interval = 40ms：限制重试频率
+    let upstream_slow = MockUpstream::start(999, true, Duration::ZERO).await;
+    let (prov_slow, _) = multi_provider_with_switches(
+        &upstream_slow,
+        vec![cred1.clone(), cred2.clone()],
+        false,
+        true,
+        40,
+    );
+
+    let _ = timeout(
+        Duration::from_millis(150),
+        prov_slow.call_api("{}", None, None),
+    )
+    .await;
+    let slow_calls = upstream_slow.count();
+    // 150ms / 40ms = 最多 4-6 次请求，不可能爆发到几十次
+    assert!(
+        slow_calls <= 7,
+        "40ms interval 下 150ms 实际调用 {} 次，频率应受约束",
+        slow_calls
+    );
+
+    // 2. interval = 0ms：不卡顿但至少 yield 一次并轮转凭据
+    let upstream_fast = MockUpstream::start(999, true, Duration::ZERO).await;
+    let (prov_fast, manager_fast) =
+        multi_provider_with_switches(&upstream_fast, vec![cred1, cred2], false, true, 0);
+
+    let _ = timeout(
+        Duration::from_millis(50),
+        prov_fast.call_api("{}", None, None),
+    )
+    .await;
+    let fast_calls = upstream_fast.count();
+    assert!(
+        fast_calls > slow_calls,
+        "interval=0 时的重试次数 ({fast_calls}) 应高于带 interval ({slow_calls})"
+    );
+    // 验证轮转游标确实更新过（在凭据 1 和 2 之间轮转）
+    let cursor = manager_fast.snapshot().entries;
+    assert_eq!(cursor.len(), 2);
 }

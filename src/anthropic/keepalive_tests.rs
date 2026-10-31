@@ -204,8 +204,9 @@ async fn infinite_retry_stream_keeps_downstream_alive_with_pings() {
     let response = stream_response(state(&upstream, true)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
-        started.elapsed() < Duration::from_millis(200),
-        "响应头应在等待上游期间立即返回，实际耗时 {:?}",
+        started.elapsed() >= Duration::from_millis(200)
+            && started.elapsed() < Duration::from_millis(1500),
+        "响应头应在首次 429 后发出，实际耗时 {:?}",
         started.elapsed()
     );
 
@@ -323,5 +324,199 @@ async fn stream_without_infinite_retry_sends_no_ping_before_headers() {
     assert!(
         before_content.contains("event: message_start"),
         "{before_content}"
+    );
+}
+#[derive(Clone)]
+enum ScriptedStep {
+    Cap429,
+    E500(String),
+    Ctx400,
+}
+
+struct ScriptedMockUpstream {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ScriptedMockUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ScriptedMockUpstream {
+    async fn start(steps: Vec<ScriptedStep>, default_step: ScriptedStep) -> Self {
+        use std::collections::VecDeque;
+        let queue = Arc::new(parking_lot::Mutex::new(VecDeque::from(steps)));
+        let app = axum::Router::new().fallback(move || {
+            let q = queue.clone();
+            let def = default_step.clone();
+            async move {
+                let step = q.lock().pop_front().unwrap_or(def);
+                match step {
+                    ScriptedStep::Cap429 => Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"message":"Insufficient model capacity","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#,
+                        ))
+                        .unwrap(),
+                    ScriptedStep::E500(msg) => Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"message":"{msg}"}}"#)))
+                        .unwrap(),
+                    ScriptedStep::Ctx400 => Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+                        ))
+                        .unwrap(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self { url, task }
+    }
+}
+
+fn state_with_url(url: &str, infinite_retry: bool, disabled: bool) -> AppState {
+    let credential: KiroCredentials = serde_json::from_value(json!({
+        "id": 1,
+        "kiroApiKey": "fixture-only-keepalive",
+        "machineId": "0000000000000000000000000000000000000000000000000000000000000000",
+        "disabled": disabled,
+    }))
+    .unwrap();
+    let mut config = Config::default();
+    config.model_api_429_infinite_retry = infinite_retry;
+    let manager =
+        Arc::new(MultiTokenManager::new(config, vec![credential], None, None, false).unwrap());
+    let endpoints = HashMap::from([(
+        "loopback".to_owned(),
+        Arc::new(LoopbackEndpoint(url.to_owned())) as Arc<dyn KiroEndpoint>,
+    )]);
+    let provider = KiroProvider::new(manager, endpoints, "loopback".to_owned());
+    AppState::new(false, ToolCompatibilityMode::Raw).with_shared_kiro_provider(Arc::new(provider))
+}
+
+#[tokio::test]
+async fn immediate_failures_with_switch_on_are_byte_identical_to_switch_off() {
+    // 场景 1：凭据全部禁用（不经过网络直接失败）
+    let res_off = stream_response(state_with_url("http://127.0.0.1:1", false, true)).await;
+    let res_on = stream_response(state_with_url("http://127.0.0.1:1", true, true)).await;
+    assert_eq!(res_off.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(res_on.status(), StatusCode::BAD_GATEWAY);
+    let bytes_off = axum::body::to_bytes(res_off.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let bytes_on = axum::body::to_bytes(res_on.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes_off, bytes_on);
+
+    // 场景 2：上下文窗口溢出 400（首次上游调用即失败，无 429）
+    let mock = ScriptedMockUpstream::start(vec![ScriptedStep::Ctx400], ScriptedStep::Ctx400).await;
+    let res_off = stream_response(state_with_url(&mock.url, false, false)).await;
+    let res_on = stream_response(state_with_url(&mock.url, true, false)).await;
+    assert_eq!(res_off.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res_on.status(), StatusCode::BAD_REQUEST);
+    let bytes_off = axum::body::to_bytes(res_off.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let bytes_on = axum::body::to_bytes(res_on.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes_off, bytes_on);
+}
+
+#[tokio::test]
+async fn error_after_200_sse_429_then_context_too_long() {
+    let mock = ScriptedMockUpstream::start(
+        vec![ScriptedStep::Cap429, ScriptedStep::Ctx400],
+        ScriptedStep::Ctx400,
+    )
+    .await;
+    let res = stream_response(state_with_url(&mock.url, true, false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&bytes).to_string();
+
+    assert!(
+        !body_str.contains("event: message_start"),
+        "error 前严禁补发 message_start: {body_str}"
+    );
+    assert!(
+        !body_str.contains("content_block_start"),
+        "error 前严禁补发 content_block_start: {body_str}"
+    );
+    assert!(
+        !body_str.contains("content_block_stop"),
+        "error 前严禁补发 content_block_stop: {body_str}"
+    );
+    assert!(body_str.contains("event: error"), "{body_str}");
+    assert!(
+        body_str.contains(r#""type":"invalid_request_error""#),
+        "必须映射为 invalid_request_error: {body_str}"
+    );
+    assert!(
+        body_str.contains("Context window is full"),
+        "必须使用标准脱敏文案: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn error_after_200_sse_429_then_500() {
+    let mock = ScriptedMockUpstream::start(
+        vec![ScriptedStep::Cap429],
+        ScriptedStep::E500("internal-qa-secret-upstream-detail".into()),
+    )
+    .await;
+    let res = stream_response(state_with_url(&mock.url, true, false)).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&bytes).to_string();
+
+    assert!(
+        !body_str.contains("event: message_start"),
+        "error 前严禁补发 message_start: {body_str}"
+    );
+    assert!(
+        !body_str.contains("content_block_start"),
+        "error 前严禁补发 content_block_start: {body_str}"
+    );
+    assert!(body_str.contains("event: error"), "{body_str}");
+    assert!(
+        body_str.contains(r#""type":"api_error""#),
+        "必须映射为 api_error: {body_str}"
+    );
+    assert!(
+        body_str.contains("Upstream API request failed."),
+        "必须使用标准脱敏文案: {body_str}"
+    );
+
+    // 严禁泄露内部细节
+    assert!(
+        !body_str.contains("internal-qa-secret-upstream-detail"),
+        "泄露了上游原始响应体: {body_str}"
+    );
+    assert!(
+        !body_str.contains("127.0.0.1"),
+        "泄露了内部 URL: {body_str}"
+    );
+    assert!(
+        !body_str.contains("所有凭据均已禁用"),
+        "泄露了凭据数量等内部文本: {body_str}"
     );
 }

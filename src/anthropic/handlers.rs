@@ -179,7 +179,10 @@ impl UsageSource {
     }
 
     /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
-    pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
+    pub fn resolve(
+        has_provider_usage: bool,
+        cache_usage: &super::cache_metering::CacheUsage,
+    ) -> Self {
         if has_provider_usage {
             Self::Provider
         } else if cache_usage.cache_covered_est > 0 {
@@ -255,11 +258,16 @@ impl RequestTracer {
     fn mark_first_content(&self, events: &[SseEvent]) {
         if events.iter().any(|event| match event.event.as_str() {
             "content_block_start" => {
-                event.data.pointer("/content_block/type")
-                    .and_then(serde_json::Value::as_str) == Some("tool_use")
+                event
+                    .data
+                    .pointer("/content_block/type")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("tool_use")
             }
             "content_block_delta" => ["text", "thinking", "partial_json"].iter().any(|field| {
-                event.data.get("delta")
+                event
+                    .data
+                    .get("delta")
                     .and_then(|delta| delta.get(*field))
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|value| !value.is_empty())
@@ -452,69 +460,69 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-pub(super) fn map_provider_error(err: Error) -> Response {
+/// 分类后的 KiroProvider 错误详情，供 HTTP 状态码映射与流内 error 事件共享。
+#[derive(Debug, Clone)]
+pub(super) struct ClassifiedProviderError {
+    pub status: StatusCode,
+    pub error_type: &'static str,
+    pub message: String,
+    pub retry_after: Option<String>,
+}
+
+/// 将 KiroProvider 错误分类为 Anthropic 错误类型与脱敏文案。
+///
+/// 保证 HTTP 响应状态码路径与流式 `event: error` 终态路径共享同一份分类规则与脱敏文案，
+/// 严禁泄露上游原始报错体、内部 URL 或凭据数量等敏感信息。
+pub(super) fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
     if err
         .downcast_ref::<crate::kiro::error::UpstreamTimeoutError>()
         .is_some()
     {
-        return (
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(ErrorResponse::new(
-                "api_error",
-                "Upstream timed out before returning a response.",
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            error_type: "api_error",
+            message: "Upstream timed out before returning a response.".to_string(),
+            retry_after: None,
+        };
     }
     if let Some(unavailable) =
         err.downcast_ref::<crate::kiro::error::UpstreamModelUnavailableError>()
     {
-        let mut response = (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(
-                "overloaded_error",
-                "Upstream model is temporarily overloaded. Retry later.",
-            )),
-        )
-            .into_response();
-        if let Ok(value) = unavailable.retry_after.parse() {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-        return response;
+        let retry_after = unavailable
+            .retry_after
+            .parse::<header::HeaderValue>()
+            .ok()
+            .map(|v| v.to_str().unwrap_or("").to_string());
+        return ClassifiedProviderError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "overloaded_error",
+            message: "Upstream model is temporarily overloaded. Retry later.".to_string(),
+            retry_after,
+        };
     }
     if err
         .downcast_ref::<crate::kiro::error::UpstreamContextOverflowError>()
         .is_some()
     {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message:
+                "Context window is full. Reduce conversation history, system prompt, or tools."
+                    .to_string(),
+            retry_after: None,
+        };
     }
 
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
         tracing::warn!(error = %err, "上游限流（映射为 429）");
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "Upstream rate limit exceeded. Retry later.",
-            )),
-        )
-            .into_response();
-        if let Some(value) = rate_limit
-            .retry_after()
-            .and_then(|value| value.parse::<header::HeaderValue>().ok())
-        {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-        return response;
+        return ClassifiedProviderError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error_type: "rate_limit_error",
+            message: "Upstream rate limit exceeded. Retry later.".to_string(),
+            retry_after: rate_limit.retry_after().map(|s| s.to_string()),
+        };
     }
 
     let err_str = err.to_string();
@@ -522,29 +530,26 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message:
+                "Context window is full. Reduce conversation history, system prompt, or tools."
+                    .to_string(),
+            retry_after: None,
+        };
     }
 
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: "Input is too long. Reduce the size of your messages.".to_string(),
+            retry_after: None,
+        };
     }
-
     // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
     // The root cause is the client's own messages array, not an upstream failure, so it must not map to 5xx
     // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s.
@@ -558,25 +563,41 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         // Return a stable, client-facing message and avoid echoing the raw upstream
         // error string (which can carry request IDs or internal validation details).
         // The full error is already logged above for diagnostics.
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
+            retry_after: None,
+        };
     }
 
     tracing::error!("Kiro API 调用失败: {}", err);
-    (
-        StatusCode::BAD_GATEWAY,
+    ClassifiedProviderError {
+        status: StatusCode::BAD_GATEWAY,
+        error_type: "api_error",
+        message: "Upstream API request failed.".to_string(),
+        retry_after: None,
+    }
+}
+
+/// 将 KiroProvider 错误映射为 HTTP 响应
+pub(super) fn map_provider_error(err: Error) -> Response {
+    let classified = classify_provider_error(&err);
+    let mut response = (
+        classified.status,
         Json(ErrorResponse::new(
-            "api_error",
-            "Upstream API request failed.",
+            classified.error_type,
+            classified.message,
         )),
     )
-        .into_response()
+        .into_response();
+    if let Some(value) = classified
+        .retry_after
+        .and_then(|r| r.parse::<header::HeaderValue>().ok())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// 解析普通非流式响应的最终 Anthropic usage。
@@ -929,10 +950,9 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("消息序列无效: {}", reason),
-                ),
+                ConversionError::InvalidMessageSequence(reason) => {
+                    ("invalid_request_error", format!("消息序列无效: {}", reason))
+                }
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -1073,54 +1093,80 @@ async fn handle_stream_request(
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
 ) -> Response {
-    // 429 无限立即重试打开时，上游可能长时间不返回响应头（等待期一个字节都不回）。
-    // 此时必须先把 200 SSE 响应头发给下游并在等待期持续 ping，否则下游（如 CPA）
-    // 会按自己的超时断开。开关关闭时走下面的原路径，行为与 master 完全一致。
-    if provider
+    let infinite_retry = provider
         .token_manager()
         .get_model_api_429_infinite_retry_enabled()
-    {
-        return handle_stream_request_with_keepalive(
-            provider,
-            request_body,
+        || provider
+            .token_manager()
+            .get_account_rate_limit_infinite_retry_enabled();
+
+    if !infinite_retry {
+        // 开关关闭时完全沿用 master 既有流式调用路径，行为逐字节一致。
+        let call_result = match provider
+            .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+                tracer.finalize(
+                    "error",
+                    last_attempt_outcome(&tracer),
+                    Some(&format!("{e:#}")),
+                    None,
+                    TraceUsage::zero(),
+                );
+                return map_provider_error(e);
+            }
+        };
+        tracer.mark_upstream_headers_received();
+        let response = call_result.response;
+        let credential_id = call_result.credential_id;
+
+        let mut ctx = StreamContext::new_with_thinking(
             model,
             input_tokens,
             thinking_enabled,
             tool_name_map,
             known_tool_names,
+        );
+        ctx.cache_usage = cache_usage;
+
+        let initial_events = ctx.generate_initial_events();
+
+        let stream = create_sse_stream(
+            response,
+            ctx,
+            initial_events,
             hook,
-            cache_usage,
+            credential_id,
             tracer,
-            group,
-            structured_schema,
-        )
-        .await;
+            structured_schema.map(|schema| StructuredCollector::new(schema, model)),
+        );
+
+        return sse_response(stream);
     }
 
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&format!("{e:#}")),
-                None,
-                TraceUsage::zero(),
-            );
-            return map_provider_error(e);
-        }
+    // 429 无限立即重试打开时：仅在首次看到 429 后才发 200 SSE 响应头和 ping 保活。
+    // 首次遇到 429 之前就失败的情况（全部凭据禁用、上下文溢出等）与 master 完全一致，
+    // 返回对应的 HTTP 错误状态码和脱敏错误体。
+    let (first_429_tx, mut first_429_rx) = tokio::sync::oneshot::channel::<()>();
+    let call_provider = provider.clone();
+    let call_body = request_body.to_owned();
+    let call_group = group.clone();
+    let call_tracer = tracer.clone();
+    let call = async move {
+        call_provider
+            .call_api_stream_with_notifier(
+                &call_body,
+                Some(call_tracer.as_ref()),
+                call_group.as_deref(),
+                Some(first_429_tx),
+            )
+            .await
     };
-    tracer.mark_upstream_headers_received();
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
+    let mut call = Box::pin(call);
 
-    // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
         model,
         input_tokens,
@@ -1130,21 +1176,52 @@ async fn handle_stream_request(
     );
     ctx.cache_usage = cache_usage;
 
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
-
-    // 创建 SSE 流
-    let stream = create_sse_stream(
-        response,
-        ctx,
-        initial_events,
-        hook,
-        credential_id,
-        tracer,
-        structured_schema.map(|schema| StructuredCollector::new(schema, model)),
-    );
-
-    sse_response(stream)
+    tokio::select! {
+        biased;
+        result = &mut call => {
+            // 未遇到任何 429 就已结束（首轮即成功，或首次调用即出现非 429 错误）
+            match result {
+                Ok(call_result) => {
+                    tracer.mark_upstream_headers_received();
+                    let initial_events = ctx.generate_initial_events();
+                    let stream = create_sse_stream(
+                        call_result.response,
+                        ctx,
+                        initial_events,
+                        hook,
+                        call_result.credential_id,
+                        tracer,
+                        structured_schema.map(|schema| StructuredCollector::new(schema, model)),
+                    );
+                    sse_response(stream)
+                }
+                Err(e) => {
+                    hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+                    tracer.finalize(
+                        "error",
+                        last_attempt_outcome(&tracer),
+                        Some(&format!("{e:#}")),
+                        None,
+                        TraceUsage::zero(),
+                    );
+                    map_provider_error(e)
+                }
+            }
+        }
+        Ok(()) = &mut first_429_rx => {
+            // 首次遇到 429：此时上游进入无限重试，先向下游回 200 SSE 响应头并在等待期间持续 ping 保活。
+            let stream = create_keepalive_wait_stream(
+                call,
+                ctx,
+                hook,
+                tracer,
+                model.to_string(),
+                input_tokens,
+                structured_schema,
+            );
+            sse_response(stream)
+        }
+    }
 }
 
 /// 等待上游响应头期间的 keepalive ping 间隔（秒）。
@@ -1189,7 +1266,7 @@ struct KeepaliveWait {
 /// 重试链路最终失败时（响应头已发出，无法再改状态码）先补 `message_start` 让下游拿到
 /// 合法响应，再走 `generate_error_events` 的流内 error 事件。
 fn create_keepalive_wait_stream(
-    call: impl Future<Output = anyhow::Result<KiroCallResult>> + Send + 'static,
+    call: std::pin::Pin<Box<dyn Future<Output = anyhow::Result<KiroCallResult>> + Send>>,
     ctx: StreamContext,
     hook: UsageRecordHook,
     tracer: std::sync::Arc<RequestTracer>,
@@ -1205,10 +1282,7 @@ fn create_keepalive_wait_stream(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let state = KeepaliveWait {
-        phase: KeepalivePhase::Waiting {
-            call: Box::pin(call),
-            ticker,
-        },
+        phase: KeepalivePhase::Waiting { call, ticker },
         ctx: Some(ctx),
         hook: Some(hook),
         tracer,
@@ -1256,14 +1330,11 @@ fn create_keepalive_wait_stream(
                                         )));
                                 }
                                 Err(e) => {
-                                    let message = format!("{e:#}");
+                                    let classified = classify_provider_error(&e);
                                     tracing::error!(
-                                        error = %message,
+                                        error = %classified.message,
+                                        error_type = %classified.error_type,
                                         "429 无限重试等待期结束后仍未拿到上游响应，转为流内错误事件"
-                                    );
-                                    let mut events = ctx.generate_initial_events();
-                                    events.extend(
-                                        ctx.generate_error_events("api_error", &message),
                                     );
                                     state
                                         .hook
@@ -1273,14 +1344,22 @@ fn create_keepalive_wait_stream(
                                     state.tracer.finalize(
                                         "error",
                                         last_attempt_outcome(&state.tracer),
-                                        Some(&message),
+                                        Some(&classified.message),
                                         None,
                                         TraceUsage::zero(),
                                     );
-                                    let bytes: Vec<Result<Bytes, Infallible>> = events
-                                        .into_iter()
-                                        .map(|event| Ok(Bytes::from(event.to_sse_string())))
-                                        .collect();
+                                    let sse_event = SseEvent::new(
+                                        "error",
+                                        json!({
+                                            "type": "error",
+                                            "error": {
+                                                "type": classified.error_type,
+                                                "message": classified.message,
+                                            }
+                                        }),
+                                    );
+                                    let bytes: Vec<Result<Bytes, Infallible>> =
+                                        vec![Ok(Bytes::from(sse_event.to_sse_string()))];
                                     return Some((stream::iter(bytes), state));
                                 }
                             }
@@ -1316,59 +1395,6 @@ fn sse_response(
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
-}
-
-/// 429 无限重试打开时的流式入口：先回 200 SSE 响应头，等待上游期间持续 ping。
-#[allow(clippy::too_many_arguments)]
-async fn handle_stream_request_with_keepalive(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
-    model: &str,
-    input_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
-    known_tool_names: std::collections::HashSet<String>,
-    hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
-    tracer: std::sync::Arc<RequestTracer>,
-    group: Option<String>,
-    structured_schema: Option<serde_json::Value>,
-) -> Response {
-    let mut ctx = StreamContext::new_with_thinking(
-        model,
-        input_tokens,
-        thinking_enabled,
-        tool_name_map,
-        known_tool_names,
-    );
-    ctx.cache_usage = cache_usage;
-
-    // provider future 必须拥有自己借用的数据：下游 body 要求 'static。
-    let call_provider = provider.clone();
-    let call_body = request_body.to_owned();
-    let call_group = group.clone();
-    let call_tracer = tracer.clone();
-    let call = async move {
-        call_provider
-            .call_api_stream(
-                &call_body,
-                Some(call_tracer.as_ref()),
-                call_group.as_deref(),
-            )
-            .await
-    };
-
-    let stream = create_keepalive_wait_stream(
-        call,
-        ctx,
-        hook,
-        tracer,
-        model.to_owned(),
-        input_tokens,
-        structured_schema,
-    );
-
-    sse_response(stream)
 }
 
 /// Ping 事件间隔（25秒）
@@ -2023,7 +2049,11 @@ pub(crate) async fn execute_non_stream_request(
             &tracer,
             credential_id,
             input_tokens,
-            if received_data { "Upstream ended with an incomplete event frame" } else { "Upstream returned an empty event stream" },
+            if received_data {
+                "Upstream ended with an incomplete event frame"
+            } else {
+                "Upstream returned an empty event stream"
+            },
         ));
     }
 
@@ -2456,10 +2486,9 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("消息序列无效: {}", reason),
-                ),
+                ConversionError::InvalidMessageSequence(reason) => {
+                    ("invalid_request_error", format!("消息序列无效: {}", reason))
+                }
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -2631,16 +2660,26 @@ mod tests {
         };
         let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]});
         let mut with_format = request(json!({"format": {"type": "json_schema", "schema": schema}}));
-        assert!(append_schema_instruction(with_format.output_config.as_ref(), &mut with_format.system).is_some());
+        assert!(
+            append_schema_instruction(with_format.output_config.as_ref(), &mut with_format.system)
+                .is_some()
+        );
         let system = with_format.system.as_ref().unwrap();
         assert_eq!(system.len(), 1);
         assert!(system[0].text.contains("\"ok\""));
         // 不带 format：不注入
         let mut plain = request(json!({"effort": "high"}));
-        assert!(append_schema_instruction(plain.output_config.as_ref(), &mut plain.system).is_none());
+        assert!(
+            append_schema_instruction(plain.output_config.as_ref(), &mut plain.system).is_none()
+        );
         assert!(plain.system.is_none());
         // output_config 不会被转发给外部 count_tokens API
-        assert!(serde_json::to_value(&with_format).unwrap().get("output_config").is_none());
+        assert!(
+            serde_json::to_value(&with_format)
+                .unwrap()
+                .get("output_config")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3107,10 +3146,12 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Context window is full"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Context window is full")
+        );
     }
 
     #[tokio::test]

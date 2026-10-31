@@ -54,6 +54,8 @@ const NON_DATA_QUERY_ROOTS = new Set([
   'accountThrottleConfig',
   'modelApiRetryConfig',
   'modelApi429InfiniteRetryConfig',
+  'accountRateLimitInfiniteRetryConfig',
+  'allCredsCooldownRetryIntervalConfig',
   'accountRpmLimitConfig',
   'selfHealConfig',
   'logGovernanceConfig',

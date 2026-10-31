@@ -24,6 +24,10 @@ import {
   setModelApiRetryConfig,
   getModelApi429InfiniteRetryConfig,
   setModelApi429InfiniteRetryConfig,
+  getAccountRateLimitInfiniteRetryConfig,
+  setAccountRateLimitInfiniteRetryConfig,
+  getAllCredsCooldownRetryIntervalConfig,
+  setAllCredsCooldownRetryIntervalConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
   getQuotaResetRecoveryConfig,
@@ -342,6 +346,43 @@ export function useSetModelApi429InfiniteRetryConfig() {
     mutationFn: setModelApi429InfiniteRetryConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['modelApi429InfiniteRetryConfig'] })
+    },
+  })
+}
+// 获取账号级 429 无限立即重试配置
+export function useAccountRateLimitInfiniteRetryConfig() {
+  return useQuery({
+    queryKey: ['accountRateLimitInfiniteRetryConfig'],
+    queryFn: getAccountRateLimitInfiniteRetryConfig,
+  })
+}
+
+// 更新账号级 429 无限立即重试配置
+export function useSetAccountRateLimitInfiniteRetryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAccountRateLimitInfiniteRetryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['accountRateLimitInfiniteRetryConfig'] })
+    },
+  })
+}
+
+// 获取全凭据冷却重试等待间隔配置
+export function useAllCredsCooldownRetryIntervalConfig() {
+  return useQuery({
+    queryKey: ['allCredsCooldownRetryIntervalConfig'],
+    queryFn: getAllCredsCooldownRetryIntervalConfig,
+  })
+}
+
+// 更新全凭据冷却重试等待间隔配置
+export function useSetAllCredsCooldownRetryIntervalConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAllCredsCooldownRetryIntervalConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['allCredsCooldownRetryIntervalConfig'] })
     },
   })
 }

@@ -559,6 +559,36 @@ pub struct ModelApi429InfiniteRetryConfigResponse {
 pub struct SetModelApi429InfiniteRetryConfigRequest {
     pub enabled: bool,
 }
+/// 账号级 429 无限重试配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRateLimitInfiniteRetryConfigResponse {
+    /// 是否对账号级 429 无限重试
+    pub enabled: bool,
+}
+
+/// 更新账号级 429 无限重试配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountRateLimitInfiniteRetryConfigRequest {
+    pub enabled: bool,
+}
+
+/// 全凭据冷却重试间隔配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllCredsCooldownRetryIntervalConfigResponse {
+    /// 全凭据冷却重试间隔（毫秒）
+    pub interval_ms: u64,
+}
+
+/// 更新全凭据冷却重试间隔配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAllCredsCooldownRetryIntervalConfigRequest {
+    #[serde(alias = "intervalMs")]
+    pub interval_ms: u64,
+}
 
 /// 单账号 RPM 限流配置响应
 #[derive(Debug, Serialize)]

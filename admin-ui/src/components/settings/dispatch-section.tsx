@@ -5,6 +5,10 @@ import {
   useSetModelApiRetryConfig,
   useModelApi429InfiniteRetryConfig,
   useSetModelApi429InfiniteRetryConfig,
+  useAccountRateLimitInfiniteRetryConfig,
+  useSetAccountRateLimitInfiniteRetryConfig,
+  useAllCredsCooldownRetryIntervalConfig,
+  useSetAllCredsCooldownRetryIntervalConfig,
   useAccountRpmLimitConfig,
   useSetAccountRpmLimitConfig,
   useQuotaResetRecoveryConfig,
@@ -121,11 +125,28 @@ function RateLimitHandlingGroup() {
     useModelApi429InfiniteRetryConfig()
   const { mutate: setInfiniteRetry } = useSetModelApi429InfiniteRetryConfig()
   const infiniteRetrySaver = useFieldSaver(setInfiniteRetry, reportSaveError)
+  const { data: accountInfiniteRetry, isLoading: accountInfiniteRetryLoading } =
+    useAccountRateLimitInfiniteRetryConfig()
+  const { mutate: setAccountInfiniteRetry } =
+    useSetAccountRateLimitInfiniteRetryConfig()
+  const accountInfiniteRetrySaver = useFieldSaver(
+    setAccountInfiniteRetry,
+    reportSaveError,
+  )
+  const { data: cooldownInterval, isLoading: cooldownIntervalLoading } =
+    useAllCredsCooldownRetryIntervalConfig()
+  const { mutate: setCooldownInterval } =
+    useSetAllCredsCooldownRetryIntervalConfig()
+  const cooldownIntervalSaver = useFieldSaver(
+    setCooldownInterval,
+    reportSaveError,
+  )
   const failover = throttle?.failover ?? true
   const cooldownSecs = throttle?.cooldownSecs ?? 30 * SECS_PER_MIN
   const retryEnabled = retry?.enabled ?? true
   const infiniteRetryEnabled = infiniteRetry?.enabled ?? false
-
+  const accountInfiniteRetryEnabled = accountInfiniteRetry?.enabled ?? false
+  const allCredsCooldownRetryIntervalMs = cooldownInterval?.intervalMs ?? 0
   return (
     <SettingGroup
       title="上游 429 处理"
@@ -175,17 +196,47 @@ function RateLimitHandlingGroup() {
         disabled={retryLoading}
       />
       <SettingSwitch
-        label="429 无限立即重试"
+        label="容量类 429 无限立即重试"
         hint={
           infiniteRetryEnabled
-            ? '任何 429 都不返回客户端，不等待、不限次数（5xx/408/网络错误仍按上限返回）；流式请求等待期会持续发 ping 保活；非流式无法保活，实际等待受下游读超时限制'
-            : '沿用上面的次数上限与退避'
+            ? 'capacity / high traffic 等容量类 429 不返回客户端，不等待、不限次数（5xx/408/网络错误仍按上限返回）；流式请求等待期持续发 ping 保活；非流式无法保活，实际等待受下游读超时限制'
+            : '沿用普通 429 自动重试的次数上限与退避'
         }
         checked={infiniteRetryEnabled}
         onChange={(next) => infiniteRetrySaver.save('enabled', { enabled: next })}
         pending={infiniteRetrySaver.isSaving('enabled')}
         saved={infiniteRetrySaver.isSaved('enabled')}
         disabled={infiniteRetryLoading}
+      />
+      <SettingSwitch
+        label="账号级 429 无限立即重试"
+        hint={
+          accountInfiniteRetryEnabled
+            ? '账号级 429（如 SERVICE_REQUEST_RATE_EXCEEDED）冷却换号后无限立即重试，全凭据冷却时在凭据间轮转重试，不返回客户端；流式等待期持续发 ping 保活'
+            : '沿用故障转移既有行为，无可用凭据时返回 429'
+        }
+        checked={accountInfiniteRetryEnabled}
+        onChange={(next) =>
+          accountInfiniteRetrySaver.save('enabled', { enabled: next })
+        }
+        pending={accountInfiniteRetrySaver.isSaving('enabled')}
+        saved={accountInfiniteRetrySaver.isSaved('enabled')}
+        disabled={accountInfiniteRetryLoading}
+      />
+      <SettingNumber
+        label="全凭据冷却重试间隔"
+        hint="所有凭据都处于冷却时，两次重试之间的等待间隔（毫秒）。设为 0 表示不等待（每次让出 CPU 后立即轮转重试）"
+        value={allCredsCooldownRetryIntervalMs}
+        onCommit={(ms) =>
+          cooldownIntervalSaver.save('intervalMs', { intervalMs: ms })
+        }
+        min={0}
+        max={60000}
+        unit="ms"
+        presets={[0, 50, 200, 500, 1000]}
+        pending={cooldownIntervalSaver.isSaving('intervalMs')}
+        saved={cooldownIntervalSaver.isSaved('intervalMs')}
+        disabled={cooldownIntervalLoading}
       />
     </SettingGroup>
   )
