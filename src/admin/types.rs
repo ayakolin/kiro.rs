@@ -541,6 +541,25 @@ pub struct SetModelApiRetryConfigRequest {
     pub enabled: bool,
 }
 
+/// 普通模型 API 429 无限重试配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelApi429InfiniteRetryConfigResponse {
+    /// 是否对普通模型 API 429 无限重试
+    pub enabled: bool,
+}
+
+/// 更新普通模型 API 429 无限重试配置
+///
+/// 默认关闭。开启后普通 429 永不返回下游、无次数上限、不 sleep；
+/// 账号级仍照常冷却并切换账号，全部账号冷却时忽略冷却继续重试；
+/// 下游客户端断开即停止重试。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelApi429InfiniteRetryConfigRequest {
+    pub enabled: bool,
+}
+
 /// 单账号 RPM 限流配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

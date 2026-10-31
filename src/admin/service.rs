@@ -38,19 +38,20 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
-    AvailableModelItem,
-    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
-    CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
-    CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
-    CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
+    AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
+    BatchImportEvent, CacheMeteringConfigResponse, CacheMeteringStatsResponse,
+    CheckRateLimitRequest, CredentialMetadataDetail, CredentialMetadataSchemaConfig,
+    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
     CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
-    ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
+    LogGovernanceConfigResponse, ModelApi429InfiniteRetryConfigResponse,
+    ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
+    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
     SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetModelApi429InfiniteRetryConfigRequest, SetModelApiRetryConfigRequest,
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
@@ -2563,6 +2564,29 @@ impl AdminService {
         Ok(self.get_model_api_retry_config())
     }
 
+    /// 获取普通模型 API 429 无限重试配置
+    pub fn get_model_api_429_infinite_retry_config(
+        &self,
+    ) -> ModelApi429InfiniteRetryConfigResponse {
+        ModelApi429InfiniteRetryConfigResponse {
+            enabled: self
+                .token_manager
+                .get_model_api_429_infinite_retry_enabled(),
+        }
+    }
+
+    /// 更新普通模型 API 429 无限重试配置
+    pub fn set_model_api_429_infinite_retry_config(
+        &self,
+        req: SetModelApi429InfiniteRetryConfigRequest,
+    ) -> Result<ModelApi429InfiniteRetryConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_model_api_429_infinite_retry_enabled(req.enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_model_api_429_infinite_retry_config())
+    }
+
     /// 获取单账号 RPM 限流配置
     pub fn get_account_rpm_limit_config(&self) -> AccountRpmLimitConfigResponse {
         let (enabled, limit) = self.token_manager.get_account_rpm_limit_config();
@@ -4292,5 +4316,38 @@ mod cache_metering_config_tests {
         ] {
             assert_eq!(after[key], before[key], "{key} 是只读字段，PUT 不得改动");
         }
+    }
+
+    #[tokio::test]
+    async fn infinite_429_retry_config_round_trips_through_admin_api() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-admin-model-api-429-infinite-retry-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+
+        assert!(!service.get_model_api_429_infinite_retry_config().enabled);
+
+        let response = service
+            .set_model_api_429_infinite_retry_config(SetModelApi429InfiniteRetryConfigRequest {
+                enabled: true,
+            })
+            .unwrap();
+        assert!(response.enabled);
+
+        assert!(
+            Config::load(&config_path)
+                .unwrap()
+                .model_api_429_infinite_retry
+        );
+
+        std::fs::remove_file(&config_path).unwrap();
     }
 }

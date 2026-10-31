@@ -20,20 +20,17 @@ use super::{
     trace_db::TraceQuery,
     types::{
         AddCredentialRequest, AddProxyRequest, ApiDomainConfig, AssignProxyRequest,
-        AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, ModelTestRequest,
-        CredentialMetadataSchemaConfig,
-        SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
-        SetGlobalProxyRequest,
-        SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest,
-        SetSelfHealConfigRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
-        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
-        SetCustomModelsRequest,
+        AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest,
+        BatchImportSummary, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
+        CreateClientKeyRequest, CreateClientKeyResponse, CredentialMetadataSchemaConfig,
+        ModelTestRequest, SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest,
+        SetCacheMeteringConfigRequest, SetCustomModelsRequest, SetDisabledRequest,
+        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetModelApi429InfiniteRetryConfigRequest, SetModelApiRetryConfigRequest,
+        SetPriorityRequest, SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest,
+        SetSessionAffinityConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -49,9 +46,7 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
 }
 
 /// GET /api/admin/config/credential-metadata-schema
-pub async fn get_credential_metadata_schema(
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+pub async fn get_credential_metadata_schema(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_credential_metadata_schema())
 }
 
@@ -624,6 +619,29 @@ pub async fn set_model_api_retry_config(
     }
 }
 
+/// GET /api/admin/config/model-api-429-infinite-retry
+/// 获取普通模型 API 429 无限重试配置
+pub async fn get_model_api_429_infinite_retry_config(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_model_api_429_infinite_retry_config())
+}
+
+/// PUT /api/admin/config/model-api-429-infinite-retry
+/// 更新普通模型 API 429 无限重试配置
+pub async fn set_model_api_429_infinite_retry_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetModelApi429InfiniteRetryConfigRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_model_api_429_infinite_retry_config(payload)
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/account-rpm-limit
 /// 获取单账号 RPM 限流配置
 pub async fn get_account_rpm_limit_config(State(state): State<AdminState>) -> impl IntoResponse {
@@ -815,10 +833,11 @@ pub async fn set_global_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<SetGlobalProxyRequest>,
 ) -> impl IntoResponse {
-    match state
-        .service
-        .set_global_proxy(payload.proxy_url, payload.proxy_username, payload.proxy_password)
-    {
+    match state.service.set_global_proxy(
+        payload.proxy_url,
+        payload.proxy_username,
+        payload.proxy_password,
+    ) {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -1493,7 +1512,9 @@ pub async fn stats_by_key(
     };
     let group = parse_group_filter(&params);
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let data = state.usage_aggregator.query_by_key(window, cred_ids.as_ref());
+    let data = state
+        .usage_aggregator
+        .query_by_key(window, cred_ids.as_ref());
     // Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
     let key_name_map: HashMap<u64, String> = state
         .client_keys
