@@ -237,6 +237,17 @@ pub struct Config {
     #[serde(default = "default_model_api_429_retry_enabled")]
     pub model_api_429_retry_enabled: bool,
 
+    /// 429 无限立即重试（默认 false）。
+    ///
+    /// 开启后，普通与流式请求（首帧之前）遇到任何 429 都不返回下游、不受重试次数上限
+    /// 约束、两次重试之间不等待：账号级 429 照常冷却当前凭据并换号后立即重试；所有
+    /// 凭据都在冷却时忽略冷却选一个继续重试。下游断开（请求 future 被 drop）时停止。
+    /// 重试日志按「首条 + 定期汇总 + 结束汇总」限流，不会每次失败打一行。
+    /// 关闭时（默认）完全沿用 `modelApi429RetryEnabled` / `accountThrottleFailover` 的
+    /// 既有行为。注意：开启后单个请求可能长时间占用连接，请配合客户端超时使用。
+    #[serde(default = "default_model_api_429_infinite_retry")]
+    pub model_api_429_infinite_retry: bool,
+
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
     /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
@@ -459,6 +470,10 @@ fn default_model_api_429_retry_enabled() -> bool {
     true
 }
 
+fn default_model_api_429_infinite_retry() -> bool {
+    false
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -550,6 +565,7 @@ impl Default for Config {
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
+            model_api_429_infinite_retry: default_model_api_429_infinite_retry(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
@@ -760,6 +776,23 @@ mod tests {
     fn model_api_429_retry_accepts_explicitly_disabled() {
         let config: Config = serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
         assert!(!config.model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn model_api_429_infinite_retry_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.model_api_429_infinite_retry);
+        assert!(!Config::default().model_api_429_infinite_retry);
+    }
+
+    #[test]
+    fn model_api_429_infinite_retry_accepts_explicit_value() {
+        let enabled: Config = serde_json::from_str(r#"{"modelApi429InfiniteRetry":true}"#).unwrap();
+        assert!(enabled.model_api_429_infinite_retry);
+
+        let disabled: Config =
+            serde_json::from_str(r#"{"modelApi429InfiniteRetry":false}"#).unwrap();
+        assert!(!disabled.model_api_429_infinite_retry);
     }
 
     #[test]

@@ -14,6 +14,7 @@
   "updateAutoApplyTime": "03:00",
   "modelCacheTtlSecs": 3600,
   "modelApi429RetryEnabled": true,
+  "modelApi429InfiniteRetry": false,
   "cacheMeteringCapacity": 262144,
   "cacheMeteringPersistEnabled": false,
   "cacheMeteringFlushIntervalSecs": 300,
