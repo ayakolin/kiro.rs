@@ -1252,6 +1252,8 @@ pub struct MultiTokenManager {
     account_throttle_cooldown_secs: AtomicU64,
     /// 普通模型 API 429 自动重试开关（运行时可修改）
     model_api_429_retry_enabled: AtomicBool,
+    /// 普通模型 API 429 无限立即重试开关（运行时可修改，忽略冷却选号）
+    model_api_429_infinite_retry: AtomicBool,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1496,6 +1498,7 @@ impl MultiTokenManager {
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let model_api_429_retry_enabled = config.model_api_429_retry_enabled;
+        let model_api_429_infinite_retry = config.model_api_429_infinite_retry;
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
@@ -1521,6 +1524,7 @@ impl MultiTokenManager {
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             model_api_429_retry_enabled: AtomicBool::new(model_api_429_retry_enabled),
+            model_api_429_infinite_retry: AtomicBool::new(model_api_429_infinite_retry),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -1906,12 +1910,29 @@ impl MultiTokenManager {
         group: Option<&str>,
         now: Instant,
     ) -> bool {
+        self.entry_eligible(entry, model, group, now, false)
+    }
+
+    /// 判断凭据是否可以参与本次请求的选号。
+    ///
+    /// `ignore_cooldown == true` 时跳过临时冷却（`throttled_until`）与 RPM 上限
+    /// 判定：无限立即重试模式要求「所有凭据都在冷却」时仍能选出一个继续重试，
+    /// 但硬性条件（已禁用、模型/分组不匹配、模型缓存明确不支持）依旧生效。
+    fn entry_eligible(
+        &self,
+        entry: &CredentialEntry,
+        model: Option<&str>,
+        group: Option<&str>,
+        now: Instant,
+        ignore_cooldown: bool,
+    ) -> bool {
         !entry.disabled
-            && !entry
-                .throttled_until
-                .map(|until| until > now)
-                .unwrap_or(false)
-            && !self.rpm_exceeded(entry, now)
+            && (ignore_cooldown
+                || (!entry
+                    .throttled_until
+                    .map(|until| until > now)
+                    .unwrap_or(false)
+                    && !self.rpm_exceeded(entry, now)))
             && credential_matches_request(&entry.credentials, model, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
@@ -2064,13 +2085,47 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_impl(model, group, false)
+    }
+
+    /// 429 无限重试专用选号：忽略账号级冷却与 RPM 上限，保证「全部凭据都在冷却」
+    /// 也能选出一个继续重试，而不是把「没有可用凭据」返回给下游。
+    fn select_next_credential_ignoring_cooldown(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        self.select_next_credential_impl(model, group, true)
+    }
+
+    /// 按调用场景选择普通选号或忽略冷却的选号。
+    fn select_next_credential_for(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        ignore_cooldown: bool,
+    ) -> Option<(u64, KiroCredentials)> {
+        if ignore_cooldown {
+            self.select_next_credential_ignoring_cooldown(model, group)
+        } else {
+            self.select_next_credential(model, group)
+        }
+    }
+
+    /// 两种选号共用的实现，`ignore_cooldown` 透传给 [`Self::entry_eligible`]。
+    fn select_next_credential_impl(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        ignore_cooldown: bool,
+    ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
         // 过滤可用凭据（已排除模型缓存明确不支持的凭据）
         let available: Vec<&CredentialEntry> = entries
             .iter()
-            .filter(|e| self.entry_available_for_request(e, model, group, now))
+            .filter(|e| self.entry_eligible(e, model, group, now, ignore_cooldown))
             .collect();
 
         if available.is_empty() {
@@ -2117,7 +2172,7 @@ impl MultiTokenManager {
         model: Option<&str>,
         group: Option<&str>,
     ) -> anyhow::Result<CallContext> {
-        self.acquire_context_impl(model, group, None, true)
+        self.acquire_context_impl(model, group, None, true, false)
             .await
             .map(|(context, _, _)| context)
     }
@@ -2133,7 +2188,23 @@ impl MultiTokenManager {
         group: Option<&str>,
         session: Option<&str>,
     ) -> anyhow::Result<(CallContext, RouteDecision)> {
-        self.acquire_context_impl(model, group, session, true)
+        self.acquire_context_impl(model, group, session, true, false)
+            .await
+            .map(|(context, _, route)| (context, route))
+    }
+
+    /// 无限立即重试模式下的上下文获取：忽略临时冷却与 RPM 上限选号。
+    ///
+    /// 普通 [`Self::acquire_context_routed`] 在全部凭据都处于冷却时返回 429 /
+    /// 「所有凭据均已禁用」，而无限重试要求此时仍挑一个凭据继续重试；已禁用、
+    /// 模型或分组不匹配、模型缓存明确不支持的凭据依旧被排除。
+    pub async fn acquire_context_routed_ignoring_cooldown(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        session: Option<&str>,
+    ) -> anyhow::Result<(CallContext, RouteDecision)> {
+        self.acquire_context_impl(model, group, session, true, true)
             .await
             .map(|(context, _, route)| (context, route))
     }
@@ -2159,6 +2230,7 @@ impl MultiTokenManager {
         session: Option<&str>,
         model: Option<&str>,
         group: Option<&str>,
+        ignore_cooldown: bool,
     ) -> (Option<(u64, KiroCredentials)>, RouteDecision) {
         let Some(session) = session else {
             return (None, RouteDecision::none());
@@ -2180,7 +2252,7 @@ impl MultiTokenManager {
         let pick = entries
             .iter()
             .find(|e| e.id == bound_id)
-            .filter(|e| self.entry_available_for_request(e, model, group, now))
+            .filter(|e| self.entry_eligible(e, model, group, now, ignore_cooldown))
             .map(|e| (e.id, e.credentials.clone()));
         let outcome = if pick.is_some() {
             StickyOutcome::Hit
@@ -2206,6 +2278,7 @@ impl MultiTokenManager {
         group: Option<&str>,
         session: Option<&str>,
         update_current: bool,
+        ignore_cooldown: bool,
     ) -> anyhow::Result<(CallContext, bool, RouteDecision)> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
@@ -2226,13 +2299,15 @@ impl MultiTokenManager {
                 // 会话粘性优先：绑定凭据仍可用就沿用，保住上游按账号隔离的 prompt cache。
                 // 粘性未命中时两种模式都按当前请求重新选择。priority 模式不能复用 current_id，
                 // 否则高优先级凭据从 RPM/冷却恢复后无法在下一次请求立即回切。
-                let (sticky_pick, route) = self.sticky_candidate(session, model, group);
-                let mut best = sticky_pick.or_else(|| self.select_next_credential(model, group));
+                let (sticky_pick, route) =
+                    self.sticky_candidate(session, model, group, ignore_cooldown);
+                let mut best = sticky_pick
+                    .or_else(|| self.select_next_credential_for(model, group, ignore_cooldown));
 
                 // 没有可用凭据：如果是"自动禁用导致全灭"，做一次受控自愈
                 // （受冷却间隔与连续轮数上限约束，避免持续 403 死循环）。
                 if best.is_none() && self.try_self_heal(model, group) {
-                    best = self.select_next_credential(model, group);
+                    best = self.select_next_credential_for(model, group, ignore_cooldown);
                 }
 
                 let (id, credentials) = if let Some((new_id, new_creds)) = best {
@@ -3866,7 +3941,9 @@ impl MultiTokenManager {
     pub async fn get_available_models_for_current(
         &self,
     ) -> anyhow::Result<(u64, ListAvailableModelsResponse, bool)> {
-        let (context, is_balanced, _) = self.acquire_context_impl(None, None, None, false).await?;
+        let (context, is_balanced, _) = self
+            .acquire_context_impl(None, None, None, false, false)
+            .await?;
         let id = context.id;
         let response = self.refresh_model_cache_for(id, true).await?;
         Ok((id, response, is_balanced))
@@ -4732,6 +4809,33 @@ impl MultiTokenManager {
         }
 
         tracing::info!("普通模型 API 429 自动重试已设置为: {}", enabled);
+        Ok(())
+    }
+
+    /// 获取普通模型 API 429 无限立即重试配置（Admin API）。
+    pub fn get_model_api_429_infinite_retry_enabled(&self) -> bool {
+        self.model_api_429_infinite_retry.load(Ordering::Relaxed)
+    }
+
+    /// 设置普通模型 API 429 无限立即重试配置（Admin API）。
+    pub fn set_model_api_429_infinite_retry_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+        let previous = self.get_model_api_429_infinite_retry_enabled();
+        if previous == enabled {
+            return Ok(());
+        }
+
+        self.model_api_429_infinite_retry
+            .store(enabled, Ordering::Relaxed);
+        if let Err(err) = self.update_config_file(move |config| {
+            config.model_api_429_infinite_retry = enabled;
+        }) {
+            self.model_api_429_infinite_retry
+                .store(previous, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!("429 无限立即重试已设置为: {}", enabled);
         Ok(())
     }
 
@@ -6314,6 +6418,59 @@ mod tests {
         std::fs::remove_file(&config_path).unwrap();
     }
 
+    #[test]
+    fn model_api_429_infinite_retry_update_is_immediate_and_persisted() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-model-api-429-infinite-retry-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "{}").unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        assert!(!manager.get_model_api_429_infinite_retry_enabled());
+        manager
+            .set_model_api_429_infinite_retry_enabled(true)
+            .unwrap();
+        assert!(manager.get_model_api_429_infinite_retry_enabled());
+        assert!(
+            Config::load(&config_path)
+                .unwrap()
+                .model_api_429_infinite_retry
+        );
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ignoring_cooldown_acquire_selects_throttled_credential() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![api_key_cred("ksk_throttled_only")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.report_account_throttled_for_request(1, StdDuration::from_secs(300), None, None);
+
+        // 普通选号只看冷却，唯一凭据在冷却中 → 「所有凭据均已禁用」。
+        let normal = manager.acquire_context(None, None).await;
+        assert!(normal.is_err(), "冷却中的唯一凭据不应被普通选号选中");
+
+        // 无限重试模式忽略冷却，仍能选出该凭据继续重试。
+        let (ctx, _route) = manager
+            .acquire_context_routed_ignoring_cooldown(None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "ksk_throttled_only");
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
@@ -6392,7 +6549,7 @@ mod tests {
         let mut picked_other = false;
         for _ in 0..64 {
             let (context, is_balanced, _) = manager
-                .acquire_context_impl(None, None, None, false)
+                .acquire_context_impl(None, None, None, false, false)
                 .await
                 .unwrap();
             assert!(is_balanced);
