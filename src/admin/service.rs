@@ -38,20 +38,19 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
     AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
-    AvailableModelItem, AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest,
-    BatchImportEvent, CacheMeteringConfigResponse, CacheMeteringStatsResponse,
-    CheckRateLimitRequest, CredentialMetadataDetail, CredentialMetadataSchemaConfig,
-    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
+    AvailableModelItem,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
+    CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
     CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, ModelApi429InfiniteRetryConfigResponse,
-    ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
-    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
+    LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
+    ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
     SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-    SetModelApi429InfiniteRetryConfigRequest, SetModelApiRetryConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
     SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
@@ -2567,8 +2566,8 @@ impl AdminService {
     /// 获取普通模型 API 429 无限重试配置
     pub fn get_model_api_429_infinite_retry_config(
         &self,
-    ) -> ModelApi429InfiniteRetryConfigResponse {
-        ModelApi429InfiniteRetryConfigResponse {
+    ) -> super::types::ModelApi429InfiniteRetryConfigResponse {
+        super::types::ModelApi429InfiniteRetryConfigResponse {
             enabled: self
                 .token_manager
                 .get_model_api_429_infinite_retry_enabled(),
@@ -2578,8 +2577,8 @@ impl AdminService {
     /// 更新普通模型 API 429 无限重试配置
     pub fn set_model_api_429_infinite_retry_config(
         &self,
-        req: SetModelApi429InfiniteRetryConfigRequest,
-    ) -> Result<ModelApi429InfiniteRetryConfigResponse, AdminServiceError> {
+        req: super::types::SetModelApi429InfiniteRetryConfigRequest,
+    ) -> Result<super::types::ModelApi429InfiniteRetryConfigResponse, AdminServiceError> {
         self.token_manager
             .set_model_api_429_infinite_retry_enabled(req.enabled)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -4336,9 +4335,9 @@ mod cache_metering_config_tests {
         assert!(!service.get_model_api_429_infinite_retry_config().enabled);
 
         let response = service
-            .set_model_api_429_infinite_retry_config(SetModelApi429InfiniteRetryConfigRequest {
-                enabled: true,
-            })
+            .set_model_api_429_infinite_retry_config(
+                crate::admin::types::SetModelApi429InfiniteRetryConfigRequest { enabled: true },
+            )
             .unwrap();
         assert!(response.enabled);
 

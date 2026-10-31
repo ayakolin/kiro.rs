@@ -371,7 +371,7 @@ Admin API 鉴权同样支持：
 | `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
 | `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
 | `modelApi429RetryEnabled` | `true` | 无需换号的容量类模型 API 429 是否由中转自动重试 |
-| `modelApi429InfiniteRetry` | `false` | 429 无限立即重试：不返回下游、无次数上限、不 sleep；账号级照常冷却换号，全冷却时忽略冷却继续重试，下游断开即停止。开启后单请求可能长时间占用连接 |
+| `modelApi429InfiniteRetry` | `false` | 429 无限立即重试：429 不返回下游、不计次数、不 sleep；账号级照常冷却换号，全部冷却时在冷却账号间轮转继续重试，客户端断开即停止。**只对 429 生效**，5xx/408/网络错误仍按原有上限与退避返回。流式请求在等待期间会持续下发 SSE ping 保活；**非流式请求无法保活**，实际能等多久受下游（如 CPA）读超时限制 |
 | `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |
 | `selfHealMinIntervalSecs` | `300` | 两次自愈的最小冷却间隔（秒），打断持续 403 死循环的关键 |

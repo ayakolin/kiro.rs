@@ -14,6 +14,7 @@ use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::{Event, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::provider::KiroCallResult;
 use crate::kiro::token_manager::ModelDiscoveryError;
 use crate::token;
 use anyhow::Error;
@@ -26,7 +27,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{Stream, StreamExt, stream};
+use futures::{Future, Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
@@ -1072,6 +1073,30 @@ async fn handle_stream_request(
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
 ) -> Response {
+    // 429 无限立即重试打开时，上游可能长时间不返回响应头（等待期一个字节都不回）。
+    // 此时必须先把 200 SSE 响应头发给下游并在等待期持续 ping，否则下游（如 CPA）
+    // 会按自己的超时断开。开关关闭时走下面的原路径，行为与 master 完全一致。
+    if provider
+        .token_manager()
+        .get_model_api_429_infinite_retry_enabled()
+    {
+        return handle_stream_request_with_keepalive(
+            provider,
+            request_body,
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            known_tool_names,
+            hook,
+            cache_usage,
+            tracer,
+            group,
+            structured_schema,
+        )
+        .await;
+    }
+
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
         .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
@@ -1119,10 +1144,170 @@ async fn handle_stream_request(
         structured_schema.map(|schema| StructuredCollector::new(schema, model)),
     );
 
-    // 返回 SSE 响应
-    // `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
-    // 若反代开启了响应缓冲，SSE 分片会先攒在缓冲区再转发，拉长增量到达延迟；
-    // 该头只作用于当前响应，无需在反代侧改全局配置。
+    sse_response(stream)
+}
+
+/// 等待上游响应头期间的 keepalive ping 间隔（秒）。
+///
+/// 429 无限立即重试打开时，上游可能连续几十秒都不返回响应头。若沿用网关常规的
+/// [`PING_INTERVAL_SECS`]（25s），CPA 这类下游会先按自己的空闲超时断开，因此等待
+/// 期必须密集保活。这里只作用于「响应头尚未到达」这一段，拿到上游响应后由
+/// [`create_sse_stream`] 的 25s ping 接管。
+const KEEPALIVE_WAIT_PING_INTERVAL_SECS: u64 = 1;
+
+/// 等待期状态机阶段。
+enum KeepalivePhase {
+    /// 驱动 provider 调用（含 429 无限重试），同时按固定间隔发 ping。
+    Waiting {
+        call: std::pin::Pin<Box<dyn Future<Output = anyhow::Result<KiroCallResult>> + Send>>,
+        ticker: tokio::time::Interval,
+    },
+    /// 已拿到上游响应头：转发 [`create_sse_stream`] 的后续流。
+    Streaming(std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>),
+    /// 已结束（正常收尾或已发流内 error 事件）。
+    Done,
+}
+
+/// 等待期状态机的全部持有物。
+///
+/// 把 future / ctx / hook 都放在这里（而不是 spawn 到后台任务），下游断开时整个
+/// body 被 drop，provider 重试循环随 future 一起取消。
+struct KeepaliveWait {
+    phase: KeepalivePhase,
+    ctx: Option<StreamContext>,
+    hook: Option<UsageRecordHook>,
+    tracer: std::sync::Arc<RequestTracer>,
+    model: String,
+    input_tokens: i32,
+    structured_schema: Option<serde_json::Value>,
+}
+
+/// 构造等待上游响应头期间的 SSE 流。
+///
+/// 序列：`[ping...] → 初始事件 → 常规 SSE 处理流`。拿到上游响应头后初始事件与后续
+/// 内容都由 [`create_sse_stream`] 原样产生，因此结构化输出模式的事件缓冲语义不变。
+/// 重试链路最终失败时（响应头已发出，无法再改状态码）先补 `message_start` 让下游拿到
+/// 合法响应，再走 `generate_error_events` 的流内 error 事件。
+fn create_keepalive_wait_stream(
+    call: impl Future<Output = anyhow::Result<KiroCallResult>> + Send + 'static,
+    ctx: StreamContext,
+    hook: UsageRecordHook,
+    tracer: std::sync::Arc<RequestTracer>,
+    model: String,
+    input_tokens: i32,
+    structured_schema: Option<serde_json::Value>,
+) -> impl Stream<Item = Result<Bytes, Infallible>> + Send {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(KEEPALIVE_WAIT_PING_INTERVAL_SECS),
+        Duration::from_secs(KEEPALIVE_WAIT_PING_INTERVAL_SECS),
+    );
+    // 下游写不出去时不要攒一串 tick 后集中爆发 ping。
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let state = KeepaliveWait {
+        phase: KeepalivePhase::Waiting {
+            call: Box::pin(call),
+            ticker,
+        },
+        ctx: Some(ctx),
+        hook: Some(hook),
+        tracer,
+        model,
+        input_tokens,
+        structured_schema,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        loop {
+            match std::mem::replace(&mut state.phase, KeepalivePhase::Done) {
+                KeepalivePhase::Done => return None,
+                KeepalivePhase::Streaming(mut rest) => {
+                    return match rest.next().await {
+                        Some(item) => {
+                            state.phase = KeepalivePhase::Streaming(rest);
+                            Some((stream::iter(vec![item]), state))
+                        }
+                        None => None,
+                    };
+                }
+                KeepalivePhase::Waiting { mut call, mut ticker } => {
+                    tokio::select! {
+                        // 优先看 provider 调用结果：已经拿到响应头就不必再发一次 ping。
+                        biased;
+                        result = &mut call => {
+                            let mut ctx = state.ctx.take().expect("keepalive ctx 只取一次");
+                            match result {
+                                Ok(call_result) => {
+                                    state.tracer.mark_upstream_headers_received();
+                                    let initial_events = ctx.generate_initial_events();
+                                    let structured = state
+                                        .structured_schema
+                                        .take()
+                                        .map(|schema| StructuredCollector::new(schema, &state.model));
+                                    state.phase =
+                                        KeepalivePhase::Streaming(Box::pin(create_sse_stream(
+                                            call_result.response,
+                                            ctx,
+                                            initial_events,
+                                            state.hook.take().expect("keepalive hook 只取一次"),
+                                            call_result.credential_id,
+                                            state.tracer.clone(),
+                                            structured,
+                                        )));
+                                }
+                                Err(e) => {
+                                    let message = format!("{e:#}");
+                                    tracing::error!(
+                                        error = %message,
+                                        "429 无限重试等待期结束后仍未拿到上游响应，转为流内错误事件"
+                                    );
+                                    let mut events = ctx.generate_initial_events();
+                                    events.extend(
+                                        ctx.generate_error_events("api_error", &message),
+                                    );
+                                    state
+                                        .hook
+                                        .take()
+                                        .expect("keepalive hook 只取一次")
+                                        .record(0, state.input_tokens, 0, 0, 0, 0.0, "error");
+                                    state.tracer.finalize(
+                                        "error",
+                                        last_attempt_outcome(&state.tracer),
+                                        Some(&message),
+                                        None,
+                                        TraceUsage::zero(),
+                                    );
+                                    let bytes: Vec<Result<Bytes, Infallible>> = events
+                                        .into_iter()
+                                        .map(|event| Ok(Bytes::from(event.to_sse_string())))
+                                        .collect();
+                                    return Some((stream::iter(bytes), state));
+                                }
+                            }
+                        }
+                        _ = ticker.tick() => {
+                            state.phase = KeepalivePhase::Waiting { call, ticker };
+                            return Some((
+                                stream::iter(vec![Ok(create_ping_sse())]),
+                                state,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .flatten()
+}
+
+/// 构造成功路径的 SSE 响应头。
+///
+/// `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
+/// 若反代开启了响应缓冲，SSE 分片会先攒在缓冲区再转发，拉长增量到达延迟；
+/// 该头只作用于当前响应，无需在反代侧改全局配置。
+fn sse_response(
+    stream: impl Stream<Item = Result<Bytes, Infallible>> + Send + 'static,
+) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1131,6 +1316,59 @@ async fn handle_stream_request(
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+/// 429 无限重试打开时的流式入口：先回 200 SSE 响应头，等待上游期间持续 ping。
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream_request_with_keepalive(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+    structured_schema: Option<serde_json::Value>,
+) -> Response {
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
+    ctx.cache_usage = cache_usage;
+
+    // provider future 必须拥有自己借用的数据：下游 body 要求 'static。
+    let call_provider = provider.clone();
+    let call_body = request_body.to_owned();
+    let call_group = group.clone();
+    let call_tracer = tracer.clone();
+    let call = async move {
+        call_provider
+            .call_api_stream(
+                &call_body,
+                Some(call_tracer.as_ref()),
+                call_group.as_deref(),
+            )
+            .await
+    };
+
+    let stream = create_keepalive_wait_stream(
+        call,
+        ctx,
+        hook,
+        tracer,
+        model.to_owned(),
+        input_tokens,
+        structured_schema,
+    );
+
+    sse_response(stream)
 }
 
 /// Ping 事件间隔（25秒）

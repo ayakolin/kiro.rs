@@ -1254,6 +1254,9 @@ pub struct MultiTokenManager {
     model_api_429_retry_enabled: AtomicBool,
     /// 普通模型 API 429 无限立即重试开关（运行时可修改，忽略冷却选号）
     model_api_429_infinite_retry: AtomicBool,
+    /// 忽略冷却选号的轮转游标（记录上一次选中的凭据 ID）。
+    /// 全部凭据都在冷却时，按 `(priority, id)` 升序逐一轮转，避免反复猛打同一账号。
+    ignored_cooldown_cursor: AtomicU64,
     /// 单账号 RPM 主动限流开关（运行时可修改）
     account_rpm_limit_enabled: AtomicBool,
     /// 单账号每分钟请求次数上限（运行时可修改）
@@ -1525,6 +1528,7 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             model_api_429_retry_enabled: AtomicBool::new(model_api_429_retry_enabled),
             model_api_429_infinite_retry: AtomicBool::new(model_api_429_infinite_retry),
+            ignored_cooldown_cursor: AtomicU64::new(0),
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
@@ -1903,6 +1907,37 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 当前「无可用凭据」的唯一原因是不是账号级 429 冷却。
+    ///
+    /// 供无限重试判断是否还有重试价值：只有「存在匹配的、未禁用、未超本地 RPM、
+    /// 模型缓存未明确不支持的凭据，但它们全部处于冷却中」才返回 `true`。没有匹配
+    /// 分组/模型的凭据、全部被禁用、全部超出本地 RPM 上限等情况都返回 `false`
+    /// —— 那不是靠等待冷却能解决的。
+    ///
+    /// 只取一次 `entries` 锁；内部只用不锁 `entries` 的纯判断函数（`rpm_exceeded`）。
+    pub fn cooldown_only_block(&self, model: Option<&str>, group: Option<&str>) -> bool {
+        let now = Instant::now();
+        let entries = self.entries.lock();
+
+        let mut matched = 0usize;
+        for entry in entries.iter().filter(|entry| {
+            !entry.disabled
+                && credential_matches_request(&entry.credentials, model, group)
+                && !self.rpm_exceeded(entry, now)
+                && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
+        }) {
+            matched += 1;
+            if !entry
+                .throttled_until
+                .map(|until| until > now)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        matched > 0
+    }
+
     fn entry_available_for_request(
         &self,
         entry: &CredentialEntry,
@@ -1915,9 +1950,10 @@ impl MultiTokenManager {
 
     /// 判断凭据是否可以参与本次请求的选号。
     ///
-    /// `ignore_cooldown == true` 时跳过临时冷却（`throttled_until`）与 RPM 上限
-    /// 判定：无限立即重试模式要求「所有凭据都在冷却」时仍能选出一个继续重试，
-    /// 但硬性条件（已禁用、模型/分组不匹配、模型缓存明确不支持）依旧生效。
+    /// `ignore_cooldown == true` 时只跳过账号级临时冷却（`throttled_until`）判定：
+    /// 无限立即重试模式要求「所有凭据都在冷却」时仍能选出一个继续重试，但
+    /// 已禁用、模型/分组不匹配、模型缓存明确不支持、本地 RPM 已超限这些条件
+    /// 依旧生效 —— 忽略冷却是为了不卡死，不是为了绕过本地限流保护去猛打同一账号。
     fn entry_eligible(
         &self,
         entry: &CredentialEntry,
@@ -1927,12 +1963,12 @@ impl MultiTokenManager {
         ignore_cooldown: bool,
     ) -> bool {
         !entry.disabled
-            && (ignore_cooldown
-                || (!entry
+            && ((ignore_cooldown
+                || !entry
                     .throttled_until
                     .map(|until| until > now)
-                    .unwrap_or(false)
-                    && !self.rpm_exceeded(entry, now)))
+                    .unwrap_or(false))
+                && !self.rpm_exceeded(entry, now))
             && credential_matches_request(&entry.credentials, model, group)
             && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
     }
@@ -2088,8 +2124,35 @@ impl MultiTokenManager {
         self.select_next_credential_impl(model, group, false)
     }
 
-    /// 429 无限重试专用选号：忽略账号级冷却与 RPM 上限，保证「全部凭据都在冷却」
+    /// 全冷却场景下的轮转选号：按 `(priority, id)` 升序在候选之间逐个试过去，
+    /// 而不是每次重试都打同一个（`priority`、`id` 最小的）账号、反复重置它的冷却。
+    ///
+    /// 游标记录上一次选中的凭据 ID：本次取游标之后的第一个；游标不在候选里或已
+    /// 是最后一个时回绕到第一个。调用方保证 `available` 非空。
+    fn rotate_ignored_cooldown_candidate<'a>(
+        &self,
+        available: &[&'a CredentialEntry],
+    ) -> &'a CredentialEntry {
+        let mut ordered: Vec<&CredentialEntry> = available.to_vec();
+        ordered.sort_by_key(|e| (e.credentials.priority, e.id));
+
+        let cursor = self.ignored_cooldown_cursor.load(Ordering::Relaxed);
+        let index = ordered
+            .iter()
+            .position(|e| e.id == cursor)
+            .map(|index| (index + 1) % ordered.len())
+            .unwrap_or(0);
+        let entry = ordered[index];
+        self.ignored_cooldown_cursor
+            .store(entry.id, Ordering::Relaxed);
+        entry
+    }
+
+    /// 429 无限重试专用选号：忽略账号级冷却，保证「全部凭据都在冷却」
     /// 也能选出一个继续重试，而不是把「没有可用凭据」返回给下游。
+    ///
+    /// priority 模式下在冷却凭据之间轮转（见 [`Self::rotate_ignored_cooldown_candidate`]），
+    /// 避免每次重试都猛打同一个账号并不断重置它的冷却。
     fn select_next_credential_ignoring_cooldown(
         &self,
         model: Option<&str>,
@@ -2145,6 +2208,7 @@ impl MultiTokenManager {
                 //   不会因为被使用而变成 Confirmed。
                 available[fastrand::usize(..available.len())]
             }
+            _ if ignore_cooldown => self.rotate_ignored_cooldown_candidate(&available),
             _ => {
                 // priority 模式（默认）：严格选择数字最小的有效凭据。
                 // 同优先级按 ID 升序固定顺序，保证后端调度与前端预览一致。
@@ -2193,11 +2257,11 @@ impl MultiTokenManager {
             .map(|(context, _, route)| (context, route))
     }
 
-    /// 无限立即重试模式下的上下文获取：忽略临时冷却与 RPM 上限选号。
+    /// 无限立即重试模式下的上下文获取：忽略临时冷却选号。
     ///
     /// 普通 [`Self::acquire_context_routed`] 在全部凭据都处于冷却时返回 429 /
     /// 「所有凭据均已禁用」，而无限重试要求此时仍挑一个凭据继续重试；已禁用、
-    /// 模型或分组不匹配、模型缓存明确不支持的凭据依旧被排除。
+    /// 模型或分组不匹配、模型缓存明确不支持、本地 RPM 额度已耗尽的凭据依旧被排除。
     pub async fn acquire_context_routed_ignoring_cooldown(
         &self,
         model: Option<&str>,
@@ -6443,6 +6507,101 @@ mod tests {
         );
 
         std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn cooldown_only_block_distinguishes_cooldown_from_disabled() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![api_key_cred("ksk_cooldown_only")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 唯一凭据可用 → 不是「仅因冷却被阻塞」
+        assert!(!manager.cooldown_only_block(None, None));
+
+        manager.report_account_throttled_for_request(1, StdDuration::from_secs(300), None, None);
+        assert!(manager.cooldown_only_block(None, None));
+
+        // 禁用后即使仍在冷却，也不能说「只差冷却」
+        manager.set_disabled(1, true).unwrap();
+        assert!(!manager.cooldown_only_block(None, None));
+
+        manager.set_disabled(1, false).unwrap();
+        manager.report_account_throttled_for_request(1, StdDuration::from_secs(300), None, None);
+        // 无凭据匹配该分组 → 不是冷却导致的阻塞
+        assert!(!manager.cooldown_only_block(None, Some("nope")));
+        assert!(manager.cooldown_only_block(None, None));
+    }
+
+    #[test]
+    fn ignoring_cooldown_selection_rotates_across_cooled_credentials() {
+        let mut creds = vec![];
+        for index in 1..=3u64 {
+            let mut cred = api_key_cred(&format!("ksk_rotate_{index}"));
+            cred.id = Some(index);
+            creds.push(cred);
+        }
+        let manager = MultiTokenManager::new(Config::default(), creds, None, None, false).unwrap();
+
+        for id in 1..=3u64 {
+            manager.report_account_throttled_for_request(
+                id,
+                StdDuration::from_secs(300),
+                None,
+                None,
+            );
+        }
+
+        // 普通选号：全部在冷却 → 无可用凭据
+        assert!(manager.select_next_credential(None, None).is_none());
+        assert_eq!(manager.available_count(), 0);
+
+        // 忽略冷却的选号逐一轮转，而不是反复打同一个账号
+        let picked: Vec<u64> = (0..6)
+            .map(|_| {
+                manager
+                    .select_next_credential_ignoring_cooldown(None, None)
+                    .map(|(id, _)| id)
+                    .expect("全部冷却时仍应选出一个凭据")
+            })
+            .collect();
+        assert_eq!(picked, vec![1, 2, 3, 1, 2, 3]);
+    }
+
+    #[test]
+    fn ignoring_cooldown_still_honors_rpm_limit() {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 1;
+        let mut creds = vec![];
+        for index in 1..=2u64 {
+            let mut cred = api_key_cred(&format!("ksk_rpm_{index}"));
+            cred.id = Some(index);
+            creds.push(cred);
+        }
+        let manager = MultiTokenManager::new(config, creds, None, None, false).unwrap();
+
+        for id in 1..=2u64 {
+            assert!(manager.record_request(id), "首次请求应占用 RPM 额度");
+            manager.report_account_throttled_for_request(
+                id,
+                StdDuration::from_secs(300),
+                None,
+                None,
+            );
+        }
+
+        // 忽略冷却只能跳过 throttled_until，不能绕过本地 RPM 上限
+        assert!(
+            manager
+                .select_next_credential_ignoring_cooldown(None, None)
+                .is_none(),
+            "RPM 打满的凭据不应因忽略冷却而被选中"
+        );
     }
 
     #[tokio::test]

@@ -18,6 +18,9 @@ use tokio::time::timeout;
 /// 上游 mock 的行为：先回 `throttle_times` 次 429，再回 200。
 #[derive(Clone)]
 struct MockState {
+    /// 按顺序消费的状态码脚本；用尽后一直返回最后一个（脚本为空则恒 200）。
+    script: Arc<Vec<u16>>,
+    /// 前 `throttle_times` 次返回 429（脚本为空时使用）。
     throttle_times: usize,
     calls: Arc<AtomicUsize>,
     /// 账号级 429 文案（命中 `is_account_rate_limited`）vs 容量类 429。
@@ -40,7 +43,22 @@ impl Drop for MockUpstream {
 
 impl MockUpstream {
     async fn start(throttle_times: usize, account_level: bool, delay: Duration) -> Self {
+        Self::start_with(throttle_times, account_level, delay, Vec::new()).await
+    }
+
+    /// 按 `script` 依次返回状态码，脚本用尽后返回 200。
+    async fn start_script(script: Vec<u16>, delay: Duration) -> Self {
+        Self::start_with(0, false, delay, script).await
+    }
+
+    async fn start_with(
+        throttle_times: usize,
+        account_level: bool,
+        delay: Duration,
+        script: Vec<u16>,
+    ) -> Self {
         let state = MockState {
+            script: Arc::new(script),
             throttle_times,
             calls: Arc::new(AtomicUsize::new(0)),
             account_level,
@@ -66,13 +84,21 @@ async fn mock_handler(State(state): State<MockState>) -> Response {
     if !state.delay.is_zero() {
         tokio::time::sleep(state.delay).await;
     }
-    if n < state.throttle_times {
+    let status = match state.script.get(n) {
+        Some(status) => *status,
+        None if n < state.throttle_times => 429,
+        None => 200,
+    };
+    if status == 429 {
         let body = if state.account_level {
             r#"{"message":"You have exceeded the request rate for this account","reason":"USER_REQUEST_RATE_EXCEEDED"}"#
         } else {
             r#"{"message":"Insufficient model capacity","reason":"INSUFFICIENT_MODEL_CAPACITY"}"#
         };
         return (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+    }
+    if !(200..300).contains(&status) {
+        return (StatusCode::from_u16(status).unwrap(), "server error").into_response();
     }
     (StatusCode::OK, "ok").into_response()
 }
@@ -273,8 +299,8 @@ async fn infinite_retry_stops_when_client_disconnects() {
     let lines = summary_lines(&sink);
     assert_eq!(lines.len(), 1, "断开也必须留下唯一一条汇总: {:?}", lines);
     assert!(
-        lines[0].contains("已停止"),
-        "汇总应写明因断开而停止: {}",
+        lines[0].contains("客户端断开"),
+        "汇总应写明因客户端断开而停止: {}",
         lines[0]
     );
     let retries: usize = lines[0]
@@ -331,4 +357,177 @@ async fn infinite_retry_keeps_retrying_while_all_credentials_cool() {
     let lines = summary_lines(&sink);
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("重试 6 次"), "{}", lines[0]);
+}
+
+// ---------------------------------------------------------------------------
+// B1：开关打开时，非 429 错误必须保持 master 的上限与退避行为。
+// ---------------------------------------------------------------------------
+
+/// 上游一直 500：按 master 的普通预算（1 凭据 = 3 次）放弃，返回 502。
+#[tokio::test]
+async fn infinite_retry_still_bounds_persistent_5xx_to_master_budget() {
+    let upstream = MockUpstream::start_with(0, false, Duration::ZERO, vec![500; 64]).await;
+    let (provider, _manager) = provider(&upstream, true);
+    let sink = provider.capture_retry_logs();
+
+    let started = Instant::now();
+    let error = match timeout(Duration::from_secs(10), provider.call_api("{}", None, None)).await {
+        Ok(Ok(_)) => panic!("持续 500 不能返回成功"),
+        Ok(Err(error)) => error,
+        Err(_) => panic!("开关打开时持续 500 也必须按预算返回，不能挂起"),
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        upstream.count(),
+        MAX_RETRIES_PER_CREDENTIAL,
+        "持续 500 必须与 master 同样次数后放弃"
+    );
+    assert!(
+        error.to_string().contains("500"),
+        "错误应保留上游状态: {error}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "5xx 必须保留 master 的退避，实际 {:?}",
+        elapsed
+    );
+    // 从没发生过 429，报告里不该出现无限重试汇总。
+    assert!(
+        summary_lines(&sink).is_empty(),
+        "无 429 时不应写汇总: {:?}",
+        sink.lock()
+    );
+}
+
+/// 上游端口拒绝连接：与 master 一样按预算返回网络错误，不挂起。
+#[tokio::test]
+async fn infinite_retry_still_bounds_connection_refused() {
+    // 绑定后立刻释放端口，得到一个「肯定没人监听」的地址。
+    let dead = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    };
+    let upstream = MockUpstream {
+        url: format!("http://{dead}/"),
+        calls: Arc::new(AtomicUsize::new(0)),
+        task: tokio::spawn(async {}),
+    };
+    let (provider, _manager) = provider(&upstream, true);
+
+    let started = Instant::now();
+    let error = match timeout(Duration::from_secs(10), provider.call_api("{}", None, None)).await {
+        Ok(Ok(_)) => panic!("连接被拒不能成功"),
+        Ok(Err(error)) => error,
+        Err(_) => panic!("连接被拒也必须按预算返回"),
+    };
+    let elapsed = started.elapsed();
+
+    assert!(!error.to_string().is_empty());
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "不得无限重试，实际 {:?}",
+        elapsed
+    );
+}
+
+/// 唯一凭据被禁用：立刻报错，且从不打上游。
+#[tokio::test]
+async fn infinite_retry_still_fails_fast_when_no_credential_is_enabled() {
+    let upstream = MockUpstream::start(0, false, Duration::ZERO).await;
+    let (provider, manager) = provider(&upstream, true);
+    manager.set_disabled(1, true).unwrap();
+
+    let started = Instant::now();
+    let error = match timeout(Duration::from_secs(5), provider.call_api("{}", None, None)).await {
+        Ok(Ok(_)) => panic!("全部禁用不能成功"),
+        Ok(Err(error)) => error,
+        Err(_) => panic!("全部禁用必须立即报错，不能挂起"),
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(upstream.count(), 0, "无可用凭据时不应打上游");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "全部禁用应立即返回，实际 {:?}",
+        elapsed
+    );
+    assert!(
+        error.to_string().contains("禁用"),
+        "错误应说明无可用凭据: {error}"
+    );
+}
+
+/// 429 与 500 混合：429 不消耗普通预算，500 只消耗一次，最终成功。
+#[tokio::test]
+async fn infinite_retry_429s_do_not_consume_the_ordinary_retry_budget() {
+    let mut script = vec![429; 5];
+    script.push(500);
+    script.extend(std::iter::repeat_n(429, 5));
+    let upstream = MockUpstream::start_script(script, Duration::ZERO).await;
+    let (provider, _manager) = provider(&upstream, true);
+    let sink = provider.capture_retry_logs();
+
+    let result = timeout(Duration::from_secs(10), provider.call_api("{}", None, None))
+        .await
+        .expect("混合序列不应超时")
+        .expect("10 次 429 + 1 次 500 之后应拿到 200");
+    assert_eq!(result.response.text().await.unwrap(), "ok");
+    assert_eq!(upstream.count(), 12, "5+1+5 次失败 + 1 次成功");
+
+    let lines = summary_lines(&sink);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("重试 10 次"), "只统计 429: {}", lines[0]);
+    assert!(lines[0].contains("成功"), "{}", lines[0]);
+}
+
+/// N2：没有发生 429 重试的成功请求不能写任何汇总日志。
+#[tokio::test]
+async fn infinite_retry_success_without_any_429_stays_silent() {
+    let upstream = MockUpstream::start(0, false, Duration::ZERO).await;
+    let (provider, _manager) = provider(&upstream, true);
+    let sink = provider.capture_retry_logs();
+
+    let result = timeout(Duration::from_secs(5), provider.call_api("{}", None, None))
+        .await
+        .expect("不应超时")
+        .expect("首次即成功");
+    assert_eq!(result.response.text().await.unwrap(), "ok");
+    assert_eq!(upstream.count(), 1);
+
+    assert!(
+        sink.lock().is_empty(),
+        "0 次重试不能写汇总: {:?}",
+        sink.lock()
+    );
+}
+
+/// N2：非 429 错误终止与客户端断开必须打不同的汇总标签。
+#[tokio::test]
+async fn infinite_retry_summary_labels_distinguish_stop_reasons() {
+    // 先来几次 429（让日志计数非零），再让上游持续 500 触发非 429 终止。
+    let mut script = vec![429; 3];
+    script.extend(std::iter::repeat_n(500, 64));
+    let upstream = MockUpstream::start_script(script, Duration::ZERO).await;
+    let (provider, _manager) = provider(&upstream, true);
+    let sink = provider.capture_retry_logs();
+
+    let error = match timeout(Duration::from_secs(10), provider.call_api("{}", None, None)).await {
+        Ok(Ok(_)) => panic!("持续 500 不能成功"),
+        Ok(Err(error)) => error,
+        Err(_) => panic!("必须按预算返回"),
+    };
+    assert!(error.to_string().contains("500"));
+
+    let lines = summary_lines(&sink);
+    assert_eq!(lines.len(), 1, "{:?}", lines);
+    assert!(
+        lines[0].contains("非 429 错误终止"),
+        "非 429 终止必须有独立标签: {}",
+        lines[0]
+    );
+    assert!(lines[0].contains("重试 3 次"), "{}", lines[0]);
+    assert!(lines[0].contains("耗时"), "{}", lines[0]);
 }

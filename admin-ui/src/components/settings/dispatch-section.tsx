@@ -178,7 +178,7 @@ function RateLimitHandlingGroup() {
         label="429 无限立即重试"
         hint={
           infiniteRetryEnabled
-            ? '任何 429 都不返回客户端，不等待、不限次数；账号级照常冷却换号，全部冷却时忽略冷却继续重试；客户端断开即停止'
+            ? '任何 429 都不返回客户端，不等待、不限次数（5xx/408/网络错误仍按上限返回）；流式请求等待期会持续发 ping 保活；非流式无法保活，实际等待受下游读超时限制'
             : '沿用上面的次数上限与退避'
         }
         checked={infiniteRetryEnabled}
