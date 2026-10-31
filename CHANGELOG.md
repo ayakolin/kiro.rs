@@ -10,6 +10,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - Support `output_config.format = {"type":"json_schema","schema":{...}}` on `/v1/messages` and `/cc/v1/messages`. Kiro has no native structured-output field, so the schema is appended to the system prompt and the reply is rewritten to the last schema-conforming JSON value (non-stream: single text block; stream: buffered, then one compliant text block). Replies without conforming JSON are returned unchanged with a single warning. `format` is never forwarded upstream; requests without it behave as before.
 
+### ⏳ 429 无限立即重试（`modelApi429InfiniteRetry`，默认关闭）
+
+- 新增配置项 `modelApi429InfiniteRetry`（默认 `false`）。开启后普通与流式请求（首帧之前）遇到任何 429 都不再返回下游，不受 `MAX_TOTAL_RETRIES` 约束，两次重试之间不 `sleep`、不走 429 专用退避。
+- 账号级 429 仍照常冷却当前凭据并换号，换号后立即重试；所有凭据都在冷却时忽略冷却与 RPM 上限挑一个继续重试，不会因为「没有可用凭据」把错误交给下游。
+- 下游客户端断开（请求 future 被 drop）时循环随之结束，不会空转；每轮重试前后都有 await，全冷却场景也不会忙等占满锁。
+- 重试日志限流：首次失败一行、之后每 50 次或每 5 秒一行进度、结束时一行汇总，汇总行同时给出总重试次数与总耗时，成功与断开两条路径都会写。
+- 关闭开关时（默认）完整沿用 `modelApi429RetryEnabled` / `accountThrottleFailover` 的既有上限与退避行为。
+- 管理 API：`GET|PUT /api/admin/config/model-api-429-infinite-retry`；管理面板「上游 429 处理」新增同名开关。
+
 ## [0.9.3] - 2026-10-26
 
 主题：**全局代理热更新、模型过载隔离与 Sonnet 5.5 上下文计量修复**。本版汇总 `v0.9.2` 之后合并的 3 个 PR；没有新增配置项，现有配置、凭据与请求日志无需手动迁移。

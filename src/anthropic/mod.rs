@@ -39,6 +39,9 @@ mod websearch_loop;
 #[cfg(test)]
 mod gateway_tests;
 
+#[cfg(test)]
+mod keepalive_tests;
+
 // `create_router_with_provider` 是公开扩展点（允许外部以自定义 provider 构造路由），
 // 项目内默认走 `create_router_with_shared_provider`，因此本身不会触发该函数。
 #[allow(unused_imports)]

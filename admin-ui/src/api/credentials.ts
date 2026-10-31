@@ -499,6 +499,74 @@ export async function setModelApiRetryConfig(
   return data
 }
 
+export interface ModelApi429InfiniteRetryConfig {
+  enabled: boolean
+}
+
+// 获取模型 API 429 无限立即重试配置
+export async function getModelApi429InfiniteRetryConfig(): Promise<ModelApi429InfiniteRetryConfig> {
+  const { data } = await api.get<ModelApi429InfiniteRetryConfig>(
+    '/config/model-api-429-infinite-retry',
+  )
+  return data
+}
+
+// 更新模型 API 429 无限立即重试配置
+export async function setModelApi429InfiniteRetryConfig(
+  config: ModelApi429InfiniteRetryConfig,
+): Promise<ModelApi429InfiniteRetryConfig> {
+  const { data } = await api.put<ModelApi429InfiniteRetryConfig>(
+    '/config/model-api-429-infinite-retry',
+    config,
+  )
+  return data
+}
+export interface AccountRateLimitInfiniteRetryConfig {
+  enabled: boolean
+}
+
+// 获取账号级 429 无限立即重试配置
+export async function getAccountRateLimitInfiniteRetryConfig(): Promise<AccountRateLimitInfiniteRetryConfig> {
+  const { data } = await api.get<AccountRateLimitInfiniteRetryConfig>(
+    '/config/account-rate-limit-infinite-retry',
+  )
+  return data
+}
+
+// 更新账号级 429 无限立即重试配置
+export async function setAccountRateLimitInfiniteRetryConfig(
+  config: AccountRateLimitInfiniteRetryConfig,
+): Promise<AccountRateLimitInfiniteRetryConfig> {
+  const { data } = await api.put<AccountRateLimitInfiniteRetryConfig>(
+    '/config/account-rate-limit-infinite-retry',
+    config,
+  )
+  return data
+}
+
+export interface AllCredsCooldownRetryIntervalConfig {
+  intervalMs: number
+}
+
+// 获取全凭据冷却重试等待间隔配置
+export async function getAllCredsCooldownRetryIntervalConfig(): Promise<AllCredsCooldownRetryIntervalConfig> {
+  const { data } = await api.get<AllCredsCooldownRetryIntervalConfig>(
+    '/config/all-creds-cooldown-retry-interval',
+  )
+  return data
+}
+
+// 更新全凭据冷却重试等待间隔配置
+export async function setAllCredsCooldownRetryIntervalConfig(
+  config: AllCredsCooldownRetryIntervalConfig,
+): Promise<AllCredsCooldownRetryIntervalConfig> {
+  const { data } = await api.put<AllCredsCooldownRetryIntervalConfig>(
+    '/config/all-creds-cooldown-retry-interval',
+    config,
+  )
+  return data
+}
+
 export interface AccountRpmLimitConfig {
   enabled: boolean
   limit: number

@@ -27,6 +27,9 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 参数超出有效范围或无法处理（422）
+    UnprocessableEntity(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -39,6 +42,7 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::RateLimited { .. } => write!(f, "上游请求过于频繁，请稍后重试"),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::UnprocessableEntity(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -54,6 +58,7 @@ impl AdminServiceError {
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
         }
     }
 
@@ -69,6 +74,9 @@ impl AdminServiceError {
                 AdminErrorResponse::internal_error(self.to_string())
             }
             AdminServiceError::InvalidCredential(_) => {
+                AdminErrorResponse::invalid_request(self.to_string())
+            }
+            AdminServiceError::UnprocessableEntity(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }

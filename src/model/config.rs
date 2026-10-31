@@ -237,6 +237,27 @@ pub struct Config {
     #[serde(default = "default_model_api_429_retry_enabled")]
     pub model_api_429_retry_enabled: bool,
 
+    /// 普通模型容量类 429 无限立即重试（默认 false）。
+    ///
+    /// 开启后，普通与流式请求遇到容量类 429（如 `INSUFFICIENT_MODEL_CAPACITY`）都不返回下游、
+    /// 不受重试次数上限约束、两次重试之间不等待；流式等待期持续发 ping 保活。
+    /// 账号级 429 由独立的 `account_rate_limit_infinite_retry` 控制。
+    #[serde(default = "default_model_api_429_infinite_retry")]
+    pub model_api_429_infinite_retry: bool,
+
+    /// 账号级 429 无限立即重试（默认 false）。
+    ///
+    /// 开启后，遇到账号级限流（如 `SERVICE_REQUEST_RATE_EXCEEDED`）冷却当前凭据并立即换号重试，
+    /// 不返回下游、不受重试上限约束；所有凭据都在冷却时在凭据之间轮转重试。
+    /// 关闭时沿用原有的账号级故障转移与重试行为（无可用凭据时返回客户端）。
+    #[serde(default = "default_account_rate_limit_infinite_retry")]
+    pub account_rate_limit_infinite_retry: bool,
+
+    /// 全部凭据都在冷却时的最小重试等待间隔（毫秒，默认 0 表示不等待，仅让出 CPU）。
+    ///
+    /// 仅在所有凭据都处于冷却状态时生效；有未冷却凭据时不等待。
+    #[serde(default = "default_all_creds_cooldown_retry_interval_ms")]
+    pub all_creds_cooldown_retry_interval_ms: u64,
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
     /// 开启后：每个凭据独立维护最近 60 秒的滑动窗口计数，达到 `account_rpm_limit`
@@ -459,6 +480,17 @@ fn default_model_api_429_retry_enabled() -> bool {
     true
 }
 
+fn default_model_api_429_infinite_retry() -> bool {
+    false
+}
+fn default_account_rate_limit_infinite_retry() -> bool {
+    false
+}
+
+fn default_all_creds_cooldown_retry_interval_ms() -> u64 {
+    0
+}
+
 fn default_account_rpm_limit_enabled() -> bool {
     false
 }
@@ -550,6 +582,9 @@ impl Default for Config {
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
+            model_api_429_infinite_retry: default_model_api_429_infinite_retry(),
+            account_rate_limit_infinite_retry: default_account_rate_limit_infinite_retry(),
+            all_creds_cooldown_retry_interval_ms: default_all_creds_cooldown_retry_interval_ms(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
@@ -579,6 +614,9 @@ impl Default for Config {
 }
 
 impl Config {
+    /// 全部凭据都在冷却时的最小重试等待间隔上限（毫秒，1 分钟）
+    pub const MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS: u64 = 60_000;
+
     /// 获取默认配置文件路径
     pub fn default_config_path() -> &'static str {
         "config.json"
@@ -615,6 +653,19 @@ impl Config {
         // 空字符串导致难以诊断的错误。
         if config.update_auto_apply_time.trim().is_empty() {
             config.update_auto_apply_time = default_update_auto_apply_time();
+        }
+
+        if config.all_creds_cooldown_retry_interval_ms
+            > Self::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS
+        {
+            tracing::warn!(
+                "allCredsCooldownRetryIntervalMs ({}) 超过最大上限 {}ms，已自动限制为 {}ms",
+                config.all_creds_cooldown_retry_interval_ms,
+                Self::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS,
+                Self::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS,
+            );
+            config.all_creds_cooldown_retry_interval_ms =
+                Self::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS;
         }
 
         Ok(config)
@@ -760,6 +811,60 @@ mod tests {
     fn model_api_429_retry_accepts_explicitly_disabled() {
         let config: Config = serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
         assert!(!config.model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn model_api_429_infinite_retry_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.model_api_429_infinite_retry);
+        assert!(!Config::default().model_api_429_infinite_retry);
+    }
+
+    #[test]
+    fn model_api_429_infinite_retry_accepts_explicit_value() {
+        let enabled: Config = serde_json::from_str(r#"{"modelApi429InfiniteRetry":true}"#).unwrap();
+        assert!(enabled.model_api_429_infinite_retry);
+
+        let disabled: Config =
+            serde_json::from_str(r#"{"modelApi429InfiniteRetry":false}"#).unwrap();
+        assert!(!disabled.model_api_429_infinite_retry);
+    }
+    #[test]
+    fn account_rate_limit_infinite_retry_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.account_rate_limit_infinite_retry);
+        assert_eq!(config.all_creds_cooldown_retry_interval_ms, 0);
+        assert!(!Config::default().account_rate_limit_infinite_retry);
+        assert_eq!(Config::default().all_creds_cooldown_retry_interval_ms, 0);
+    }
+
+    #[test]
+    fn account_rate_limit_infinite_retry_and_interval_accept_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{"accountRateLimitInfiniteRetry":true,"allCredsCooldownRetryIntervalMs":50}"#,
+        )
+        .unwrap();
+        assert!(config.account_rate_limit_infinite_retry);
+        assert_eq!(config.all_creds_cooldown_retry_interval_ms, 50);
+    }
+
+    #[test]
+    fn all_creds_cooldown_retry_interval_ms_clamps_above_max_in_config_load() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-test-interval-clamp-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"accountRateLimitInfiniteRetry":true,"allCredsCooldownRetryIntervalMs":99999}"#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            config.all_creds_cooldown_retry_interval_ms,
+            Config::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS
+        );
     }
 
     #[test]

@@ -25,6 +25,8 @@ use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
 #[cfg(test)]
+mod infinite_retry_tests;
+#[cfg(test)]
 mod proxy_tests;
 
 /// 每个凭据的最大重试次数
@@ -36,6 +38,121 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 const MAX_TOTAL_RETRIES: usize = 4;
+
+/// 429 无限重试的进度汇总间隔：每 N 次重试或每隔 N 毫秒打一行。
+const INFINITE_429_LOG_EVERY_RETRIES: usize = 50;
+const INFINITE_429_LOG_EVERY_MILLIS: u128 = 5_000;
+
+/// 测试用的 429 无限重试日志捕获（生产恒为 None）。
+type RetryLogSink = Arc<parking_lot::Mutex<Vec<String>>>;
+
+/// 429 无限重试的进度与结束汇总。
+///
+/// 无限重试可能每秒撞墙几十次，逐次 `tracing::warn!` 会把日志放大成噪音并拖慢
+/// 请求本身。这里把日志压成三类事件：首次失败打一行、之后每
+/// [`INFINITE_429_LOG_EVERY_RETRIES`] 次或每 [`INFINITE_429_LOG_EVERY_MILLIS`]
+/// 毫秒打一行进度、结束时打一行含「总重试次数 + 总耗时」的汇总。
+///
+/// 只在真正发生过 429 重试时才输出任何一行：没有 429 的普通成功请求保持安静。
+pub(crate) struct Infinite429RetryLog {
+    started: Instant,
+    retries: usize,
+    last_log_at: Instant,
+    sink: Option<RetryLogSink>,
+    finished: bool,
+}
+
+/// 汇总结束原因。三条路径必须能区分开，ops 才能知道请求是怎么结束的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryFinish {
+    /// 上游最终成功。
+    Success,
+    /// 重试期间遇到非 429 错误，按 master 的重试预算终止。
+    NonRetryableError,
+    /// 请求 future 被 drop：下游断开或客户端取消。
+    Cancelled,
+}
+
+impl RetryFinish {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Success => "成功",
+            Self::NonRetryableError => "非 429 错误终止",
+            Self::Cancelled => "客户端断开",
+        }
+    }
+}
+
+impl Infinite429RetryLog {
+    fn new(sink: Option<RetryLogSink>) -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            retries: 0,
+            last_log_at: now,
+            sink,
+            finished: false,
+        }
+    }
+
+    /// 记录一次 429 重试；仅首次与周期性汇总打日志。
+    fn record(&mut self, credential_id: u64, body: &str) {
+        self.retries += 1;
+        let periodic = self.retries.is_multiple_of(INFINITE_429_LOG_EVERY_RETRIES)
+            || self.last_log_at.elapsed().as_millis() >= INFINITE_429_LOG_EVERY_MILLIS;
+        if self.retries != 1 && !periodic {
+            return;
+        }
+        self.last_log_at = Instant::now();
+        let elapsed = self.started.elapsed();
+        let line = format!(
+            "429 无限重试进行中：已重试 {} 次，耗时 {:.3}s，最近凭据 #{}，上游: {}",
+            self.retries,
+            elapsed.as_secs_f64(),
+            credential_id,
+            truncate_snippet(body).unwrap_or_default()
+        );
+        self.emit(line.clone());
+        tracing::warn!("{}", line);
+    }
+
+    /// 结束汇总。未发生过 429 重试时完全静默（避免给每个正常请求加一行 INFO）。
+    fn finish(&mut self, reason: RetryFinish) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if self.retries == 0 {
+            return;
+        }
+        let summary = infinite_429_summary(reason.label(), self.retries, self.started.elapsed());
+        self.emit(summary.clone());
+        tracing::info!("{}", summary);
+    }
+
+    fn emit(&self, line: String) {
+        if let Some(sink) = &self.sink {
+            sink.lock().push(line);
+        }
+    }
+}
+
+impl Drop for Infinite429RetryLog {
+    fn drop(&mut self) {
+        // 未显式 finish 就被 drop ⇒ 请求 future 被取消（下游断开 / 客户端取消）。
+        self.finish(RetryFinish::Cancelled);
+    }
+}
+
+/// 汇总行：必须同时含重试次数与总耗时。
+pub(crate) fn infinite_429_summary(outcome: &str, retries: usize, elapsed: Duration) -> String {
+    format!(
+        "429 无限重试汇总（{}）：重试 {} 次，耗时 {:.3}s",
+        outcome,
+        retries,
+        elapsed.as_secs_f64()
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelApi429Action {
@@ -144,6 +261,9 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    /// 429 无限重试的日志捕获（仅测试注入，生产不编译该字段）。
+    #[cfg(test)]
+    retry_log_sink: Mutex<Option<RetryLogSink>>,
 }
 
 impl KiroProvider {
@@ -189,7 +309,22 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            retry_log_sink: Mutex::new(None),
         }
+    }
+
+    /// 测试注入：捕获 429 无限重试的日志行。
+    #[cfg(test)]
+    fn capture_retry_logs(&self) -> RetryLogSink {
+        let sink: RetryLogSink = Arc::new(Mutex::new(Vec::new()));
+        *self.retry_log_sink.lock() = Some(sink.clone());
+        sink
+    }
+
+    #[cfg(test)]
+    fn retry_log_sink(&self) -> Option<RetryLogSink> {
+        self.retry_log_sink.lock().clone()
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
@@ -305,7 +440,20 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group).await
+        self.call_api_stream_with_notifier(request_body, sink, group, None)
+            .await
+    }
+
+    /// 发送流式 API 请求，支持在首次遇到 429 时通过 oneshot 通知调用方（用于保活延迟建连）。
+    pub async fn call_api_stream_with_notifier(
+        &self,
+        request_body: &str,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        first_429_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry_inner(request_body, true, sink, group, first_429_tx)
+            .await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -742,10 +890,10 @@ impl KiroProvider {
 
     /// 内部方法：带重试逻辑的 API 调用
     ///
-    /// 重试策略：
-    /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// 只在真正发生过 429 重试时输出汇总，并区分三种结束原因。把循环拆到
+    /// [`Self::call_api_retry_loop`] 的好处是：正常返回（成功或错误）由这里显式
+    /// 标注结束原因，只有 future 被 drop（下游断开 / 客户端取消）才会落到
+    /// [`Infinite429RetryLog`] 的 `Drop` 分支标成「客户端断开」。
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -753,7 +901,72 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
+        self.call_api_with_retry_inner(request_body, is_stream, sink, group, None)
+            .await
+    }
+
+    async fn call_api_with_retry_inner(
+        &self,
+        request_body: &str,
+        is_stream: bool,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        mut first_429_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> anyhow::Result<KiroCallResult> {
+        let model_api_infinite = self
+            .token_manager
+            .get_model_api_429_infinite_retry_enabled();
+        let account_infinite = self
+            .token_manager
+            .get_account_rate_limit_infinite_retry_enabled();
+        let any_infinite = model_api_infinite || account_infinite;
+        #[cfg(test)]
+        let retry_log_sink = any_infinite.then(|| self.retry_log_sink()).flatten();
+        #[cfg(not(test))]
+        let retry_log_sink: Option<RetryLogSink> = None;
+        let mut retry_log = any_infinite.then(|| Infinite429RetryLog::new(retry_log_sink));
+
+        let result = self
+            .call_api_retry_loop(
+                request_body,
+                is_stream,
+                sink,
+                group,
+                model_api_infinite,
+                account_infinite,
+                &mut retry_log,
+                &mut first_429_tx,
+            )
+            .await;
+
+        if let Some(log) = retry_log.as_mut() {
+            log.finish(if result.is_ok() {
+                RetryFinish::Success
+            } else {
+                RetryFinish::NonRetryableError
+            });
+        }
+        result
+    }
+
+    /// 重试主体。`infinite_retry` 只影响 429：429 重试不消耗普通重试预算、不 sleep；
+    /// 其余错误（5xx / 408 / 未知状态码 / 网络错误 / 无可用凭据）一律按 master 的
+    /// `max_retries` 预算与退避处理。
+    #[allow(clippy::too_many_arguments)]
+    async fn call_api_retry_loop(
+        &self,
+        request_body: &str,
+        is_stream: bool,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        model_api_infinite: bool,
+        account_infinite: bool,
+        retry_log: &mut Option<Infinite429RetryLog>,
+        first_429_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> anyhow::Result<KiroCallResult> {
+        let all_creds_cooldown_interval_ms = self
+            .token_manager
+            .get_all_creds_cooldown_retry_interval_ms();
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -763,14 +976,34 @@ impl KiroProvider {
         // 尝试从请求体中提取模型与会话标识
         let (model, session_id) = Self::extract_routing_hints(request_body);
 
-        for attempt in 0..max_retries {
+        // `attempt` 是迭代序号（日志与 trace 用），`ordinary_retries` 是普通错误
+        // 已消耗的预算。429 无限重试会把本轮预算退回去，因此关闭开关时
+        // `ordinary_retries == attempt + 1`，循环与 master 的 `0..max_retries` 等价。
+        let mut attempt_counter: usize = 0;
+        let mut ordinary_retries: usize = 0;
+        while ordinary_retries < max_retries {
+            ordinary_retries += 1;
+            let attempt = attempt_counter;
+            attempt_counter += 1;
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
-            let mut ctx = match self
+            // 无限重试时先按正常规则选号（换到未冷却的账号、遵守 RPM），只有全部凭据
+            // 都在冷却时才忽略冷却兜底挑一个继续撞——绝不把「没有可用凭据」交给下游。
+            let mut acquired = self
                 .token_manager
                 .acquire_context_routed(model.as_deref(), group, session_id.as_deref())
-                .await
-            {
+                .await;
+            if account_infinite && acquired.is_err() {
+                acquired = self
+                    .token_manager
+                    .acquire_context_routed_ignoring_cooldown(
+                        model.as_deref(),
+                        group,
+                        session_id.as_deref(),
+                    )
+                    .await;
+            }
+            let mut ctx = match acquired {
                 Ok((c, route)) => {
                     // 只在首次选号时计入命中率并上报 trace；重试轮次的判定受本请求内
                     // 刚发生的失败影响，不代表会话层面的粘性效果。
@@ -787,10 +1020,42 @@ impl KiroProvider {
                     c
                 }
                 Err(e) => {
+                    // 无限重试只在「唯一原因是账号级 429 冷却」时兜底继续：忽略冷却
+                    // 仍拿不到凭据（全禁用 / 分组与模型不匹配 / RPM 打满）说明再试也
+                    // 不会成功，必须按 master 直接报错，否则下游永远挂起。
+                    if account_infinite
+                        && self
+                            .token_manager
+                            .cooldown_only_block(model.as_deref(), group)
+                    {
+                        if let Some(tx) = first_429_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(log) = retry_log.as_mut() {
+                            log.record(0, &e.to_string());
+                        }
+                        // 429 重试不消耗普通预算。
+                        ordinary_retries -= 1;
+                        if all_creds_cooldown_interval_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                all_creds_cooldown_interval_ms,
+                            ))
+                            .await;
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
+                        continue;
+                    }
                     if is_rate_limit_error(&e) {
                         Self::emit_attempt(
-                            sink, attempt, 0, "", None, outcome::TRANSIENT,
-                            Some(&e.to_string()), attempt_start,
+                            sink,
+                            attempt,
+                            0,
+                            "",
+                            None,
+                            outcome::TRANSIENT,
+                            Some(&e.to_string()),
+                            attempt_start,
                         );
                         return Err(e);
                     }
@@ -818,7 +1083,28 @@ impl KiroProvider {
                     Some(&e.to_string()),
                     attempt_start,
                 );
-                return Err(e);
+                // 无限重试下 token 刷新/profile 解析被上游 429 同样不返回下游，继续。
+                if account_infinite && is_rate_limit_error(&e) {
+                    if let Some(tx) = first_429_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(log) = retry_log.as_mut() {
+                        log.record(ctx.id, &e.to_string());
+                    }
+                    ordinary_retries -= 1;
+                    let all_cooling = self
+                        .token_manager
+                        .cooldown_only_block(model.as_deref(), group);
+                    if all_cooling && all_creds_cooldown_interval_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            all_creds_cooldown_interval_ms,
+                        ))
+                        .await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
             }
 
             let config = self.token_manager.config();
@@ -873,33 +1159,42 @@ impl KiroProvider {
                 Err(e) => {
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
-                        attempt + 1,
+                        ordinary_retries,
                         max_retries,
                         e
                     );
                     Self::emit_attempt(
-                        sink, attempt, ctx.id, endpoint_name, None,
-                        outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        None,
+                        outcome::NETWORK_ERROR,
+                        Some(&e.to_string()),
+                        attempt_start,
                     );
                     if e.is_timeout() {
                         return Err(UpstreamTimeoutError { source: e }.into());
                     }
                     // 凭据专属代理故障时，重试同一凭据无意义，应跳过该凭据换下一个。
                     // 没有专属代理时（直连或仅全局代理），切换凭据不解决问题，保持重试。
-                    let has_own_proxy = ctx.credentials.proxy_url.as_deref()
+                    let has_own_proxy = ctx
+                        .credentials
+                        .proxy_url
+                        .as_deref()
                         .map_or(false, |u| !u.trim().is_empty());
                     if has_own_proxy {
-                        tracing::warn!(
-                            "凭据 #{} 有专属代理且网络请求失败，跳过该凭据",
-                            ctx.id
+                        tracing::warn!("凭据 #{} 有专属代理且网络请求失败，跳过该凭据", ctx.id);
+                        self.token_manager.report_failure_for_request(
+                            ctx.id,
+                            model.as_deref(),
+                            group,
                         );
-                        self.token_manager
-                            .report_failure_for_request(ctx.id, model.as_deref(), group);
                     }
 
                     last_error = Some(e.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
+                    if ordinary_retries < max_retries {
+                        sleep(Self::retry_delay(ordinary_retries - 1)).await;
                     }
                     continue;
                 }
@@ -1110,6 +1405,58 @@ impl KiroProvider {
 
             if status.as_u16() == 429 {
                 let account_rate_limited = endpoint.is_account_rate_limited(&body);
+                let is_infinite = (account_rate_limited && account_infinite)
+                    || (!account_rate_limited && model_api_infinite);
+
+                if is_infinite {
+                    if let Some(tx) = first_429_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    if account_rate_limited {
+                        let cooldown_secs = self
+                            .token_manager
+                            .get_account_throttle_cooldown_secs()
+                            .max(1);
+                        self.token_manager.report_account_throttled_for_request(
+                            ctx.id,
+                            std::time::Duration::from_secs(cooldown_secs),
+                            model.as_deref(),
+                            group,
+                        );
+                    }
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(429),
+                        if account_rate_limited {
+                            outcome::ACCOUNT_THROTTLED
+                        } else {
+                            outcome::TRANSIENT
+                        },
+                        Some(&body),
+                        attempt_start,
+                    );
+                    if let Some(log) = retry_log.as_mut() {
+                        log.record(ctx.id, &body);
+                    }
+                    // 429 重试不消耗普通重试预算：退回本轮预扣。
+                    ordinary_retries -= 1;
+                    let all_cooling = self
+                        .token_manager
+                        .cooldown_only_block(model.as_deref(), group);
+                    if all_cooling && all_creds_cooldown_interval_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            all_creds_cooldown_interval_ms,
+                        ))
+                        .await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
+
                 match model_api_429_action(
                     account_rate_limited,
                     self.token_manager.get_account_throttle_failover(),
@@ -1226,14 +1573,20 @@ impl KiroProvider {
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
+                    ordinary_retries,
                     max_retries,
                     status,
                     body
                 );
                 Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                    outcome::TRANSIENT, Some(&body), attempt_start,
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
                 );
                 last_error = if let Some(rate_limit) = rate_limit_error {
                     if !rate_limit.should_retry_locally() {
@@ -1248,12 +1601,12 @@ impl KiroProvider {
                         body
                     ))
                 };
-                if attempt + 1 < max_retries {
+                if ordinary_retries < max_retries {
                     // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
                     let delay = if status.as_u16() == 429 {
-                        Self::retry_delay_throttle(attempt)
+                        Self::retry_delay_throttle(ordinary_retries - 1)
                     } else {
-                        Self::retry_delay(attempt)
+                        Self::retry_delay(ordinary_retries - 1)
                     };
                     sleep(delay).await;
                 }
@@ -1272,14 +1625,20 @@ impl KiroProvider {
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
-                attempt + 1,
+                ordinary_retries,
                 max_retries,
                 status,
                 body
             );
             Self::emit_attempt(
-                sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
-                outcome::UNKNOWN, Some(&body), attempt_start,
+                sink,
+                attempt,
+                ctx.id,
+                endpoint_name,
+                Some(status.as_u16()),
+                outcome::UNKNOWN,
+                Some(&body),
+                attempt_start,
             );
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
@@ -1287,8 +1646,8 @@ impl KiroProvider {
                 status,
                 body
             ));
-            if attempt + 1 < max_retries {
-                sleep(Self::retry_delay(attempt)).await;
+            if ordinary_retries < max_retries {
+                sleep(Self::retry_delay(ordinary_retries - 1)).await;
             }
         }
 

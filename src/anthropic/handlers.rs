@@ -14,6 +14,7 @@ use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::{Event, TokenUsage};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::provider::KiroCallResult;
 use crate::kiro::token_manager::ModelDiscoveryError;
 use crate::token;
 use anyhow::Error;
@@ -26,7 +27,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::Utc;
-use futures::{Stream, StreamExt, stream};
+use futures::{Future, Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::interval;
@@ -451,69 +452,69 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-pub(super) fn map_provider_error(err: Error) -> Response {
+/// 分类后的 KiroProvider 错误详情，供 HTTP 状态码映射与流内 error 事件共享。
+#[derive(Debug, Clone)]
+pub(super) struct ClassifiedProviderError {
+    pub status: StatusCode,
+    pub error_type: &'static str,
+    pub message: String,
+    pub retry_after: Option<String>,
+}
+
+/// 将 KiroProvider 错误分类为 Anthropic 错误类型与脱敏文案。
+///
+/// 保证 HTTP 响应状态码路径与流式 `event: error` 终态路径共享同一份分类规则与脱敏文案，
+/// 严禁泄露上游原始报错体、内部 URL 或凭据数量等敏感信息。
+pub(super) fn classify_provider_error(err: &Error) -> ClassifiedProviderError {
     if err
         .downcast_ref::<crate::kiro::error::UpstreamTimeoutError>()
         .is_some()
     {
-        return (
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(ErrorResponse::new(
-                "api_error",
-                "Upstream timed out before returning a response.",
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            error_type: "api_error",
+            message: "Upstream timed out before returning a response.".to_string(),
+            retry_after: None,
+        };
     }
     if let Some(unavailable) =
         err.downcast_ref::<crate::kiro::error::UpstreamModelUnavailableError>()
     {
-        let mut response = (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(
-                "overloaded_error",
-                "Upstream model is temporarily overloaded. Retry later.",
-            )),
-        )
-            .into_response();
-        if let Ok(value) = unavailable.retry_after.parse() {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-        return response;
+        let retry_after = unavailable
+            .retry_after
+            .parse::<header::HeaderValue>()
+            .ok()
+            .map(|v| v.to_str().unwrap_or("").to_string());
+        return ClassifiedProviderError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "overloaded_error",
+            message: "Upstream model is temporarily overloaded. Retry later.".to_string(),
+            retry_after,
+        };
     }
     if err
         .downcast_ref::<crate::kiro::error::UpstreamContextOverflowError>()
         .is_some()
     {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message:
+                "Context window is full. Reduce conversation history, system prompt, or tools."
+                    .to_string(),
+            retry_after: None,
+        };
     }
 
     if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
         tracing::warn!(error = %err, "上游限流（映射为 429）");
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorResponse::new(
-                "rate_limit_error",
-                "Upstream rate limit exceeded. Retry later.",
-            )),
-        )
-            .into_response();
-        if let Some(value) = rate_limit
-            .retry_after()
-            .and_then(|value| value.parse::<header::HeaderValue>().ok())
-        {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
-        return response;
+        return ClassifiedProviderError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error_type: "rate_limit_error",
+            message: "Upstream rate limit exceeded. Retry later.".to_string(),
+            retry_after: rate_limit.retry_after().map(|s| s.to_string()),
+        };
     }
 
     let err_str = err.to_string();
@@ -521,29 +522,26 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message:
+                "Context window is full. Reduce conversation history, system prompt, or tools."
+                    .to_string(),
+            retry_after: None,
+        };
     }
 
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: "Input is too long. Reduce the size of your messages.".to_string(),
+            retry_after: None,
+        };
     }
-
     // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
     // The root cause is the client's own messages array, not an upstream failure, so it must not map to 5xx
     // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s.
@@ -557,25 +555,41 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         // Return a stable, client-facing message and avoid echoing the raw upstream
         // error string (which can carry request IDs or internal validation details).
         // The full error is already logged above for diagnostics.
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
-            )),
-        )
-            .into_response();
+        return ClassifiedProviderError {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
+            retry_after: None,
+        };
     }
 
     tracing::error!("Kiro API 调用失败: {}", err);
-    (
-        StatusCode::BAD_GATEWAY,
+    ClassifiedProviderError {
+        status: StatusCode::BAD_GATEWAY,
+        error_type: "api_error",
+        message: "Upstream API request failed.".to_string(),
+        retry_after: None,
+    }
+}
+
+/// 将 KiroProvider 错误映射为 HTTP 响应
+pub(super) fn map_provider_error(err: Error) -> Response {
+    let classified = classify_provider_error(&err);
+    let mut response = (
+        classified.status,
         Json(ErrorResponse::new(
-            "api_error",
-            "Upstream API request failed.",
+            classified.error_type,
+            classified.message,
         )),
     )
-        .into_response()
+        .into_response();
+    if let Some(value) = classified
+        .retry_after
+        .and_then(|r| r.parse::<header::HeaderValue>().ok())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 /// 解析普通非流式响应的最终 Anthropic usage。
@@ -1072,30 +1086,80 @@ async fn handle_stream_request(
     group: Option<String>,
     structured_schema: Option<serde_json::Value>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&format!("{e:#}")),
-                None,
-                TraceUsage::zero(),
-            );
-            return map_provider_error(e);
-        }
-    };
-    tracer.mark_upstream_headers_received();
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
+    let infinite_retry = provider
+        .token_manager()
+        .get_model_api_429_infinite_retry_enabled()
+        || provider
+            .token_manager()
+            .get_account_rate_limit_infinite_retry_enabled();
 
-    // 创建流处理上下文
+    if !infinite_retry {
+        // 开关关闭时完全沿用 master 既有流式调用路径，行为逐字节一致。
+        let call_result = match provider
+            .call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref())
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+                tracer.finalize(
+                    "error",
+                    last_attempt_outcome(&tracer),
+                    Some(&format!("{e:#}")),
+                    None,
+                    TraceUsage::zero(),
+                );
+                return map_provider_error(e);
+            }
+        };
+        tracer.mark_upstream_headers_received();
+        let response = call_result.response;
+        let credential_id = call_result.credential_id;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            known_tool_names,
+        );
+        ctx.cache_usage = cache_usage;
+
+        let initial_events = ctx.generate_initial_events();
+
+        let stream = create_sse_stream(
+            response,
+            ctx,
+            initial_events,
+            hook,
+            credential_id,
+            tracer,
+            structured_schema.map(|schema| StructuredCollector::new(schema, model)),
+        );
+
+        return sse_response(stream);
+    }
+
+    // 429 无限立即重试打开时：仅在首次看到 429 后才发 200 SSE 响应头和 ping 保活。
+    // 首次遇到 429 之前就失败的情况（全部凭据禁用、上下文溢出等）与 master 完全一致，
+    // 返回对应的 HTTP 错误状态码和脱敏错误体。
+    let (first_429_tx, mut first_429_rx) = tokio::sync::oneshot::channel::<()>();
+    let call_provider = provider.clone();
+    let call_body = request_body.to_owned();
+    let call_group = group.clone();
+    let call_tracer = tracer.clone();
+    let call = async move {
+        call_provider
+            .call_api_stream_with_notifier(
+                &call_body,
+                Some(call_tracer.as_ref()),
+                call_group.as_deref(),
+                Some(first_429_tx),
+            )
+            .await
+    };
+    let mut call = Box::pin(call);
+
     let mut ctx = StreamContext::new_with_thinking(
         model,
         input_tokens,
@@ -1105,24 +1169,217 @@ async fn handle_stream_request(
     );
     ctx.cache_usage = cache_usage;
 
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
+    tokio::select! {
+        biased;
+        result = &mut call => {
+            // 未遇到任何 429 就已结束（首轮即成功，或首次调用即出现非 429 错误）
+            match result {
+                Ok(call_result) => {
+                    tracer.mark_upstream_headers_received();
+                    let initial_events = ctx.generate_initial_events();
+                    let stream = create_sse_stream(
+                        call_result.response,
+                        ctx,
+                        initial_events,
+                        hook,
+                        call_result.credential_id,
+                        tracer,
+                        structured_schema.map(|schema| StructuredCollector::new(schema, model)),
+                    );
+                    sse_response(stream)
+                }
+                Err(e) => {
+                    hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+                    tracer.finalize(
+                        "error",
+                        last_attempt_outcome(&tracer),
+                        Some(&format!("{e:#}")),
+                        None,
+                        TraceUsage::zero(),
+                    );
+                    map_provider_error(e)
+                }
+            }
+        }
+        Ok(()) = &mut first_429_rx => {
+            // 首次遇到 429：此时上游进入无限重试，先向下游回 200 SSE 响应头并在等待期间持续 ping 保活。
+            let stream = create_keepalive_wait_stream(
+                call,
+                ctx,
+                hook,
+                tracer,
+                model.to_string(),
+                input_tokens,
+                structured_schema,
+            );
+            sse_response(stream)
+        }
+    }
+}
 
-    // 创建 SSE 流
-    let stream = create_sse_stream(
-        response,
-        ctx,
-        initial_events,
-        hook,
-        credential_id,
-        tracer,
-        structured_schema.map(|schema| StructuredCollector::new(schema, model)),
+/// 等待上游响应头期间的 keepalive ping 间隔（秒）。
+///
+/// 429 无限立即重试打开时，上游可能连续几十秒都不返回响应头。若沿用网关常规的
+/// [`PING_INTERVAL_SECS`]（25s），CPA 这类下游会先按自己的空闲超时断开，因此等待
+/// 期必须密集保活。这里只作用于「响应头尚未到达」这一段，拿到上游响应后由
+/// [`create_sse_stream`] 的 25s ping 接管。
+const KEEPALIVE_WAIT_PING_INTERVAL_SECS: u64 = 1;
+
+/// 等待期状态机阶段。
+enum KeepalivePhase {
+    /// 驱动 provider 调用（含 429 无限重试），同时按固定间隔发 ping。
+    Waiting {
+        call: std::pin::Pin<Box<dyn Future<Output = anyhow::Result<KiroCallResult>> + Send>>,
+        ticker: tokio::time::Interval,
+    },
+    /// 已拿到上游响应头：转发 [`create_sse_stream`] 的后续流。
+    Streaming(std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>),
+    /// 已结束（正常收尾或已发流内 error 事件）。
+    Done,
+}
+
+/// 等待期状态机的全部持有物。
+///
+/// 把 future / ctx / hook 都放在这里（而不是 spawn 到后台任务），下游断开时整个
+/// body 被 drop，provider 重试循环随 future 一起取消。
+struct KeepaliveWait {
+    phase: KeepalivePhase,
+    ctx: Option<StreamContext>,
+    hook: Option<UsageRecordHook>,
+    tracer: std::sync::Arc<RequestTracer>,
+    model: String,
+    input_tokens: i32,
+    structured_schema: Option<serde_json::Value>,
+}
+
+/// 构造等待上游响应头期间的 SSE 流。
+///
+/// 序列：`[ping...] → 初始事件 → 常规 SSE 处理流`。拿到上游响应头后初始事件与后续
+/// 内容都由 [`create_sse_stream`] 原样产生，因此结构化输出模式的事件缓冲语义不变。
+/// 重试链路最终失败时（响应头已发出，无法再改状态码）先补 `message_start` 让下游拿到
+/// 合法响应，再走 `generate_error_events` 的流内 error 事件。
+fn create_keepalive_wait_stream(
+    call: std::pin::Pin<Box<dyn Future<Output = anyhow::Result<KiroCallResult>> + Send>>,
+    ctx: StreamContext,
+    hook: UsageRecordHook,
+    tracer: std::sync::Arc<RequestTracer>,
+    model: String,
+    input_tokens: i32,
+    structured_schema: Option<serde_json::Value>,
+) -> impl Stream<Item = Result<Bytes, Infallible>> + Send {
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(KEEPALIVE_WAIT_PING_INTERVAL_SECS),
+        Duration::from_secs(KEEPALIVE_WAIT_PING_INTERVAL_SECS),
     );
+    // 下游写不出去时不要攒一串 tick 后集中爆发 ping。
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // 返回 SSE 响应
-    // `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
-    // 若反代开启了响应缓冲，SSE 分片会先攒在缓冲区再转发，拉长增量到达延迟；
-    // 该头只作用于当前响应，无需在反代侧改全局配置。
+    let state = KeepaliveWait {
+        phase: KeepalivePhase::Waiting { call, ticker },
+        ctx: Some(ctx),
+        hook: Some(hook),
+        tracer,
+        model,
+        input_tokens,
+        structured_schema,
+    };
+
+    stream::unfold(state, |mut state| async move {
+        loop {
+            match std::mem::replace(&mut state.phase, KeepalivePhase::Done) {
+                KeepalivePhase::Done => return None,
+                KeepalivePhase::Streaming(mut rest) => {
+                    return match rest.next().await {
+                        Some(item) => {
+                            state.phase = KeepalivePhase::Streaming(rest);
+                            Some((stream::iter(vec![item]), state))
+                        }
+                        None => None,
+                    };
+                }
+                KeepalivePhase::Waiting { mut call, mut ticker } => {
+                    tokio::select! {
+                        // 优先看 provider 调用结果：已经拿到响应头就不必再发一次 ping。
+                        biased;
+                        result = &mut call => {
+                            let mut ctx = state.ctx.take().expect("keepalive ctx 只取一次");
+                            match result {
+                                Ok(call_result) => {
+                                    state.tracer.mark_upstream_headers_received();
+                                    let initial_events = ctx.generate_initial_events();
+                                    let structured = state
+                                        .structured_schema
+                                        .take()
+                                        .map(|schema| StructuredCollector::new(schema, &state.model));
+                                    state.phase =
+                                        KeepalivePhase::Streaming(Box::pin(create_sse_stream(
+                                            call_result.response,
+                                            ctx,
+                                            initial_events,
+                                            state.hook.take().expect("keepalive hook 只取一次"),
+                                            call_result.credential_id,
+                                            state.tracer.clone(),
+                                            structured,
+                                        )));
+                                }
+                                Err(e) => {
+                                    let classified = classify_provider_error(&e);
+                                    tracing::error!(
+                                        error = %classified.message,
+                                        error_type = %classified.error_type,
+                                        "429 无限重试等待期结束后仍未拿到上游响应，转为流内错误事件"
+                                    );
+                                    state
+                                        .hook
+                                        .take()
+                                        .expect("keepalive hook 只取一次")
+                                        .record(0, state.input_tokens, 0, 0, 0, 0.0, "error");
+                                    state.tracer.finalize(
+                                        "error",
+                                        last_attempt_outcome(&state.tracer),
+                                        Some(&classified.message),
+                                        None,
+                                        TraceUsage::zero(),
+                                    );
+                                    let sse_event = SseEvent::new(
+                                        "error",
+                                        json!({
+                                            "type": "error",
+                                            "error": {
+                                                "type": classified.error_type,
+                                                "message": classified.message,
+                                            }
+                                        }),
+                                    );
+                                    let bytes: Vec<Result<Bytes, Infallible>> =
+                                        vec![Ok(Bytes::from(sse_event.to_sse_string()))];
+                                    return Some((stream::iter(bytes), state));
+                                }
+                            }
+                        }
+                        _ = ticker.tick() => {
+                            state.phase = KeepalivePhase::Waiting { call, ticker };
+                            return Some((
+                                stream::iter(vec![Ok(create_ping_sse())]),
+                                state,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .flatten()
+}
+
+/// 构造成功路径的 SSE 响应头。
+///
+/// `x-accel-buffering: no` 让前置 nginx 对本次响应关闭 proxy_buffering。
+/// 若反代开启了响应缓冲，SSE 分片会先攒在缓冲区再转发，拉长增量到达延迟；
+/// 该头只作用于当前响应，无需在反代侧改全局配置。
+fn sse_response(
+    stream: impl Stream<Item = Result<Bytes, Infallible>> + Send + 'static,
+) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")

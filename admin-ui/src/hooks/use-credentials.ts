@@ -22,6 +22,12 @@ import {
   setAccountThrottleConfig,
   getModelApiRetryConfig,
   setModelApiRetryConfig,
+  getModelApi429InfiniteRetryConfig,
+  setModelApi429InfiniteRetryConfig,
+  getAccountRateLimitInfiniteRetryConfig,
+  setAccountRateLimitInfiniteRetryConfig,
+  getAllCredsCooldownRetryIntervalConfig,
+  setAllCredsCooldownRetryIntervalConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
   getQuotaResetRecoveryConfig,
@@ -321,6 +327,62 @@ export function useSetModelApiRetryConfig() {
     mutationFn: setModelApiRetryConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['modelApiRetryConfig'] })
+    },
+  })
+}
+
+// 获取模型 API 429 无限立即重试配置
+export function useModelApi429InfiniteRetryConfig() {
+  return useQuery({
+    queryKey: ['modelApi429InfiniteRetryConfig'],
+    queryFn: getModelApi429InfiniteRetryConfig,
+  })
+}
+
+// 更新模型 API 429 无限立即重试配置
+export function useSetModelApi429InfiniteRetryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setModelApi429InfiniteRetryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modelApi429InfiniteRetryConfig'] })
+    },
+  })
+}
+// 获取账号级 429 无限立即重试配置
+export function useAccountRateLimitInfiniteRetryConfig() {
+  return useQuery({
+    queryKey: ['accountRateLimitInfiniteRetryConfig'],
+    queryFn: getAccountRateLimitInfiniteRetryConfig,
+  })
+}
+
+// 更新账号级 429 无限立即重试配置
+export function useSetAccountRateLimitInfiniteRetryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAccountRateLimitInfiniteRetryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['accountRateLimitInfiniteRetryConfig'] })
+    },
+  })
+}
+
+// 获取全凭据冷却重试等待间隔配置
+export function useAllCredsCooldownRetryIntervalConfig() {
+  return useQuery({
+    queryKey: ['allCredsCooldownRetryIntervalConfig'],
+    queryFn: getAllCredsCooldownRetryIntervalConfig,
+  })
+}
+
+// 更新全凭据冷却重试等待间隔配置
+export function useSetAllCredsCooldownRetryIntervalConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAllCredsCooldownRetryIntervalConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['allCredsCooldownRetryIntervalConfig'] })
     },
   })
 }
