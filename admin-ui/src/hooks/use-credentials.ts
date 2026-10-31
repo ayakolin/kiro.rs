@@ -22,6 +22,8 @@ import {
   setAccountThrottleConfig,
   getModelApiRetryConfig,
   setModelApiRetryConfig,
+  getModelApi429InfiniteRetryConfig,
+  setModelApi429InfiniteRetryConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
   getQuotaResetRecoveryConfig,
@@ -321,6 +323,25 @@ export function useSetModelApiRetryConfig() {
     mutationFn: setModelApiRetryConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['modelApiRetryConfig'] })
+    },
+  })
+}
+
+// 获取模型 API 429 无限立即重试配置
+export function useModelApi429InfiniteRetryConfig() {
+  return useQuery({
+    queryKey: ['modelApi429InfiniteRetryConfig'],
+    queryFn: getModelApi429InfiniteRetryConfig,
+  })
+}
+
+// 更新模型 API 429 无限立即重试配置
+export function useSetModelApi429InfiniteRetryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setModelApi429InfiniteRetryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['modelApi429InfiniteRetryConfig'] })
     },
   })
 }

@@ -499,6 +499,29 @@ export async function setModelApiRetryConfig(
   return data
 }
 
+export interface ModelApi429InfiniteRetryConfig {
+  enabled: boolean
+}
+
+// 获取模型 API 429 无限立即重试配置
+export async function getModelApi429InfiniteRetryConfig(): Promise<ModelApi429InfiniteRetryConfig> {
+  const { data } = await api.get<ModelApi429InfiniteRetryConfig>(
+    '/config/model-api-429-infinite-retry',
+  )
+  return data
+}
+
+// 更新模型 API 429 无限立即重试配置
+export async function setModelApi429InfiniteRetryConfig(
+  config: ModelApi429InfiniteRetryConfig,
+): Promise<ModelApi429InfiniteRetryConfig> {
+  const { data } = await api.put<ModelApi429InfiniteRetryConfig>(
+    '/config/model-api-429-infinite-retry',
+    config,
+  )
+  return data
+}
+
 export interface AccountRpmLimitConfig {
   enabled: boolean
   limit: number

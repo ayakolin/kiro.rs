@@ -3,6 +3,8 @@ import {
   useSetAccountThrottleConfig,
   useModelApiRetryConfig,
   useSetModelApiRetryConfig,
+  useModelApi429InfiniteRetryConfig,
+  useSetModelApi429InfiniteRetryConfig,
   useAccountRpmLimitConfig,
   useSetAccountRpmLimitConfig,
   useQuotaResetRecoveryConfig,
@@ -115,9 +117,14 @@ function RateLimitHandlingGroup() {
   const { data: retry, isLoading: retryLoading } = useModelApiRetryConfig()
   const { mutate: setRetry } = useSetModelApiRetryConfig()
   const retrySaver = useFieldSaver(setRetry, reportSaveError)
+  const { data: infiniteRetry, isLoading: infiniteRetryLoading } =
+    useModelApi429InfiniteRetryConfig()
+  const { mutate: setInfiniteRetry } = useSetModelApi429InfiniteRetryConfig()
+  const infiniteRetrySaver = useFieldSaver(setInfiniteRetry, reportSaveError)
   const failover = throttle?.failover ?? true
   const cooldownSecs = throttle?.cooldownSecs ?? 30 * SECS_PER_MIN
   const retryEnabled = retry?.enabled ?? true
+  const infiniteRetryEnabled = infiniteRetry?.enabled ?? false
 
   return (
     <SettingGroup
@@ -166,6 +173,19 @@ function RateLimitHandlingGroup() {
         pending={retrySaver.isSaving('enabled')}
         saved={retrySaver.isSaved('enabled')}
         disabled={retryLoading}
+      />
+      <SettingSwitch
+        label="429 无限立即重试"
+        hint={
+          infiniteRetryEnabled
+            ? '任何 429 都不返回客户端，不等待、不限次数；账号级照常冷却换号，全部冷却时忽略冷却继续重试；客户端断开即停止'
+            : '沿用上面的次数上限与退避'
+        }
+        checked={infiniteRetryEnabled}
+        onChange={(next) => infiniteRetrySaver.save('enabled', { enabled: next })}
+        pending={infiniteRetrySaver.isSaving('enabled')}
+        saved={infiniteRetrySaver.isSaved('enabled')}
+        disabled={infiniteRetryLoading}
       />
     </SettingGroup>
   )

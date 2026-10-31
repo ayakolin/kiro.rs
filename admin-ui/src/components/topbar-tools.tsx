@@ -53,6 +53,7 @@ const NON_DATA_QUERY_ROOTS = new Set([
   'loadBalancingMode',
   'accountThrottleConfig',
   'modelApiRetryConfig',
+  'modelApi429InfiniteRetryConfig',
   'accountRpmLimitConfig',
   'selfHealConfig',
   'logGovernanceConfig',
