@@ -614,6 +614,9 @@ impl Default for Config {
 }
 
 impl Config {
+    /// 全部凭据都在冷却时的最小重试等待间隔上限（毫秒，1 分钟）
+    pub const MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS: u64 = 60_000;
+
     /// 获取默认配置文件路径
     pub fn default_config_path() -> &'static str {
         "config.json"
@@ -650,6 +653,19 @@ impl Config {
         // 空字符串导致难以诊断的错误。
         if config.update_auto_apply_time.trim().is_empty() {
             config.update_auto_apply_time = default_update_auto_apply_time();
+        }
+
+        if config.all_creds_cooldown_retry_interval_ms
+            > Self::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS
+        {
+            tracing::warn!(
+                "allCredsCooldownRetryIntervalMs ({}) 超过最大上限 {}ms，已自动限制为 {}ms",
+                config.all_creds_cooldown_retry_interval_ms,
+                Self::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS,
+                Self::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS,
+            );
+            config.all_creds_cooldown_retry_interval_ms =
+                Self::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS;
         }
 
         Ok(config)
@@ -830,6 +846,25 @@ mod tests {
         .unwrap();
         assert!(config.account_rate_limit_infinite_retry);
         assert_eq!(config.all_creds_cooldown_retry_interval_ms, 50);
+    }
+
+    #[test]
+    fn all_creds_cooldown_retry_interval_ms_clamps_above_max_in_config_load() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-test-interval-clamp-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"accountRateLimitInfiniteRetry":true,"allCredsCooldownRetryIntervalMs":99999}"#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            config.all_creds_cooldown_retry_interval_ms,
+            Config::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS
+        );
     }
 
     #[test]

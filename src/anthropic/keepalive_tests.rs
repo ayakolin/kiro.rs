@@ -520,3 +520,121 @@ async fn error_after_200_sse_429_then_500() {
         "泄露了凭据数量等内部文本: {body_str}"
     );
 }
+
+struct AlwaysAccount429MockUpstream {
+    url: String,
+    calls: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AlwaysAccount429MockUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl AlwaysAccount429MockUpstream {
+    async fn start() -> Self {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let app = axum::Router::new().fallback(move || {
+            let calls = calls_clone.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("retry-after", "1800")
+                    .body(Body::from(
+                        r#"{"message":"Rate exceeded","reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#,
+                    ))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self { url, calls, task }
+    }
+}
+
+fn two_creds_state(url: &str, model_infinite: bool, account_infinite: bool) -> AppState {
+    let cred1: KiroCredentials = serde_json::from_value(json!({
+        "id": 1,
+        "kiroApiKey": "fixture-cred-1",
+        "machineId": "0000000000000000000000000000000000000000000000000000000000000001"
+    }))
+    .unwrap();
+    let cred2: KiroCredentials = serde_json::from_value(json!({
+        "id": 2,
+        "kiroApiKey": "fixture-cred-2",
+        "machineId": "0000000000000000000000000000000000000000000000000000000000000002"
+    }))
+    .unwrap();
+    let mut config = Config::default();
+    config.model_api_429_infinite_retry = model_infinite;
+    config.account_rate_limit_infinite_retry = account_infinite;
+    let manager =
+        Arc::new(MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap());
+    let endpoints = HashMap::from([(
+        "loopback".to_owned(),
+        Arc::new(LoopbackEndpoint(url.to_owned())) as Arc<dyn KiroEndpoint>,
+    )]);
+    let provider = KiroProvider::new(manager, endpoints, "loopback".to_owned());
+    AppState::new(false, ToolCompatibilityMode::Raw).with_shared_kiro_provider(Arc::new(provider))
+}
+
+async fn post_message_req(state: AppState, stream: bool) -> Response {
+    let payload = json!({
+        "model": "gpt-5.6-sol",
+        "max_tokens": 64,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    post_messages(
+        State(state),
+        Extension(key()),
+        Json(serde_json::from_value(payload).unwrap()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn crosstalk_model_on_account_off_precooled_accounts_match_master() {
+    for stream in [false, true] {
+        let mock = AlwaysAccount429MockUpstream::start().await;
+        let app_state = two_creds_state(&mock.url, true, false);
+
+        // 第 1 个请求：把两个凭据都打入冷却，返回 429
+        let res1 = post_message_req(app_state.clone(), stream).await;
+        assert_eq!(res1.status(), StatusCode::TOO_MANY_REQUESTS);
+        let calls_after_req1 = mock.calls.load(Ordering::SeqCst);
+        assert_eq!(calls_after_req1, 2, "第 1 个请求轮询 2 个凭据各一次并冷却");
+
+        // 第 2 个请求：所有凭据已在冷却中，且账号级无限重试为 OFF
+        // master 行为：直接返回 502 Bad Gateway (api_error)，0 次上游调用
+        let res2 = post_message_req(app_state.clone(), stream).await;
+        let calls_after_req2 = mock.calls.load(Ordering::SeqCst);
+        let delta = calls_after_req2 - calls_after_req1;
+        assert_eq!(
+            delta, 0,
+            "stream={stream}: model ON / account OFF 严禁在凭据冷却期间打上游 (master: 0 calls)"
+        );
+        assert_eq!(
+            res2.status(),
+            StatusCode::BAD_GATEWAY,
+            "stream={stream}: master 返回 502"
+        );
+
+        let bytes = axum::body::to_bytes(res2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"]["type"], "api_error",
+            "stream={stream}: error 类型必须是 api_error"
+        );
+    }
+}

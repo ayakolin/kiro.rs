@@ -2623,6 +2623,14 @@ impl AdminService {
         &self,
         req: super::types::SetAllCredsCooldownRetryIntervalConfigRequest,
     ) -> Result<super::types::AllCredsCooldownRetryIntervalConfigResponse, AdminServiceError> {
+        if req.interval_ms > crate::model::config::Config::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS
+        {
+            return Err(AdminServiceError::UnprocessableEntity(format!(
+                "allCredsCooldownRetryIntervalMs 超出有效范围 0-{}ms: {}",
+                crate::model::config::Config::MAX_ALL_CREDS_COOLDOWN_RETRY_INTERVAL_MS,
+                req.interval_ms
+            )));
+        }
         self.token_manager
             .set_all_creds_cooldown_retry_interval_ms(req.interval_ms)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -4441,6 +4449,28 @@ mod cache_metering_config_tests {
         let reloaded = Config::load(&config_path).unwrap();
         assert!(reloaded.account_rate_limit_infinite_retry);
         assert_eq!(reloaded.all_creds_cooldown_retry_interval_ms, 250);
+
+        // 超出 60000ms 应被拒绝为 422 (UnprocessableEntity)
+        let err = service
+            .set_all_creds_cooldown_retry_interval_config(
+                crate::admin::types::SetAllCredsCooldownRetryIntervalConfigRequest {
+                    interval_ms: 60001,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.status_code(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // 运行时和配置文件状态应保持 250 不变
+        assert_eq!(
+            service
+                .get_all_creds_cooldown_retry_interval_config()
+                .interval_ms,
+            250
+        );
+        let reloaded_after_bad = Config::load(&config_path).unwrap();
+        assert_eq!(reloaded_after_bad.all_creds_cooldown_retry_interval_ms, 250);
 
         std::fs::remove_file(&config_path).unwrap();
     }

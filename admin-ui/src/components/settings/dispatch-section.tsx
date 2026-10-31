@@ -225,7 +225,7 @@ function RateLimitHandlingGroup() {
       />
       <SettingNumber
         label="全凭据冷却重试间隔"
-        hint="所有凭据都处于冷却时，两次重试之间的等待间隔（毫秒）。设为 0 表示不等待（每次让出 CPU 后立即轮转重试）"
+        hint="所有凭据都处于冷却时，两次重试之间的等待间隔（毫秒，范围 0-60000ms）。设为 0 表示不等待（每次让出 CPU 后立即轮转重试；注意：在全部凭据冷却期间设为 0 会打满单核 CPU）"
         value={allCredsCooldownRetryIntervalMs}
         onCommit={(ms) =>
           cooldownIntervalSaver.save('intervalMs', { intervalMs: ms })

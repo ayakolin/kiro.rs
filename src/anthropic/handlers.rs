@@ -179,10 +179,7 @@ impl UsageSource {
     }
 
     /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
-    pub fn resolve(
-        has_provider_usage: bool,
-        cache_usage: &super::cache_metering::CacheUsage,
-    ) -> Self {
+    pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
         if has_provider_usage {
             Self::Provider
         } else if cache_usage.cache_covered_est > 0 {
@@ -258,16 +255,11 @@ impl RequestTracer {
     fn mark_first_content(&self, events: &[SseEvent]) {
         if events.iter().any(|event| match event.event.as_str() {
             "content_block_start" => {
-                event
-                    .data
-                    .pointer("/content_block/type")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("tool_use")
+                event.data.pointer("/content_block/type")
+                    .and_then(serde_json::Value::as_str) == Some("tool_use")
             }
             "content_block_delta" => ["text", "thinking", "partial_json"].iter().any(|field| {
-                event
-                    .data
-                    .get("delta")
+                event.data.get("delta")
                     .and_then(|delta| delta.get(*field))
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|value| !value.is_empty())
@@ -950,9 +942,10 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => {
-                    ("invalid_request_error", format!("消息序列无效: {}", reason))
-                }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("消息序列无效: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -2049,11 +2042,7 @@ pub(crate) async fn execute_non_stream_request(
             &tracer,
             credential_id,
             input_tokens,
-            if received_data {
-                "Upstream ended with an incomplete event frame"
-            } else {
-                "Upstream returned an empty event stream"
-            },
+            if received_data { "Upstream ended with an incomplete event frame" } else { "Upstream returned an empty event stream" },
         ));
     }
 
@@ -2486,9 +2475,10 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => {
-                    ("invalid_request_error", format!("消息序列无效: {}", reason))
-                }
+                ConversionError::InvalidMessageSequence(reason) => (
+                    "invalid_request_error",
+                    format!("消息序列无效: {}", reason),
+                ),
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -2660,26 +2650,16 @@ mod tests {
         };
         let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]});
         let mut with_format = request(json!({"format": {"type": "json_schema", "schema": schema}}));
-        assert!(
-            append_schema_instruction(with_format.output_config.as_ref(), &mut with_format.system)
-                .is_some()
-        );
+        assert!(append_schema_instruction(with_format.output_config.as_ref(), &mut with_format.system).is_some());
         let system = with_format.system.as_ref().unwrap();
         assert_eq!(system.len(), 1);
         assert!(system[0].text.contains("\"ok\""));
         // 不带 format：不注入
         let mut plain = request(json!({"effort": "high"}));
-        assert!(
-            append_schema_instruction(plain.output_config.as_ref(), &mut plain.system).is_none()
-        );
+        assert!(append_schema_instruction(plain.output_config.as_ref(), &mut plain.system).is_none());
         assert!(plain.system.is_none());
         // output_config 不会被转发给外部 count_tokens API
-        assert!(
-            serde_json::to_value(&with_format)
-                .unwrap()
-                .get("output_config")
-                .is_none()
-        );
+        assert!(serde_json::to_value(&with_format).unwrap().get("output_config").is_none());
     }
 
     #[test]
@@ -3146,12 +3126,10 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Context window is full")
-        );
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Context window is full"));
     }
 
     #[tokio::test]
